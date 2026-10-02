@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wqagent"
+version = "0.1.0"
+description = "WQ Agent - a workspace-scoped tool-calling agent with a Typer CLI (wq)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["agent", "llm", "langchain", "tools", "cli", "typer"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "langchain-core>=0.3",
+  "langchain-openai>=0.2",
+  "typer>=0.12",
+  "python-dotenv>=1.0",
+  "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+wq = "wqagent.cli.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wqagent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,34 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# local scratch (pip temp/downloads)
+.tmp/
+
+# tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# agent scratch space (default workspace)
+workspace/
+
+# stray runtime logs (written into the cwd by other processes, e.g. IME debug output)
+debug.log
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
