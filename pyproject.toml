@@ -20,6 +20,7 @@ classifiers = [
 dependencies = [
   "langchain-core>=0.3",
   "langchain-openai>=0.2",
+  "langgraph>=0.2",
   "typer>=0.12",
   "python-dotenv>=1.0",
   "rich>=13.0",

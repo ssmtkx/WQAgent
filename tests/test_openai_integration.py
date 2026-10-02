@@ -153,13 +153,34 @@ def test_agent_round_trip_over_http(tmp_path: Path, monkeypatch: Any) -> None:
 
 
 def test_cli_round_trip_over_http(tmp_path: Path, monkeypatch: Any) -> None:
+    """The whole workflow over real HTTP: planner -> actor -> verifier -> final."""
     monkeypatch.chdir(tmp_path)
     workspace = tmp_path / "cli-ws"
     scripted = [
         _tool_call_response(
+            "todo_write",
+            {
+                "plan_summary": "write notes/todo.md",
+                "todos": [{"id": "t1", "content": "write notes/todo.md"}],
+                "acceptance_criteria": ["the file exists"],
+                "verification_commands": ["echo ok"],
+            },
+        ),
+        _tool_call_response(
             "file_write", {"file_path": "notes/todo.md", "content": "- [ ] ship it\n"}
         ),
         _answer_response("Wrote notes/todo.md."),
+        _answer_response("Inspected the file."),
+        _tool_call_response(
+            "verification_report",
+            {
+                "passed": True,
+                "reason": "the file exists and the command succeeded",
+                "checks": [{"name": "the file exists", "passed": True, "detail": "read it"}],
+                "recommended_next_instruction": "",
+            },
+        ),
+        _answer_response("Done: notes/todo.md is written and verified."),
     ]
     for name in ("API_KEY", "OPENAI_API_KEY", "MODEL", "OPENAI_MODEL", "BASE_URL", "OPENAI_BASE_URL"):
         monkeypatch.delenv(name, raising=False)
@@ -172,5 +193,15 @@ def test_cli_round_trip_over_http(tmp_path: Path, monkeypatch: Any) -> None:
 
     assert result.exit_code == 0, result.output
     assert (workspace / "notes" / "todo.md").read_text(encoding="utf-8") == "- [ ] ship it\n"
-    assert "Wrote notes/todo.md." in result.output
-    assert len(requests) == 2
+    assert "Done: notes/todo.md is written and verified." in result.output
+    # six calls: planner, actor x2, verifier x2 (inspect + report), final
+    assert len(requests) == 6
+    assert sorted(
+        tool["function"]["name"] for tool in requests[0]["tools"]
+    ) == ["todo_write"]
+    assert sorted(
+        tool["function"]["name"] for tool in requests[1]["tools"]
+    ) == ["bash", "file_edit", "file_read", "file_write", "grep", "todo_update"]
+    assert sorted(
+        tool["function"]["name"] for tool in requests[3]["tools"]
+    ) == ["file_read", "grep"]

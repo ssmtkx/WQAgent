@@ -17,7 +17,9 @@ from wqagent.tools.file_tools import (
 )
 from wqagent.tools.grep_tool import GrepInput, GrepTool
 from wqagent.tools.registry import (
+    READ_ONLY_TOOL_CLASSES,
     TOOL_CLASSES,
+    build_read_only_tools,
     build_tool_instances,
     build_tools,
     describe_tools,
@@ -35,7 +37,9 @@ __all__ = [
     "FileWriteTool",
     "GrepInput",
     "GrepTool",
+    "READ_ONLY_TOOL_CLASSES",
     "TOOL_CLASSES",
+    "build_read_only_tools",
     "build_tool_instances",
     "build_tools",
     "describe_tools",

@@ -4,6 +4,11 @@ The command runs with the current user's rights - this tool is *not* a sandbox.
 What it does guarantee: the working directory is the workspace, output is
 UTF-8 decoded, the process is killed (whole tree) when the timeout expires, and
 a small set of destructive patterns is refused up front.
+
+:meth:`BashTool.execute` returns the raw :class:`ShellOutcome` (exit code,
+stdout, stderr) for callers that need structured results - the graph's verifier
+node uses it to build ``VerificationResult`` entries; :meth:`BashTool.run`
+renders the same outcome as text for the model.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ import re
 import shutil
 import signal
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,7 +29,7 @@ from wqagent.core.state import RuntimeState
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from langchain_core.tools import StructuredTool
 
-__all__ = ["BashInput", "BashTool", "MAX_TIMEOUT_SECONDS"]
+__all__ = ["BashInput", "BashTool", "MAX_TIMEOUT_SECONDS", "SHELL_NAME", "ShellOutcome"]
 
 MAX_TIMEOUT_SECONDS = 3_600.0
 
@@ -47,6 +53,57 @@ def _shell_name() -> str:
 
 #: Resolved once at import; the model is told which shell its commands run in.
 SHELL_NAME = _shell_name()
+
+
+@dataclass(frozen=True)
+class ShellOutcome:
+    """Raw result of one shell command."""
+
+    command: str
+    timeout: float | None = None
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    blocked_by: str | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """True when the command ran and exited with status 0."""
+        return (
+            self.error is None
+            and self.blocked_by is None
+            and not self.timed_out
+            and self.exit_code == 0
+        )
+
+    def format(self) -> str:
+        """Render the outcome the way the model sees it."""
+        if self.error is not None:
+            return f"Error: {self.error}"
+        if self.blocked_by is not None:
+            return (
+                f"Error: command refused by the safety filter (pattern {self.blocked_by!r}). "
+                "It is far more destructive than the workspace; ask the user to run it "
+                "manually if it really is intended."
+            )
+        lines = [
+            f"$ {self.command}",
+            f"exit_code: {self.exit_code if self.exit_code is not None else 'unknown'}",
+        ]
+        if self.timed_out:
+            timeout = f"{self.timeout:g}" if self.timeout is not None else "?"
+            lines.append(f"[timed out after {timeout}s - the process tree was terminated]")
+        out = self.stdout.strip("\n")
+        err = self.stderr.strip("\n")
+        if out:
+            lines.append(f"stdout:\n{out}")
+        if err:
+            lines.append(f"stderr:\n{err}")
+        if not out and not err:
+            lines.append("(no output)")
+        return "\n".join(lines)
 
 
 class BashInput(BaseModel):
@@ -102,18 +159,22 @@ class BashTool:
         )
 
     def run(self, command: str, timeout_seconds: float | None = None) -> str:
-        """Run *command* in the workspace; never raises for command failures."""
+        """Run *command* and return its rendered output; never raises."""
+        outcome = self.execute(command, timeout_seconds)
+        return self.state.clip(outcome.format(), label="bash output")
+
+    def execute(
+        self, command: str, timeout_seconds: float | None = None
+    ) -> ShellOutcome:
+        """Run *command* and return the raw outcome (exit code, stdout, stderr)."""
         state = self.state
         command = (command or "").strip()
         if not command:
-            return "Error: command must not be empty."
+            return ShellOutcome(command=command, error="command must not be empty.")
         blocked = self._blocked_by(command)
         if blocked is not None:
-            return (
-                f"Error: command refused by the safety filter (pattern {blocked!r}). "
-                "It is far more destructive than the workspace; ask the user to run it "
-                "manually if it really is intended."
-            )
+            return ShellOutcome(command=command, blocked_by=blocked)
+
         if timeout_seconds is None:
             timeout = float(state.timeout_seconds)
         else:
@@ -133,7 +194,7 @@ class BashTool:
                 **_popen_kwargs(),
             )
         except OSError as exc:
-            return f"Error: cannot start command: {exc}"
+            return ShellOutcome(command=command, timeout=timeout, error=f"cannot start command: {exc}")
 
         timed_out = False
         try:
@@ -146,15 +207,14 @@ class BashTool:
             except subprocess.TimeoutExpired:  # pragma: no cover - unkillable child
                 stdout, stderr = "", ""
 
-        text = self._format(
-            command,
-            process.returncode,
-            stdout or "",
-            stderr or "",
-            timed_out=timed_out,
+        return ShellOutcome(
+            command=command,
             timeout=timeout,
+            exit_code=process.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
+            timed_out=timed_out,
         )
-        return state.clip(text, label="bash output")
 
     # -- internals -----------------------------------------------------------
     def _blocked_by(self, command: str) -> str | None:
@@ -221,31 +281,3 @@ class BashTool:
             process.kill()
         except OSError:  # pragma: no cover - already gone
             pass
-
-    @staticmethod
-    def _format(
-        command: str,
-        exit_code: int | None,
-        stdout: str,
-        stderr: str,
-        *,
-        timed_out: bool,
-        timeout: float,
-    ) -> str:
-        lines = [
-            f"$ {command}",
-            f"exit_code: {exit_code if exit_code is not None else 'unknown'}",
-        ]
-        if timed_out:
-            lines.append(
-                f"[timed out after {timeout:g}s - the process tree was terminated]"
-            )
-        out = stdout.strip("\n")
-        err = stderr.strip("\n")
-        if out:
-            lines.append(f"stdout:\n{out}")
-        if err:
-            lines.append(f"stderr:\n{err}")
-        if not out and not err:
-            lines.append("(no output)")
-        return "\n".join(lines)

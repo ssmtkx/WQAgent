@@ -21,10 +21,10 @@ class ScriptedModel:
 
     def __init__(self, responses: list[Any]) -> None:
         self.responses = list(responses)
-        self.bound: list[Any] | None = None
+        self.bound: list[list[str]] = []
 
-    def bind_tools(self, tools: list[Any]) -> "ScriptedModel":
-        self.bound = list(tools)
+    def bind_tools(self, tools: list[Any], **kwargs: Any) -> "ScriptedModel":
+        self.bound.append([tool.name for tool in tools])
         return self
 
     def invoke(self, messages: list[BaseMessage]) -> Any:
@@ -37,6 +37,41 @@ def _tool_call(name: str, args: dict[str, Any]) -> AIMessage:
     return AIMessage(
         content="", tool_calls=[{"name": name, "args": args, "id": "call_1", "type": "tool_call"}]
     )
+
+
+def _passing_script(file_path: str = "hello.py", content: str = "print('hi')\n") -> list[Any]:
+    """The six responses a passing planner -> actor -> verifier -> final run needs."""
+    return [
+        _tool_call(
+            "todo_write",
+            {
+                "plan_summary": f"write {file_path}, then run it",
+                "todos": [{"id": "t1", "content": f"write {file_path}"}],
+                "acceptance_criteria": [f"{file_path} runs cleanly"],
+                "verification_commands": ["echo ok"],
+            },
+        ),
+        _tool_call("file_write", {"file_path": file_path, "content": content}),
+        AIMessage(content=f"Created {file_path}."),
+        AIMessage(content="Inspected the file."),
+        _tool_call(
+            "verification_report",
+            {
+                "passed": True,
+                "reason": "the file exists and the command succeeded",
+                "checks": [{"name": f"{file_path} runs cleanly", "passed": True, "detail": "exit 0"}],
+                "recommended_next_instruction": "",
+            },
+        ),
+        AIMessage(content=f"Done: created {file_path} and verified it."),
+    ]
+
+
+def _use_scripted(monkeypatch: Any, responses: list[Any]) -> ScriptedModel:
+    """Patch ``create_model`` so the CLI runs against a scripted model."""
+    model = ScriptedModel(list(responses))
+    monkeypatch.setattr(cli_module, "create_model", lambda **kwargs: model)
+    return model
 
 
 def _combined(result: Any) -> str:
@@ -150,61 +185,121 @@ def test_missing_api_key_is_reported(tmp_path: Path, monkeypatch: Any) -> None:
 def test_run_end_to_end_with_a_scripted_model(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
     workspace = tmp_path / "ws"
-    monkeypatch.setattr(
-        cli_module,
-        "create_model",
-        lambda **kwargs: ScriptedModel(
-            [
-                _tool_call("file_write", {"file_path": "hello.py", "content": "print('hi')\n"}),
-                AIMessage(content="Created hello.py."),
-            ]
-        ),
-    )
+    _use_scripted(monkeypatch, _passing_script())
+
     result = runner.invoke(app, ["create hello.py", "-w", str(workspace)])
 
     assert result.exit_code == 0
     assert (workspace / "hello.py").read_text(encoding="utf-8") == "print('hi')\n"
-    assert "Created hello.py." in result.output
+    output = _flat(result.output)
+    assert "Done: created hello.py and verified it." in output
+    # every node reported itself
+    for marker in ("📋 Planner", "🔧 Actor", "✅ Verifier", "📝 Final"):
+        assert marker in output, marker
+    assert "verdict" in output and "passed" in output
 
 
 def test_default_workspace_is_created(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        cli_module,
-        "create_model",
-        lambda **kwargs: ScriptedModel([AIMessage(content="nothing to do")]),
-    )
+    _use_scripted(monkeypatch, _passing_script())
+
     result = runner.invoke(app, ["say hi"])
+
     assert result.exit_code == 0
-    assert (tmp_path / "workspace").is_dir()
+    assert (tmp_path / "workspace" / "hello.py").is_file()
 
 
 def test_workspace_env_var_is_honoured(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "from-env"
     monkeypatch.setenv("WQ_WORKSPACE", str(target))
-    monkeypatch.setattr(
-        cli_module,
-        "create_model",
-        lambda **kwargs: ScriptedModel([AIMessage(content="ok")]),
-    )
+    _use_scripted(monkeypatch, _passing_script())
+
     result = runner.invoke(app, ["say hi"])
+
     assert result.exit_code == 0
-    assert target.is_dir()
+    assert (target / "hello.py").is_file()
 
 
-def test_step_limit_exits_with_an_error(tmp_path: Path, monkeypatch: Any) -> None:
+def test_failed_verification_exits_with_an_error(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        cli_module,
-        "create_model",
-        lambda **kwargs: ScriptedModel(
-            [_tool_call("file_read", {"file_path": "missing.txt"}) for _ in range(3)]
-        ),
+    _use_scripted(
+        monkeypatch,
+        [
+            _tool_call(
+                "todo_write",
+                {
+                    "plan_summary": "try the thing",
+                    "todos": [{"id": "t1", "content": "do the thing"}],
+                    "acceptance_criteria": ["it works"],
+                    "verification_commands": ["exit 1"],
+                },
+            ),
+            AIMessage(content="Tried the thing."),
+            AIMessage(content="It still fails."),
+            _tool_call(
+                "verification_report",
+                {
+                    "passed": False,
+                    "reason": "the command exits 1",
+                    "checks": [{"name": "it works", "passed": False, "detail": "exit 1"}],
+                    "recommended_next_instruction": "fix it",
+                },
+            ),
+            AIMessage(content="Not done: `exit 1` still fails."),
+        ],
     )
-    result = runner.invoke(app, ["loop", "--max-steps", "3", "-w", str(tmp_path / "ws")])
+
+    result = runner.invoke(
+        app, ["do the thing", "--max-attempts", "1", "-w", str(tmp_path / "ws")]
+    )
+
     assert result.exit_code == 1
-    assert "Stopped after 3 steps" in result.output
+    output = _flat(result.output)
+    # the answer goes through the Markdown renderer, so inline-code backticks are gone
+    assert "Not done: exit 1 still fails." in output
+    assert "❌ Verifier" in output
+    assert "failed" in output  # the verdict row
+
+
+def test_actor_step_limit_is_reported(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.chdir(tmp_path)
+    script: list[Any] = [
+        _tool_call(
+            "todo_write",
+            {
+                "plan_summary": "loop forever",
+                "todos": [{"id": "t1", "content": "keep going"}],
+                "acceptance_criteria": ["never"],
+                "verification_commands": ["echo ok"],
+            },
+        )
+    ]
+    script.extend(_tool_call("file_read", {"file_path": "missing.txt"}) for _ in range(3))
+    script.extend(
+        [
+            AIMessage(content="Inspected."),
+            _tool_call(
+                "verification_report",
+                {
+                    "passed": False,
+                    "reason": "nothing was produced",
+                    "checks": [],
+                    "recommended_next_instruction": "actually do the work",
+                },
+            ),
+            AIMessage(content="Not done."),
+        ]
+    )
+    _use_scripted(monkeypatch, script)
+
+    result = runner.invoke(
+        app,
+        ["loop", "--max-steps", "3", "--max-attempts", "1", "-w", str(tmp_path / "ws")],
+    )
+
+    assert result.exit_code == 1
+    assert "Stopped after 3 steps" in _flat(result.output)
 
 
 def test_model_failures_are_reported(tmp_path: Path, monkeypatch: Any) -> None:

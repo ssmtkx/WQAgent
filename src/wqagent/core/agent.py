@@ -1,14 +1,17 @@
-"""The ReAct loop of WQ Agent.
+"""WQ Agent's entry point and its ReAct engine.
 
-One loop, two entry points:
+* :func:`stream_agent_events` - **the agent entry point**. It no longer drives a
+  bare ReAct loop: it streams the compiled LangGraph workflow
+  (``planner -> actor -> verifier -> final``) via
+  ``build_workflow().stream(inputs, stream_mode=["updates", "custom"])`` and
+  translates the graph chunks into one flat event stream for the CLI.
+* :func:`react_loop` - the ReAct engine used *inside* that workflow by the actor
+  node (:func:`wqagent.graph.nodes.actor_node`): think, call tools, observe.
+* :class:`Agent` - object wrapper around :func:`react_loop` (the engine-level API).
 
-* :func:`stream_agent_events` - a generator that yields one event dict per step
-  (``ai_message`` / ``tool_call`` / ``tool_result`` / ``final_answer``). This is
-  what the CLI consumes to print progress in real time.
-* :class:`Agent` - a small object wrapper that drives the same loop and returns
-  an :class:`AgentResult` for scripts and tests.
-
-Both build on :func:`_react_loop`, so the workflow is defined exactly once.
+The graph modules import this module, so the imports of
+:mod:`wqagent.graph.workflow` / :mod:`wqagent.graph.state` inside
+:func:`stream_agent_events` are deliberately local.
 """
 
 from __future__ import annotations
@@ -28,8 +31,6 @@ from langchain_core.tools import BaseTool
 
 from wqagent.core.state import RuntimeState
 from wqagent.prompts.stage1 import ACTOR_PROMPT
-from wqagent.providers import create_model
-from wqagent.tools import build_tools
 
 __all__ = [
     "ACTOR_PROMPT",
@@ -42,6 +43,7 @@ __all__ = [
     "default_system_prompt",
     "execute_tool",
     "message_text",
+    "react_loop",
     "stream_agent_events",
 ]
 
@@ -166,22 +168,22 @@ def _publish(on_event: EventCallback | None, event: dict[str, Any]) -> dict[str,
     return event
 
 
-def _react_loop(
-    task: str,
+def react_loop(
+    messages: list[BaseMessage],
     *,
-    state: RuntimeState,
     model: Any,
     tools: Sequence[Any],
-    system_prompt: str,
-    max_loops: int,
-    history: list[BaseMessage] | None = None,
+    max_loops: int = DEFAULT_MAX_LOOPS,
     on_event: EventCallback | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """The loop itself: think, act, observe - yielding one event per step."""
-    messages: list[BaseMessage] = history if history is not None else []
-    messages.append(SystemMessage(content=system_prompt))
-    messages.append(HumanMessage(content=task))
+    """Think, act, observe - yielding one event per step.
 
+    Unlike :func:`stream_agent_events` this takes a caller-built message list:
+    put the system prompt and the task (or the whole transcript) in *messages*,
+    and the loop appends to that very list as it runs, so the caller keeps the
+    full conversation. Graph nodes use this to seed the actor with the workflow's
+    history. Yields the same events as :func:`stream_agent_events`.
+    """
     tool_list = list(tools)
     tools_by_name = {tool.name: tool for tool in tool_list}
     bound = (
@@ -258,58 +260,103 @@ def _react_loop(
 def stream_agent_events(
     task: str,
     *,
-    workspace: str | Path,
-    max_loops: int = DEFAULT_MAX_LOOPS,
+    workspace: str | Path | None = None,
+    max_attempts: int | None = None,
+    max_loops: int | None = None,
     model: Any | None = None,
     state: RuntimeState | None = None,
-    tools: Sequence[Any] | None = None,
-    system_prompt: str | None = None,
-    history: list[BaseMessage] | None = None,
+    inputs: Any | None = None,
+    graph: Any | None = None,
     on_event: EventCallback | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Run *task* as a ReAct workflow and yield one dict per event.
+    """Run *task* through the compiled workflow, yielding one flat event stream.
 
-    The loop builds ``SystemMessage(ACTOR_PROMPT) + HumanMessage(task)``, lets the
-    tool-bound model think, runs every tool call it asks for, feeds the JSON
-    result back as a ``ToolMessage``, and repeats until the model answers without
-    tool calls or ``max_loops`` is reached.
+    Instead of driving a bare ReAct loop, this streams
+    :func:`wqagent.graph.workflow.build_workflow` with
+    ``stream_mode=["updates", "custom"]``:
+
+    * ``custom`` chunks are the actor's per-step ReAct events - forwarded as they
+      are (they already carry ``node``);
+    * ``updates`` chunks are each node's state update - emitted as ``node_end``
+      events so the CLI can report planner / actor / verifier / final;
+    * the run is closed with a single ``final_answer`` built from the ``final``
+      node's text plus the verdict the verifier recorded.
 
     Events:
-        ``{"type": "ai_message", "content": str, "tool_calls": [str], "loop": int}``
-            One model turn. ``tool_calls`` lists the requested tool names.
-        ``{"type": "tool_call", "name": str, "args": dict, "loop": int}``
-            A tool is about to run.
-        ``{"type": "tool_result", "name": str, "result": dict, "loop": int}``
-            Its result: ``{"ok": True, "tool": ..., "result": str}`` or
-            ``{"ok": False, "tool": ..., "error": str}``.
-        ``{"type": "final_answer", "content": str, "loop": int, "stopped_early": bool}``
+        ``{"type": "ai_message", "node": "actor", "content": str, "tool_calls": [str], "loop": int}``
+        ``{"type": "tool_call", "node": "actor", "name": str, "args": dict, "loop": int}``
+        ``{"type": "tool_result", "node": "actor", "name": str, "result": dict, "loop": int}``
+        ``{"type": "node_end", "node": "planner"|"actor"|"verifier"|"final", "update": dict}``
+        ``{"type": "final_answer", "content": str, "passed": bool, "attempts": int, "stopped_early": bool}``
             Always the last event.
 
     Args:
         task: What the agent should do, in natural language.
         workspace: Workspace root; created automatically when missing.
-        max_loops: Maximum model turns before the run is stopped.
-        model: Chat model to use; defaults to :func:`~wqagent.providers.create_model`
+        max_attempts: Plan/act/verify rounds before the run stops (default 3).
+        max_loops: ReAct loops the actor may use per attempt (default 10).
+        model: Chat model to use; defaults to the nodes' ``create_model()``
             (``.env`` configuration).
         state: Reuse an existing :class:`RuntimeState` (CLI timeouts, output
             budget); takes precedence over ``workspace``.
-        tools: Override the tool list; defaults to ``build_tools(state)``.
-        system_prompt: Override :data:`ACTOR_PROMPT`.
-        history: Optional list that receives the full message history.
+        inputs: A ready-made ``WQGraphState``; skips building one from *task*.
+        graph: A prebuilt workflow app; skips ``build_workflow``.
         on_event: Optional ``(event_type, payload)`` callback mirroring the events.
     """
-    runtime = state if state is not None else RuntimeState(workspace=workspace)
-    chat_model = model if model is not None else create_model()
-    tool_list = list(tools) if tools is not None else build_tools(runtime)
-    yield from _react_loop(
-        task,
-        state=runtime,
-        model=chat_model,
-        tools=tool_list,
-        system_prompt=system_prompt or ACTOR_PROMPT,
-        max_loops=max_loops,
-        history=history,
-        on_event=on_event,
+    # Imported lazily on purpose: the workflow's nodes import this module for
+    # `react_loop`, so a module-level import here would be circular.
+    from wqagent.graph.state import DEFAULT_MAX_ATTEMPTS, new_graph_state
+    from wqagent.graph.workflow import build_workflow
+
+    if inputs is None:
+        runtime = state
+        if runtime is None:
+            if workspace is None:
+                raise ValueError(
+                    "pass workspace=, state= or inputs= so the agent knows where to work"
+                )
+            runtime = RuntimeState(workspace=workspace)
+        inputs = new_graph_state(
+            task, runtime, max_attempts=max_attempts or DEFAULT_MAX_ATTEMPTS
+        )
+
+    app = graph if graph is not None else build_workflow(model=model, actor_loops=max_loops)
+
+    passed = False
+    attempts = 0
+    final_text = ""
+    for mode, chunk in app.stream(inputs, stream_mode=["updates", "custom"]):
+        if mode == "custom":
+            event = dict(chunk or {})
+            if event.get("type") == "final_answer":
+                # The actor round's own end marker - only the `final` node closes
+                # the run, and that answer is emitted once at the end.
+                continue
+            yield _publish(on_event, event)
+            continue
+
+        for node, update in dict(chunk or {}).items():
+            patch = dict(update or {})
+            if node == "verifier":
+                if "attempts" in patch:
+                    attempts = int(patch.get("attempts") or attempts)
+                if "passed" in patch:
+                    passed = bool(patch.get("passed"))
+            elif node == "final":
+                final_text = str(patch.get("final_answer") or final_text)
+            yield _publish(
+                on_event, {"type": "node_end", "node": str(node), "update": patch}
+            )
+
+    yield _publish(
+        on_event,
+        {
+            "type": "final_answer",
+            "content": final_text,
+            "passed": passed,
+            "attempts": attempts,
+            "stopped_early": not passed,
+        },
     )
 
 
@@ -349,14 +396,14 @@ class Agent:
         self, task: str, *, history: list[BaseMessage] | None = None
     ) -> Iterator[dict[str, Any]]:
         """Yield ReAct events for *task* using this agent's model, tools and prompt."""
-        return _react_loop(
-            task,
-            state=self.state,
+        messages: list[BaseMessage] = history if history is not None else []
+        messages.append(SystemMessage(content=self.system_prompt))
+        messages.append(HumanMessage(content=task))
+        return react_loop(
+            messages,
             model=self.model,
             tools=self.tools,
-            system_prompt=self.system_prompt,
             max_loops=self.max_steps,
-            history=history,
             on_event=self.on_event,
         )
 

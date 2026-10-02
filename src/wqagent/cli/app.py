@@ -27,9 +27,10 @@ from rich.table import Table
 from rich.text import Text
 
 from wqagent import __version__
-from wqagent.core.agent import DEFAULT_MAX_STEPS, stream_agent_events
+from wqagent.core.agent import DEFAULT_MAX_LOOPS, stream_agent_events
 from wqagent.core.paths import WorkspacePathError, resolve_workspace
 from wqagent.core.state import DEFAULT_TIMEOUT_SECONDS, RuntimeState
+from wqagent.graph.state import DEFAULT_MAX_ATTEMPTS
 from wqagent.providers import ProviderConfigError, create_model, describe_config
 from wqagent.tools import describe_tools, tool_names
 
@@ -135,19 +136,19 @@ def _model_label(model: Any) -> str:
 
 
 class _EventSummary:
-    """Counters accumulated while streaming ReAct events, for the closing summary."""
+    """Counters accumulated while streaming graph events, for the closing summary."""
 
     def __init__(self) -> None:
-        self.loops = 0
+        self.attempts = 0
         self.tool_calls = 0
         self.failures = 0
         self.files: list[str] = []
+        self.nodes: list[str] = []
+        self.passed = False
 
     def observe(self, event: dict[str, Any]) -> None:
         kind = event.get("type")
-        if kind == "ai_message":
-            self.loops = max(self.loops, int(event.get("loop") or 0))
-        elif kind == "tool_call":
+        if kind == "tool_call":
             self.tool_calls += 1
             name = str(event.get("name") or "")
             path = str((event.get("args") or {}).get("file_path") or "")
@@ -156,37 +157,125 @@ class _EventSummary:
         elif kind == "tool_result":
             if not (event.get("result") or {}).get("ok", True):
                 self.failures += 1
+        elif kind == "node_end":
+            node = str(event.get("node") or "")
+            update = dict(event.get("update") or {})
+            self.nodes.append(node)
+            if node == "verifier":
+                self.attempts = max(self.attempts, int(update.get("attempts") or 0))
+                self.passed = bool(update.get("passed"))
 
 
-def _render_event(event: dict[str, Any], *, verbose: bool) -> None:
-    """Print one ReAct event as soon as it arrives."""
-    kind = event.get("type")
-    if kind == "ai_message":
-        # Only intermediate reasoning is interesting here: the turn without tool
-        # calls is the final answer, and it gets its own panel below.
-        names = [str(name) for name in event.get("tool_calls") or []]
-        if not verbose or not names:
-            return
-        content = str(event.get("content") or "").strip()
-        if content:
-            console.print(Text(content, style="dim"))
-        console.print(f"[dim]   calling: {escape(', '.join(names))}[/]")
-    elif kind == "tool_call":
-        console.print(
-            f"[bold cyan]-> {escape(str(event.get('name')))}[/] "
-            f"[dim]{escape(_summarize_args(dict(event.get('args') or {})))}[/]"
-        )
-    elif kind == "tool_result":
-        result = dict(event.get("result") or {})
-        if result.get("ok", True):
-            output = str(result.get("result") or "")
-            console.print(Text(output if verbose else _preview(output), style="dim"))
-        else:
-            error = str(result.get("error") or "")
+#: One header per node, so the CLI shows which part of the graph is reporting.
+NODE_HEADERS = {
+    "planner": "📋 Planner",
+    "actor": "🔧 Actor",
+    "verifier": "✅ Verifier",
+    "final": "📝 Final",
+}
+NODE_FAILED_HEADERS = {"verifier": "❌ Verifier"}
+
+
+def _node_header(node: str, update: dict[str, Any]) -> str:
+    if node == "verifier" and not update.get("passed"):
+        return NODE_FAILED_HEADERS["verifier"]
+    return NODE_HEADERS.get(node, node or "node")
+
+
+def _render_node_update(node: str, update: dict[str, Any]) -> None:
+    """Print what one graph node produced (the header is printed by the caller)."""
+    if node == "planner":
+        summary = str(update.get("plan_summary") or "").strip()
+        if summary:
+            console.print(Text(_preview(summary, lines=3, limit=400), style="dim"))
+        for todo in update.get("todos") or []:
             console.print(
-                f"[red]x {escape(str(event.get('name')))} failed:[/] "
-                f"{escape(error if verbose else _preview(error))}"
+                f"   [ ] {escape(str(todo.get('id')))}: {escape(str(todo.get('content')))}"
             )
+        for command in update.get("verification_commands") or []:
+            console.print(f"   [dim]$ {escape(str(command))}[/]")
+    elif node == "actor":
+        summary = str(update.get("last_actor_summary") or "").strip()
+        if summary:
+            console.print(Text(_preview(summary, lines=4, limit=500), style="dim"))
+    elif node == "verifier":
+        for result in update.get("verification_results") or []:
+            ok = bool(result.get("ok"))
+            console.print(
+                Text(
+                    f"   {'✓' if ok else '✗'} {result.get('command')} "
+                    f"-> exit code {result.get('exit_code')}",
+                    style="dim" if ok else "red",
+                )
+            )
+        if not update.get("verification_results"):
+            console.print(Text("   (no verification commands)", style="dim"))
+        error = str(update.get("last_error") or "").strip()
+        if error:
+            console.print(Text(_preview(error, lines=5, limit=700), style="red"))
+
+
+class _NodeRenderer:
+    """Prints the unified event stream, one header per graph node.
+
+    The actor streams its tool events *before* the graph reports the node's state
+    update, so its header is opened by the first event instead of by ``node_end``.
+    """
+
+    def __init__(self, *, verbose: bool) -> None:
+        self.verbose = verbose
+        self._actor_open = False
+
+    def render(self, event: dict[str, Any]) -> None:
+        kind = event.get("type")
+        if kind == "ai_message":
+            names = [str(name) for name in event.get("tool_calls") or []]
+            if not self.verbose or not names:
+                return
+            self._open("actor")
+            content = str(event.get("content") or "").strip()
+            if content:
+                console.print(Text(content, style="dim"))
+            console.print(f"[dim]   calling: {escape(', '.join(names))}[/]")
+        elif kind == "tool_call":
+            self._open(str(event.get("node") or "actor"))
+            console.print(
+                f"[bold cyan]-> {escape(str(event.get('name')))}[/] "
+                f"[dim]{escape(_summarize_args(dict(event.get('args') or {})))}[/]"
+            )
+        elif kind == "tool_result":
+            result = dict(event.get("result") or {})
+            if result.get("ok", True):
+                output = str(result.get("result") or "")
+                console.print(Text(output if self.verbose else _preview(output), style="dim"))
+            else:
+                error = str(result.get("error") or "")
+                console.print(
+                    f"[red]x {escape(str(event.get('name')))} failed:[/] "
+                    f"{escape(error if self.verbose else _preview(error))}"
+                )
+        elif kind == "node_end":
+            self._render_node_end(
+                str(event.get("node") or ""), dict(event.get("update") or {})
+            )
+
+    def _open(self, node: str) -> None:
+        if node == "actor":
+            if not self._actor_open:
+                console.print(f"[bold]{NODE_HEADERS['actor']}[/]")
+                self._actor_open = True
+            return
+        console.print(f"[bold]{_node_header(node, {})}[/]")
+
+    def _render_node_end(self, node: str, update: dict[str, Any]) -> None:
+        if node == "final":
+            # the answer is printed by the closing panel in _render_result
+            return
+        if node == "actor" and self._actor_open:
+            self._actor_open = False  # the header was already printed for this round
+        else:
+            console.print(f"[bold]{_node_header(node, update)}[/]")
+        _render_node_update(node, update)
 
 
 # -- informational commands --------------------------------------------------
@@ -212,6 +301,7 @@ def _print_config(
     api_key: Optional[str],
     env_file: Optional[Path],
     max_steps: int,
+    max_attempts: int,
     timeout: int,
 ) -> None:
     """Print the resolved configuration as plain, copy-paste friendly lines."""
@@ -237,7 +327,8 @@ def _print_config(
         ("base url", settings["base_url"]),
         ("api key", key_row),
         ("workspace", f"{resolved_workspace} ({workspace_note})"),
-        ("max steps", str(max_steps)),
+        ("max attempts", str(max_attempts)),
+        ("actor loops", f"{max_steps} per attempt"),
         ("bash timeout", f"{timeout}s"),
         ("tools", ", ".join(tool_names())),
     ]
@@ -275,11 +366,19 @@ def run_task(
         None, "--env-file", help="Explicit .env file to load."
     ),
     max_steps: int = typer.Option(
-        DEFAULT_MAX_STEPS,
+        DEFAULT_MAX_LOOPS,
         "--max-steps",
         min=1,
-        max=500,
-        help="Model/tool rounds before the run stops.",
+        max=200,
+        help="ReAct loops the actor may use per attempt.",
+        show_default=True,
+    ),
+    max_attempts: int = typer.Option(
+        DEFAULT_MAX_ATTEMPTS,
+        "--max-attempts",
+        min=1,
+        max=20,
+        help="Plan/act/verify rounds before the run stops.",
         show_default=True,
     ),
     temperature: float = typer.Option(
@@ -332,6 +431,7 @@ def run_task(
             api_key=api_key,
             env_file=env_file,
             max_steps=max_steps,
+            max_attempts=max_attempts,
             timeout=timeout,
         )
         raise typer.Exit(EXIT_OK)
@@ -366,6 +466,8 @@ def run_task(
                 f"task      : {escape(task.strip())}\n"
                 f"workspace : {escape(str(state.workspace))}\n"
                 f"model     : {escape(_model_label(chat))}\n"
+                f"workflow  : planner -> actor -> verifier -> final "
+                f"(max {max_attempts} attempts, {max_steps} loops each)\n"
                 f"tools     : {escape(', '.join(tool_names()))}",
                 border_style="cyan",
                 title="run",
@@ -373,11 +475,13 @@ def run_task(
         )
 
     summary = _EventSummary()
+    renderer = None if quiet else _NodeRenderer(verbose=verbose)
     final: dict[str, Any] = {}
     try:
         for event in stream_agent_events(
             task.strip(),
             workspace=state.workspace,
+            max_attempts=max_attempts,
             max_loops=max_steps,
             model=chat,
             state=state,
@@ -385,8 +489,8 @@ def run_task(
             summary.observe(event)
             if event.get("type") == "final_answer":
                 final = event
-            if not quiet:
-                _render_event(event, verbose=verbose)
+            if renderer is not None:
+                renderer.render(event)
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         error_console.print("[yellow]interrupted[/]")
         raise typer.Exit(EXIT_INTERRUPTED) from None
@@ -397,7 +501,7 @@ def run_task(
         _fail("the agent stopped without producing a final answer")
 
     _render_result(final, summary, state, quiet=quiet)
-    raise typer.Exit(EXIT_OK if not final.get("stopped_early") else EXIT_ERROR)
+    raise typer.Exit(EXIT_OK if final.get("passed") else EXIT_ERROR)
 
 
 def _render_result(
@@ -408,13 +512,15 @@ def _render_result(
     quiet: bool,
 ) -> None:
     """Print the final answer event plus the run summary."""
-    stopped_early = bool(final.get("stopped_early"))
+    passed = bool(final.get("passed"))
     answer = str(final.get("content") or "").strip() or "(the model returned an empty answer)"
+    if not quiet:
+        console.print(f"[bold]{NODE_HEADERS['final']}[/]")
     console.print(
         Panel(
             Markdown(answer),
-            title="stopped early" if stopped_early else "final answer",
-            border_style="yellow" if stopped_early else "green",
+            title="final answer" if passed else "not verified",
+            border_style="green" if passed else "red",
         )
     )
     if quiet:
@@ -422,7 +528,8 @@ def _render_result(
     table = Table.grid(padding=(0, 2))
     table.add_column(style="bold")
     table.add_column()
-    table.add_row("loops", str(summary.loops))
+    table.add_row("verdict", "passed" if passed else "failed")
+    table.add_row("attempts", str(summary.attempts or 1))
     calls = str(summary.tool_calls)
     if summary.failures:
         calls += f" ({summary.failures} failed)"
@@ -430,6 +537,8 @@ def _render_result(
     if summary.files:
         listed = ", ".join(summary.files[:10]) + (" ..." if len(summary.files) > 10 else "")
         table.add_row("files written", Text(listed))
+    if summary.nodes:
+        table.add_row("nodes", " -> ".join(summary.nodes))
     table.add_row("workspace", Text(str(state.workspace)))
     console.print(table)
 

@@ -17,10 +17,13 @@ from wqagent.tools.file_tools import FileEditTool, FileReadTool, FileWriteTool
 from wqagent.tools.grep_tool import GrepTool
 
 __all__ = [
+    "READ_ONLY_TOOL_CLASSES",
     "TOOL_CLASSES",
+    "build_read_only_tools",
     "build_tool_instances",
     "build_tools",
     "describe_tools",
+    "tool_names",
 ]
 
 #: Registration order is also the order the tools are listed in the system prompt.
@@ -31,6 +34,10 @@ TOOL_CLASSES: tuple[type, ...] = (
     GrepTool,
     BashTool,
 )
+
+#: Tools that cannot change the workspace - what the verifier node gets, so a
+#: verification run can inspect the result but never "fix" it.
+READ_ONLY_TOOL_CLASSES: tuple[type, ...] = (FileReadTool, GrepTool)
 
 
 def build_tool_instances(state: RuntimeState) -> list[Any]:
@@ -46,6 +53,15 @@ def build_tool_instances(state: RuntimeState) -> list[Any]:
 def build_tools(state: RuntimeState) -> list[StructuredTool]:
     """Return every tool bound to *state*, ready for ``model.bind_tools()``."""
     return [instance.as_tool() for instance in build_tool_instances(state)]
+
+
+def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
+    """Return only the tools that cannot modify the workspace.
+
+    Used by the verifier node: it may read files and search them, but it must not
+    edit, rewrite or run shell commands.
+    """
+    return [tool_class(state).as_tool() for tool_class in READ_ONLY_TOOL_CLASSES]
 
 
 def describe_tools() -> list[dict[str, Any]]:
