@@ -44,10 +44,13 @@ def test_streams_the_whole_workflow(tmp_path: Path) -> None:
     # only the `final` node closes the run - exactly one final_answer
     assert _kinds(events).count("final_answer") == 1
 
-    # the graph nodes reported themselves, in order, and no actor is involved
+    # the graph nodes reported themselves, in order, and no actor is involved;
+    # every hop between planning and verification goes through the context monitor
     assert [event["node"] for event in _by_type(events, "node_end")] == [
         "planner",
+        "context_monitor",
         "verifier",
+        "context_monitor",
         "final",
     ]
 
@@ -212,9 +215,13 @@ def test_retry_replans_before_the_second_attempt(tmp_path: Path) -> None:
 
     assert [event["node"] for event in events if event["type"] == "node_end"] == [
         "planner",
+        "context_monitor",
         "verifier",
+        "context_monitor",
         "planner",
+        "context_monitor",
         "verifier",
+        "context_monitor",
         "final",
     ]
     assert [event["to"] for event in _by_type(events, "handoff")] == ["codeAgent", "codeAgent"]
@@ -328,6 +335,33 @@ def test_planner_loop_budget_is_honoured(tmp_path: Path) -> None:
 def test_missing_workspace_is_an_error() -> None:
     with pytest.raises(ValueError, match="workspace="):
         list(stream_agent_events("do it", model=ScriptedModel([])))
+
+
+def test_complex_workflow_streams_through_the_monitor(tmp_path: Path) -> None:
+    """The context-managed graph works through the same entry point."""
+    from wqagent.graph import build_complex_workflow
+
+    model = ScriptedModel(passing_script())
+    app = build_complex_workflow(model=model)
+
+    events = list(stream_agent_events("write hello.py", workspace=tmp_path / "ws", graph=app))
+
+    assert [event["node"] for event in _by_type(events, "node_end")] == [
+        "planner",
+        "context_monitor",
+        "verifier",
+        "context_monitor",
+        "final",
+    ]
+    monitor = next(
+        event["update"]
+        for event in events
+        if event["type"] == "node_end" and event["node"] == "context_monitor"
+    )
+    assert monitor["context_token_count"] > 0
+    assert monitor["context_should_compress"] is False
+    assert events[-1]["passed"] is True
+    assert (tmp_path / "ws" / "hello.py").is_file()
 
 
 # -- engine level ------------------------------------------------------------

@@ -2,8 +2,9 @@
 
 * :func:`stream_agent_events` - **the agent entry point**. It no longer drives a
   bare ReAct loop: it streams the compiled LangGraph workflow
-  (``planner -> verifier -> final``, the planner delegating to the specialist
-  agents) via ``build_workflow().stream(inputs, stream_mode=["updates", "custom"])``
+  (``planner -> context_monitor -> verifier -> final`` with context compression
+  wired in, the planner delegating to the specialist agents) via
+  ``build_complex_workflow().stream(inputs, stream_mode=["updates", "custom"])``
   and translates the graph chunks into one flat event stream for the CLI.
 * :func:`react_loop` - the ReAct engine used *inside* that workflow by the actor
   node (:func:`wqagent.graph.nodes.actor_node`): think, call tools, observe.
@@ -345,13 +346,13 @@ def stream_agent_events(
         state: Reuse an existing :class:`RuntimeState` (CLI timeouts, output
             budget); takes precedence over ``workspace``.
         inputs: A ready-made ``WQGraphState``; skips building one from *task*.
-        graph: A prebuilt workflow app; skips ``build_workflow``.
+        graph: A prebuilt workflow app; skips ``build_complex_workflow``.
         on_event: Optional ``(event_type, payload)`` callback mirroring the events.
     """
     # Imported lazily on purpose: the workflow's nodes import this module for
     # `react_loop`, so a module-level import here would be circular.
     from wqagent.graph.state import DEFAULT_MAX_ATTEMPTS, new_graph_state
-    from wqagent.graph.workflow import build_workflow
+    from wqagent.graph.workflow import build_complex_workflow
 
     if inputs is None:
         runtime = state
@@ -365,7 +366,11 @@ def stream_agent_events(
             task, runtime, max_attempts=max_attempts or DEFAULT_MAX_ATTEMPTS
         )
 
-    app = graph if graph is not None else build_workflow(model=model, planner_loops=max_loops)
+    app = (
+        graph
+        if graph is not None
+        else build_complex_workflow(model=model, planner_loops=max_loops)
+    )
 
     passed = False
     attempts = 0

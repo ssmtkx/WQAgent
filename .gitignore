@@ -20,6 +20,10 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
+# tiktoken's downloaded BPE vocabularies (e.g. cl100k_base, ~1.7 MB); langchain's
+# token counting fetches them, and they land here when tiktoken's cache dir
+# resolves to the relative path "data-gym-cache"
+data-gym-cache/
 
 # agent scratch space (default workspace)
 workspace/

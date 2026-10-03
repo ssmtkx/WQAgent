@@ -17,8 +17,14 @@ from wqagent.agents.code_agent import (
 )
 from wqagent.core.state import RuntimeState
 from wqagent.graph import new_graph_state
+from wqagent.graph.memory import build_layered_memory
 from wqagent.graph.state import make_todo
 from wqagent.prompts.stage3 import CODE_AGENT_PROMPT
+
+
+def _layered(state: Any) -> dict[str, Any]:
+    """The layered memory the runtime injects for the code agent."""
+    return dict(build_layered_memory(state, node="codeAgent"))
 
 
 class ScriptedModel:
@@ -71,23 +77,34 @@ def state(tmp_path: Path):
 
 
 # -- messages and memory -----------------------------------------------------
-def test_messages_are_prompt_task_instruction_session_and_memory(state: Any) -> None:
+def test_messages_are_task_instruction_and_layered_memory(state: Any) -> None:
+    """The layered memory replaced the auto-built session block (no duplication)."""
     state["research_notes"] = "slugify examples: https://example.com/slugify"
     state["last_error"] = "pytest failed"
 
-    messages = build_code_messages(state, "t2: run the tests")
+    messages = build_code_messages(state, "t2: run the tests", layered=_layered(state))
 
     assert messages[0].content == CODE_AGENT_PROMPT
     human = messages[1].content
     assert "add a slugify helper" in human
     assert "t2: run the tests" in human
-    assert "Session context:" in human
-    assert "Plan progress - 0/2 todos completed" in human
-    assert "[ ] t1: write utils.py" in human
-    assert "write utils.py, then test it" in human
+    assert "Session context:" not in human  # no second, redundant memory block
+    assert "Layered memory" in human
+    # everything the session block used to carry is in the snapshot now
+    assert '"plan_summary": "write utils.py, then test it"' in human
+    assert '"content": "write utils.py"' in human
     assert "pytest failed" in human
-    assert "Memory notes:" in human
     assert "https://example.com/slugify" in human
+
+
+def test_an_explicit_memory_snapshot_is_still_rendered(state: Any) -> None:
+    """Passing memory=... explicitly keeps working (the seam is opt-in now)."""
+    messages = build_code_messages(state, "t1", memory="a string of notes")
+
+    human = messages[1].content
+    assert "Session context:" in human
+    assert "Memory notes:" in human
+    assert "a string of notes" in human
 
 
 def test_memory_snapshot_layers(state: Any) -> None:
@@ -167,8 +184,10 @@ def test_runs_tools_updates_todos_and_summarises(state: Any) -> None:
         ["file_read", "file_write", "file_edit", "grep", "bash", "todo_update"]
     ]
 
-    # events: one tool_call + one tool_result each, with todo_update in between
+    # events: the injected memory first, then one tool_call + tool_result each,
+    # with todo_update in between
     assert [event["type"] for event in events] == [
+        "memory",
         "tool_call",
         "todo_update",
         "tool_result",
@@ -179,8 +198,10 @@ def test_runs_tools_updates_todos_and_summarises(state: Any) -> None:
         "tool_result",
     ]
     assert result["tool_events"] == events
-    assert events[1]["todos"][0]["status"] == "in_progress"
-    assert events[0]["name"] == "todo_update"
+    assert events[0]["node"] == "codeAgent"
+    assert events[0]["memory"]["rules"]["scope"] == "workspace"
+    assert events[2]["todos"][0]["status"] == "in_progress"
+    assert events[1]["name"] == "todo_update"
 
 
 def test_bad_todo_updates_are_reported_not_fatal(state: Any) -> None:
@@ -226,7 +247,11 @@ def test_model_failure_keeps_partial_progress(state: Any) -> None:
     assert result["ok"] is False
     assert "connection reset by peer" in result["error"]
     assert (workspace / "half.py").is_file()  # the work already done is kept
-    assert [event["type"] for event in result["tool_events"]] == ["tool_call", "tool_result"]
+    assert [event["type"] for event in result["tool_events"]] == [
+        "memory",
+        "tool_call",
+        "tool_result",
+    ]
     assert result["messages"]  # the transcript is returned too
 
 
@@ -250,7 +275,22 @@ def test_agent_that_only_answers(state: Any) -> None:
 
     assert result["ok"] is True
     assert result["summary"] == "Nothing to do."
-    assert result["tool_events"] == []
+    # the injected memory is the only event: the agent never called a tool
+    assert [event["type"] for event in result["tool_events"]] == ["memory"]
+
+
+def test_code_agent_sees_the_layered_memory(state: Any) -> None:
+    model = ScriptedModel([AIMessage(content="Nothing to do.")])
+
+    result = run_code_agent(state, "t1: look around", model=model)
+
+    prompt = model.seen[0][1].content
+    assert "Planner instruction:\nt1: look around" in prompt
+    assert "Layered memory" in prompt
+    assert '"rules"' in prompt and '"working_memory"' in prompt
+    assert '"node": "codeAgent"' in prompt
+    assert '"content": "write utils.py"' in prompt  # the plan rides along in the snapshot
+    assert [event["type"] for event in result["tool_events"]] == ["memory"]
 
 
 def test_tool_override_is_honoured(state: Any) -> None:

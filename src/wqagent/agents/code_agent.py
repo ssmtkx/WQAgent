@@ -24,6 +24,11 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from wqagent.core.agent import last_ai_text, react_loop, write_event
 from wqagent.core.state import RuntimeState
+from wqagent.graph.memory import (
+    build_layered_memory,
+    format_layered_memory_for_prompt,
+    memory_event,
+)
 from wqagent.graph.state import (
     TodoItem,
     normalise_todos,
@@ -117,13 +122,19 @@ def build_memory_snapshot(
     return MemorySnapshot(session="\n".join(parts), notes=notes)
 
 
-def build_code_messages(
+def _code_agent_input(
     state: Mapping[str, Any] | None,
     instruction: str,
+    memory: Mapping[str, Any] | None,
     *,
-    memory: MemorySnapshot | str | None = None,
-) -> list[BaseMessage]:
-    """Build the opening messages: prompt + task + instruction + session + memory."""
+    session: MemorySnapshot | str | None = None,
+) -> str:
+    """The agent's human message: task + instruction + session + layered memory.
+
+    The layered memory already carries the plan progress, the last implementer
+    report and the last failure, so the agent-local session snapshot is only
+    rendered when the caller passes one explicitly (``memory=``/``session=``).
+    """
     source = state if isinstance(state, Mapping) else {}
     task = str(source.get("task") or "").strip() or "(no task given)"
     request = str(instruction or "").strip()
@@ -131,17 +142,37 @@ def build_code_messages(
     lines = [f"Task:\n{task}"]
     if request:
         lines.append(f"Planner instruction:\n{request}")
-    snapshot = build_memory_snapshot(source, memory)
-    rendered = snapshot.render()
-    if rendered:
-        lines.append(rendered)
+    if session is not None:
+        rendered = build_memory_snapshot(source, session).render()
+        if rendered:
+            lines.append(rendered)
+    if memory:
+        lines.append(
+            "Layered memory (rules, current task state, durable notes and compressed "
+            "history):\n" + format_layered_memory_for_prompt(memory)
+        )
     lines.append(
         "Implement the instruction, keep the todo list up to date as you go, and end with "
         "a concise summary of the files you changed and the checks you ran."
     )
+    return "\n\n".join(lines)
+
+
+def build_code_messages(
+    state: Mapping[str, Any] | None,
+    instruction: str,
+    *,
+    memory: MemorySnapshot | str | None = None,
+    layered: Mapping[str, Any] | None = None,
+) -> list[BaseMessage]:
+    """Build the opening messages: prompt + task + instruction + session + memory.
+
+    ``memory`` is the agent-local session/notes snapshot; ``layered`` is the
+    runtime's three-layer memory (see :mod:`wqagent.graph.memory`).
+    """
     return [
         SystemMessage(content=CODE_AGENT_PROMPT),
-        HumanMessage(content="\n\n".join(lines)),
+        HumanMessage(content=_code_agent_input(state, instruction, layered, session=memory)),
     ]
 
 
@@ -177,13 +208,12 @@ def run_code_agent(
         failure is reported while the work already done is kept.
     """
     source = state if isinstance(state, Mapping) else {}
-    messages = build_code_messages(source, instruction, memory=memory)
     todos = normalise_todos(source.get("todos"))
 
     runtime = source.get("runtime")
     if not isinstance(runtime, RuntimeState):
         return _failure(
-            messages,
+            build_code_messages(source, instruction, memory=memory),
             todos,
             "state has no 'runtime' RuntimeState; build the state with new_graph_state()",
         )
@@ -201,6 +231,15 @@ def run_code_agent(
     def emit(event: dict[str, Any]) -> None:
         tool_events.append(event)
         write_event(writer, event)
+
+    # the runtime's three-layer memory rides along in the opening message
+    layered: dict[str, Any] = {}
+    try:
+        layered = dict(build_layered_memory(source, node="codeAgent"))
+    except Exception:  # noqa: BLE001 - memory must never break the agent
+        layered = {}
+    emit(memory_event(layered, node="codeAgent"))
+    messages = build_code_messages(source, instruction, memory=memory, layered=layered)
 
     def on_event(kind: str, payload: dict[str, Any]) -> None:
         nonlocal todos

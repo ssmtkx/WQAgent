@@ -29,7 +29,14 @@ from wqagent.core.state import RuntimeState
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from langchain_core.tools import StructuredTool
 
-__all__ = ["BashInput", "BashTool", "MAX_TIMEOUT_SECONDS", "SHELL_NAME", "ShellOutcome"]
+__all__ = [
+    "BashInput",
+    "BashTool",
+    "MAX_TIMEOUT_SECONDS",
+    "SHELL_NAME",
+    "ShellOutcome",
+    "shell_guidance",
+]
 
 MAX_TIMEOUT_SECONDS = 3_600.0
 
@@ -53,6 +60,29 @@ def _shell_name() -> str:
 
 #: Resolved once at import; the model is told which shell its commands run in.
 SHELL_NAME = _shell_name()
+
+
+def shell_guidance() -> str:
+    """What to watch out for when writing commands for this machine's shell.
+
+    The bash tool passes its own command to a real shell, and the *planner* writes
+    verification commands without running them - it never sees the tool
+    description, so the runtime has to tell it what this shell accepts.
+    """
+    if os.name == "nt":  # pragma: no cover - platform specific
+        if Path(_shell_executable() or "").stem.lower() == "pwsh":
+            return (
+                "PowerShell 7 (pwsh): `&&` and `||` work, but POSIX tools "
+                "(`test`, `cat -A`, `grep -q`, process substitution `<(...)`) do not; "
+                "prefer `Test-Path`, `Select-String` and `;` between statements."
+            )
+        return (
+            "Windows PowerShell 5.1: `&&`, `||`, `test`, `cat -A`, `grep -q` and process "
+            "substitution `<(...)` are NOT available; use `;`, `if ($?) { ... }`, "
+            "`Test-Path`, `Select-String`, and `python` (not `python3`) unless you know "
+            "the interpreter exists."
+        )
+    return "POSIX shell (bash/sh): `&&`, `||`, `test`, `grep`, process substitution all work."
 
 
 @dataclass(frozen=True)

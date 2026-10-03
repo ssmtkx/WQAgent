@@ -35,7 +35,14 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+)
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from pydantic import BaseModel, Field
 
 from wqagent.core.agent import (
@@ -45,6 +52,29 @@ from wqagent.core.agent import (
     write_event,
 )
 from wqagent.core.state import RuntimeState
+from wqagent.graph.memory import (
+    COMPRESSION_FIELD_CHARS,
+    COMPRESSION_ITEMS,
+    COMPRESSION_SUMMARY_CHARS,
+    DEFAULT_CONTEXT_TOKEN_LIMIT,
+    ERROR_CHARS,
+    HISTORY_SUMMARY_FILE,
+    NOTEPAD_FILE,
+    RESEARCH_CHARS,
+    SUMMARY_CHARS,
+    CompressionEvent,
+    _short_text,
+    _source_refs,
+    _trim_handoffs,
+    append_notepad,
+    build_layered_memory,
+    format_layered_memory_for_prompt,
+    has_notepad_content,
+    memory_event,
+    read_todos,
+    render_notepad_section,
+    write_todos,
+)
 from wqagent.graph.state import (
     DEFAULT_MAX_ATTEMPTS,
     TODO_MARKS,
@@ -62,8 +92,9 @@ from wqagent.graph.state import (
 from wqagent.prompts.stage1 import ACTOR_PROMPT
 from wqagent.prompts.stage2 import FINAL_PROMPT
 from wqagent.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
+from wqagent.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 from wqagent.providers import create_model
-from wqagent.tools.bash_tool import BashTool
+from wqagent.tools.bash_tool import SHELL_NAME, BashTool, shell_guidance
 from wqagent.tools.graph_tools import (
     TodoUpdateTool,
     TodoWriteTool,
@@ -78,11 +109,19 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "CallCodeAgentTool",
     "CallSearchAgentTool",
+    "COMPRESSION_ITEMS",
+    "COMPRESS_TRANSCRIPT_CHARS",
     "DEFAULT_ACTOR_LOOPS",
+    "DEFAULT_CONTEXT_TOKEN_LIMIT",
     "DEFAULT_PLANNER_LOOPS",
     "DEFAULT_VERIFIER_LOOPS",
+    "SOURCE_LIMIT",
     "VERIFY_OUTPUT_CHARS",
     "actor_node",
+    "context_compressor_node",
+    "context_compressor_route",
+    "context_monitor_node",
+    "context_monitor_route",
     "final_node",
     "format_final_answer",
     "get_model",
@@ -101,6 +140,10 @@ DEFAULT_ACTOR_LOOPS = 10
 DEFAULT_VERIFIER_LOOPS = 6
 #: stdout/stderr characters kept per verification command in the state.
 VERIFY_OUTPUT_CHARS = 4_000
+#: Transcript characters handed to the compressor in one request (head + tail).
+COMPRESS_TRANSCRIPT_CHARS = 120_000
+#: Items kept in the state's ``sources`` after a compression.
+SOURCE_LIMIT = 20
 
 _MODEL: Any | None = None
 
@@ -529,6 +572,7 @@ def _call_code_agent_tool(
     model: Any | None = None,
     tools: Sequence[Any] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    persist: Callable[[Sequence[TodoItem]], None] | None = None,
 ) -> dict[str, Any]:
     """Delegate *instruction* to codeAgent and record the handoff.
 
@@ -556,6 +600,7 @@ def _call_code_agent_tool(
         writer=_agent_writer(writer, "codeAgent", on_event),
         model=model,
         tools=tools,
+        persist=persist,
     )
     if collector is not None:
         collector.handoffs.append(
@@ -668,6 +713,7 @@ class CallCodeAgentTool:
         model: Any | None = None,
         tools: Sequence[Any] | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        persist: Callable[[Sequence[TodoItem]], None] | None = None,
     ) -> None:
         self._state = state
         self._writer = writer
@@ -675,6 +721,8 @@ class CallCodeAgentTool:
         self._model = model
         self._tools = tools
         self._on_event = on_event
+        self._persist = persist
+        self._persist = persist
 
     def run(self, instruction: str) -> str:
         result = _call_code_agent_tool(
@@ -685,6 +733,7 @@ class CallCodeAgentTool:
             model=self._model,
             tools=self._tools,
             on_event=self._on_event,
+            persist=self._persist,
         )
         return _specialist_report("codeAgent", result)
 
@@ -698,6 +747,72 @@ class CallCodeAgentTool:
             description=self.description,
             args_schema=self.args_schema,
         )
+
+
+def _todo_persister(
+    runtime: RuntimeState, state: Mapping[str, Any]
+) -> Callable[[Sequence[TodoItem]], None]:
+    """A ``persist`` hook that mirrors the todo list into ``TODO.md``."""
+
+    def persist(todos: Sequence[TodoItem]) -> None:
+        write_todos(
+            runtime,
+            todos,
+            task=str(state.get("task") or ""),
+            plan_summary=str(state.get("plan_summary") or ""),
+            acceptance_criteria=_text_list(state.get("acceptance_criteria")),
+            verification_commands=_text_list(state.get("verification_commands")),
+        )
+
+    return persist
+
+
+def _persist_plan(runtime: RuntimeState, state: Mapping[str, Any], **overrides: Any) -> None:
+    """Mirror the plan into ``TODO.md`` after a node changed it (best effort)."""
+    write_todos(
+        runtime,
+        overrides.get("todos", _todos(state)),
+        task=str(state.get("task") or ""),
+        plan_summary=str(overrides.get("plan_summary", state.get("plan_summary")) or ""),
+        acceptance_criteria=_text_list(
+            overrides.get("acceptance_criteria", state.get("acceptance_criteria"))
+        ),
+        verification_commands=_text_list(
+            overrides.get("verification_commands", state.get("verification_commands"))
+        ),
+    )
+
+
+def _resume_plan(
+    runtime: RuntimeState, state: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Adopt the plan recorded in ``TODO.md`` when it belongs to this same task.
+
+    A run that was killed mid-flight can simply be started again: the plan, the
+    remaining todos and the verification commands are read back from the workspace
+    instead of being replanned from scratch. Only an *unfinished* plan for the same
+    task is adopted - a different task, or one whose todos are all completed, is
+    ignored (and overwritten once the planner publishes its own plan).
+    """
+    if _todos(state):
+        return None
+    recorded = read_todos(runtime)
+    if not recorded.get("exists") or not recorded.get("todos"):
+        return None
+    task = str(state.get("task") or "").strip()
+    if not task or str(recorded.get("task") or "").strip() != task:
+        return None
+    todos = normalise_todos(recorded.get("todos"))
+    if not todos or all(todo["status"] == "completed" for todo in todos):
+        return None
+    plan: dict[str, Any] = {"todos": todos}
+    if recorded.get("plan_summary"):
+        plan["plan_summary"] = str(recorded["plan_summary"])
+    if recorded.get("acceptance_criteria"):
+        plan["acceptance_criteria"] = _text_list(recorded["acceptance_criteria"])
+    if recorded.get("verification_commands"):
+        plan["verification_commands"] = _text_list(recorded["verification_commands"])
+    return plan
 
 
 def planner_node(
@@ -720,14 +835,20 @@ def planner_node(
     supervisor summary in ``last_actor_summary``.
     """
     _runtime(state)  # fail fast if the graph state was not built properly
+    runtime = _runtime(state)
     chat = model if model is not None else get_model()
+    # a killed run leaves its plan in TODO.md; the same task picks it up again
+    plan = _resume_plan(runtime, state) or {}
+    working = {**dict(state), **plan} if plan else state
+    memory = build_layered_memory(working, node="planner")
+    _note(memory_event(memory, node="planner"), writer, on_event)
     # the specialists run on the planner's model unless one is pinned for them
     specialist_model = agent_model if agent_model is not None else chat
     collector = _HandoffState(
-        plan_summary=str(state.get("plan_summary") or ""),
-        todos=_todos(state),
-        acceptance_criteria=_text_list(state.get("acceptance_criteria")),
-        verification_commands=_text_list(state.get("verification_commands")),
+        plan_summary=str(working.get("plan_summary") or ""),
+        todos=_todos(working),
+        acceptance_criteria=_text_list(working.get("acceptance_criteria")),
+        verification_commands=_text_list(working.get("verification_commands")),
         research_notes=str(state.get("research_notes") or ""),
         sources=[dict(source) for source in (state.get("sources") or [])],
         code_agent_summary=str(state.get("code_agent_summary") or ""),
@@ -735,7 +856,7 @@ def planner_node(
     tools: list[Any] = [
         TodoWriteTool().as_tool(),
         CallSearchAgentTool(
-            state,
+            working,
             writer=writer,
             collector=collector,
             model=specialist_model,
@@ -743,18 +864,19 @@ def planner_node(
             on_event=on_event,
         ).as_tool(),
         CallCodeAgentTool(
-            state,
+            working,
             writer=writer,
             collector=collector,
             model=specialist_model,
             tools=code_tools,
             on_event=on_event,
+            persist=_todo_persister(runtime, working),
         ).as_tool(),
     ]
 
     messages: list[BaseMessage] = [
         SystemMessage(content=PLANNER_PROMPT),
-        HumanMessage(content=_planner_instruction(state)),
+        HumanMessage(content=_planner_input(working, memory, resumed=bool(plan))),
     ]
 
     def on_react_event(kind: str, payload: dict[str, Any]) -> None:
@@ -763,17 +885,17 @@ def planner_node(
         if str(payload.get("name") or "") != TodoWriteTool.name:
             return
         args = payload.get("args")
-        plan = args if isinstance(args, Mapping) else {}
-        summary = _text(plan.get("plan_summary"))
+        published = args if isinstance(args, Mapping) else {}
+        summary = _text(published.get("plan_summary"))
         if summary:
             collector.plan_summary = summary
-        todos = _coerce_todos(plan.get("todos"), fallback=collector.todos or ())
+        todos = _coerce_todos(published.get("todos"), fallback=collector.todos or ())
         if todos:
             collector.todos = todos
-        criteria = _text_list(plan.get("acceptance_criteria"))
+        criteria = _text_list(published.get("acceptance_criteria"))
         if criteria:
             collector.acceptance_criteria = criteria
-        commands = _text_list(plan.get("verification_commands"))
+        commands = _text_list(published.get("verification_commands"))
         if commands:
             collector.verification_commands = commands
 
@@ -790,11 +912,24 @@ def planner_node(
         or str(final_event.get("content") or "").strip()
         or str(state.get("last_actor_summary") or "")
     )
+    plan_summary = collector.plan_summary or ""
+    plan_todos = collector.todos if collector.todos is not None else _todos(working)
+    criteria = collector.acceptance_criteria or []
+    commands_out = collector.verification_commands or []
+    # the plan is the working state: keep TODO.md in the workspace in sync with it
+    _persist_plan(
+        runtime,
+        working,
+        todos=plan_todos,
+        plan_summary=plan_summary,
+        acceptance_criteria=criteria,
+        verification_commands=commands_out,
+    )
     return {
-        "plan_summary": collector.plan_summary or "",
-        "todos": collector.todos if collector.todos is not None else _todos(state),
-        "acceptance_criteria": collector.acceptance_criteria or [],
-        "verification_commands": collector.verification_commands or [],
+        "plan_summary": plan_summary,
+        "todos": plan_todos,
+        "acceptance_criteria": criteria,
+        "verification_commands": commands_out,
         "messages": collector.messages,
         "last_actor_summary": summary,
         "research_notes": collector.research_notes,
@@ -804,7 +939,36 @@ def planner_node(
             *collector.handoffs,
         ],
         "code_agent_summary": collector.code_agent_summary,
+        # the supervisor just planned/delegated, so verification is what comes next
+        "context_next_node": "verifier",
+        # what this node showed the model (later readers reuse it instead of rebuilding)
+        "memory_snapshot": memory,
     }
+
+
+def _planner_input(
+    state: Mapping[str, Any], memory: Mapping[str, Any], *, resumed: bool = False
+) -> str:
+    """The planner's human message: the planning brief plus the layered memory."""
+    brief = _planner_instruction(state)
+    if resumed:
+        brief = (
+            "A previous run left an unfinished plan for this exact task in TODO.md; it is "
+            "shown below and already loaded into the todos.\n\n" + brief
+        )
+    return _with_layered_memory(brief, memory)
+
+
+def _with_layered_memory(text: str, memory: Mapping[str, Any] | None) -> str:
+    """Append the formatted layered memory to a node's human message."""
+    if not memory:
+        return text
+    return (
+        f"{text}\n\n"
+        "Layered memory (rules, current task state, durable notes and compressed "
+        "history):\n"
+        f"{format_layered_memory_for_prompt(memory)}"
+    )
 
 
 def _planner_instruction(state: Mapping[str, Any]) -> str:
@@ -823,6 +987,10 @@ def _planner_instruction(state: Mapping[str, Any]) -> str:
     commands = _text_list(state.get("verification_commands"))
     if commands:
         lines.append("Verification commands:\n" + "\n".join(f"- {command}" for command in commands))
+    lines.append(
+        f"Verification commands run in {SHELL_NAME} inside the workspace root. "
+        f"{shell_guidance()}"
+    )
     notes = str(state.get("research_notes") or "").strip()
     if notes:
         lines.append(f"Research notes already collected:\n{notes}")
@@ -958,6 +1126,8 @@ def verifier_node(
     *,
     model: Any | None = None,
     max_loops: int = DEFAULT_VERIFIER_LOOPS,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    writer: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Verify the work: run the commands, inspect read-only, report a verdict.
 
@@ -970,11 +1140,12 @@ def verifier_node(
     """
     runtime = _runtime(state)
     chat = model if model is not None else get_model()
+    memory = build_layered_memory(state, node="verifier")
+    _note(memory_event(memory, node="verifier"), writer, on_event)
     results = run_verification_commands(runtime, _text_list(state.get("verification_commands")))
-
     messages: list[BaseMessage] = [
         SystemMessage(content=VERIFIER_PROMPT),
-        HumanMessage(content=_verifier_instruction(state, results)),
+        HumanMessage(content=_verifier_input(state, results, memory)),
     ]
     # Read-only inspection: the verifier may look, never touch.
     for _ in react_loop(
@@ -1011,6 +1182,8 @@ def verifier_node(
             make_todo(todo["id"], todo["content"], status="completed", note=todo["note"] or "verified")
             for todo in todos
         ]
+    # verification can complete every todo: mirror that into TODO.md as well
+    _persist_plan(runtime, state, todos=todos)
 
     return {
         "passed": passed,
@@ -1019,7 +1192,20 @@ def verifier_node(
         "verification_checks": checks,
         "last_error": "" if passed else _compose_error(reason, instruction, results),
         "todos": todos,
+        # what this node showed the model (later readers reuse it instead of rebuilding)
+        "memory_snapshot": memory,
+        # where a following context monitor should send the run if it must go on
+        **({} if passed else {"context_next_node": "planner"}),
     }
+
+
+def _verifier_input(
+    state: Mapping[str, Any],
+    results: Sequence[VerificationResult],
+    memory: Mapping[str, Any],
+) -> str:
+    """The verifier's human message: the evidence plus the layered memory."""
+    return _with_layered_memory(_verifier_instruction(state, results), memory)
 
 
 def _verifier_instruction(
@@ -1089,7 +1275,490 @@ def _compose_error(
     return "\n".join(lines)
 
 
+# -- context monitor ---------------------------------------------------------
+def _memory_message(snapshot: Mapping[str, Any]) -> BaseMessage:
+    """The layered-memory message injected into a node's input."""
+    return SystemMessage(
+        content="Layered memory:\n" + format_layered_memory_for_prompt(snapshot)
+    )
+
+
+def _memory_payload(state: Mapping[str, Any]) -> BaseMessage:
+    """The layered-memory message that is counted as part of the context."""
+    snapshot = state.get("memory_snapshot")
+    if not isinstance(snapshot, Mapping) or not snapshot:
+        snapshot = build_layered_memory(state, node="context_monitor")
+    return _memory_message(snapshot)
+
+
+def _context_text(messages: Sequence[Any]) -> str:
+    """Everything the context is made of, as one string (for the fallback estimate)."""
+    parts: list[str] = []
+    for message in messages:
+        text = message_text(message) if isinstance(message, BaseMessage) else str(message or "")
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _count_tokens(model: Any, messages: Sequence[Any]) -> int:
+    """Tokens of ``messages``, or a ``len(text) // 4`` estimate when counting fails.
+
+    The model's own counter is authoritative (it knows the provider's tokenizer);
+    a model without ``get_num_tokens_from_messages`` - a fake in tests, or a
+    provider that cannot count - must not break the monitor.
+    """
+    conversation = list(messages)
+    counter = getattr(model, "get_num_tokens_from_messages", None)
+    if callable(counter):
+        try:
+            counted = int(counter(conversation))
+        except Exception:  # noqa: BLE001 - any counting failure falls back below
+            counted = -1
+        if counted >= 0:
+            return counted
+    return len(_context_text(conversation)) // 4
+
+
+def context_monitor_node(
+    state: WQGraphState,
+    *,
+    model: Any | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    writer: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Measure the context and decide whether it has to be compressed.
+
+    1. Estimates the tokens of ``messages`` plus the layered-memory payload with
+       ``model.get_num_tokens_from_messages(messages + [memory_payload])``, and
+       falls back to ``len(text) // 4`` when the model cannot count.
+    2. ``should_compress`` is ``token_count > context_token_limit`` (default
+       :data:`~wqagent.graph.memory.DEFAULT_CONTEXT_TOKEN_LIMIT`, 400000).
+    3. ``context_next_node`` is whatever the upstream node decided - the planner
+       sets ``"verifier"``, a failed verifier sets ``"planner"`` - and defaults to
+       ``"verifier"``.
+
+    Returns ``context_token_count``, ``context_should_compress`` and
+    ``context_next_node``.
+    """
+    _runtime(state)  # fail fast if the graph state was not built properly
+    chat = model if model is not None else get_model()
+    # reuse what the last node injected when it is still in the state
+    memory = state.get("memory_snapshot")
+    if not isinstance(memory, Mapping) or not memory:
+        memory = build_layered_memory(state, node="context_monitor")
+    # the memory payload is part of what is measured, so it is injected here too
+    _note(memory_event(memory, node="context_monitor"), writer, on_event)
+    messages = [*(state.get("messages") or []), _memory_message(memory)]
+    token_count = _count_tokens(chat, messages)
+    try:
+        limit = int(state.get("context_token_limit") or DEFAULT_CONTEXT_TOKEN_LIMIT)
+    except (TypeError, ValueError):  # a junk limit must not break the monitor
+        limit = DEFAULT_CONTEXT_TOKEN_LIMIT
+    next_node = str(state.get("context_next_node") or "").strip() or "verifier"
+    last_after = _last_compressed_size(state)
+
+    return {
+        "context_token_count": token_count,
+        "context_should_compress": token_count > limit
+        and not _compression_would_be_pointless(last_after, limit),
+        "context_next_node": next_node,
+    }
+
+
+def _last_compressed_size(state: Mapping[str, Any]) -> int | None:
+    """The token count the previous compression achieved, if there was one."""
+    events = state.get("compression_events")
+    if not isinstance(events, Sequence) or not events:
+        return None
+    last = events[-1]
+    if not isinstance(last, Mapping):
+        return None
+    try:
+        return int(last.get("tokens_after"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _compression_would_be_pointless(last_after: int | None, limit: int) -> bool:
+    """True when compressing again cannot get the context under the limit.
+
+    A compression's result size is deterministic for a given state (the capped
+    summary plus the memory payload), so once a compression has landed *above* the
+    budget, repeating it can only reproduce that size. The monitor then lets the
+    run continue instead of looping ``monitor -> compressor`` until LangGraph's
+    recursion limit - a limit that low is a misconfiguration, not a task state.
+    """
+    return last_after is not None and last_after > limit
+
+
 # -- routing -----------------------------------------------------------------
+def context_monitor_route(state: WQGraphState) -> str:
+    """Route after the context monitor: finish, compress, or continue.
+
+    A passing verdict always wins, then a spent attempt budget stops the run (the
+    same rule as :func:`verifier_route` - a failing task must never spin), then an
+    over-budget context goes to the compressor, otherwise the run continues to the
+    node the upstream one picked.
+    """
+    if state.get("passed"):
+        return "final"
+    attempts = int(state.get("attempts") or 0)
+    max_attempts = int(state.get("max_attempts") or DEFAULT_MAX_ATTEMPTS)
+    if attempts >= max_attempts:
+        return "final"
+    if state.get("context_should_compress"):
+        return "context_compressor"
+    return str(state.get("context_next_node") or "").strip() or "verifier"
+
+
+def context_compressor_route(state: WQGraphState) -> str:
+    """Route after compression: wherever the state says work continues."""
+    return str(state.get("context_next_node") or "").strip() or "verifier"
+
+
+# -- context compressor ------------------------------------------------------
+def _transcript_text(messages: Sequence[Any], *, limit: int = COMPRESS_TRANSCRIPT_CHARS) -> str:
+    """Render the conversation for the compressor, keeping head and tail.
+
+    A context that is over budget can be far larger than one request may carry, so
+    the middle is dropped: the head holds the task and the plan, the tail holds the
+    latest failures and results. Everything in between is what the compressor is
+    asked to summarise anyway.
+    """
+    lines: list[str] = []
+    for message in messages:
+        text = message_text(message) if isinstance(message, BaseMessage) else str(message or "")
+        role = getattr(message, "type", "message")
+        lines.append(f"[{role}] {text}".rstrip())
+    transcript = "\n\n".join(lines)
+    if limit <= 0 or len(transcript) <= limit:
+        return transcript
+    head = int(limit * 0.35)
+    tail = limit - head
+    dropped = len(transcript) - limit
+    return (
+        f"{transcript[:head]}\n\n... [{dropped} characters of transcript dropped "
+        f"by context_compressor] ...\n\n{transcript[-tail:]}"
+    )
+
+
+def _compression_request(state: Mapping[str, Any], messages: Sequence[Any]) -> str:
+    """The human message handed to the compressor: transcript + memory snapshot."""
+    snapshot = state.get("memory_snapshot")
+    if not isinstance(snapshot, Mapping) or not snapshot:
+        snapshot = build_layered_memory(state, node="context_compressor")
+    return (
+        f"Task:\n{str(state.get('task') or '').strip()}\n\n"
+        f"Messages to compress ({len(list(messages))}):\n"
+        f"{_transcript_text(messages)}\n\n"
+        "Layered memory:\n"
+        f"{format_layered_memory_for_prompt(snapshot)}\n\n"
+        "Return the compression JSON."
+    )
+
+
+#: Free-text fields of the compression JSON, and where each one is capped.
+_COMPRESSION_TEXT_FIELDS = ("summary", "active_goal", "completed_work", "risks")
+#: List fields of the compression JSON.
+_COMPRESSION_LIST_FIELDS = (
+    "open_todos",
+    "important_files",
+    "tool_findings",
+    "sources",
+    "next_steps",
+)
+
+
+def _compression_items(value: Any) -> list[str]:
+    """Normalise a list field of the compression JSON.
+
+    Models often stringify lists (``"important_files": "[]"`` or ``'["a.py"]'``),
+    so a JSON-looking string is parsed and an empty result stays empty instead of
+    showing up as a literal ``[]`` in the notepad.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return [text]
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+        if parsed is None or isinstance(parsed, Mapping):
+            return []
+        return [str(parsed).strip()]
+    return _text_list(value)
+
+
+def _compression_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalise the compressor's JSON: strings, capped lists, never raising."""
+    fields: dict[str, Any] = {}
+    for name in _COMPRESSION_TEXT_FIELDS:
+        limit = COMPRESSION_SUMMARY_CHARS if name == "summary" else COMPRESSION_FIELD_CHARS
+        fields[name] = _short_text(_text(payload.get(name)), limit)
+    for name in _COMPRESSION_LIST_FIELDS:
+        fields[name] = _compression_items(payload.get(name))[:COMPRESSION_ITEMS]
+    return fields
+
+
+def _fallback_summary(state: Mapping[str, Any]) -> str:
+    """A deterministic summary for when the compressor model is unusable.
+
+    Losing detail is bad; leaving an over-budget context in place is worse, so the
+    deterministic report of the state facts is used instead.
+    """
+    lines = [f"Task: {str(state.get('task') or '').strip()}"]
+    plan_summary = str(state.get("plan_summary") or "").strip()
+    if plan_summary:
+        lines.append(f"Plan: {plan_summary}")
+    todos = _todos(state)
+    if todos:
+        lines.append("Todos:\n" + render_todos(todos))
+    criteria = _text_list(state.get("acceptance_criteria"))
+    if criteria:
+        lines.append("Acceptance criteria:\n" + "\n".join(f"- {item}" for item in criteria))
+    commands = _text_list(state.get("verification_commands"))
+    if commands:
+        lines.append("Verification commands:\n" + "\n".join(f"- {item}" for item in commands))
+    implementer = _text(state.get("code_agent_summary"))
+    if implementer:
+        lines.append(f"Implementer report: {implementer}")
+    error = _text(state.get("last_error"))
+    if error:
+        lines.append(f"Last verification failure:\n{error}")
+    notes = _text(state.get("research_notes"))
+    if notes:
+        lines.append(f"Research notes:\n{notes}")
+    lines.append(
+        f"History was compressed deterministically after {int(state.get('attempts') or 0)} "
+        "attempt(s); no model summary was available."
+    )
+    return _short_text("\n\n".join(lines), COMPRESSION_SUMMARY_CHARS)
+
+
+def _render_history_summary(
+    fields: Mapping[str, Any], *, tokens_before: int, tokens_after: int, limit: int
+) -> str:
+    """The Markdown written to ``HISTORY_SUMMARY.md``."""
+    lines = ["# History summary", "", _text(fields.get("summary"))]
+    sections = (
+        ("active_goal", "Active goal", False),
+        ("completed_work", "Completed work", False),
+        ("open_todos", "Open todos", True),
+        ("important_files", "Important files", True),
+        ("tool_findings", "Tool findings", True),
+        ("sources", "Sources", True),
+        ("next_steps", "Next steps", True),
+        ("risks", "Risks", False),
+    )
+    for key, title, as_list in sections:
+        value = fields.get(key)
+        if as_list:
+            items = _text_list(value)
+            if not items:
+                continue
+            lines.extend(["", f"## {title}", *[f"- {item}" for item in items]])
+        else:
+            text = _text(value)
+            if not text:
+                continue
+            lines.extend(["", f"## {title}", text])
+    lines.extend(
+        [
+            "",
+            "<!-- compressed by context_compressor_node:",
+            f"     tokens {tokens_before} -> {tokens_after} (limit {limit}) -->",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _compression_count(state: Mapping[str, Any]) -> int:
+    """How many compressions this run already recorded."""
+    events = state.get("compression_events")
+    return len(events) if isinstance(events, Sequence) else 0
+
+
+def _looks_like_a_url(text: str) -> bool:
+    """Cheap sanity filter for urls the compressor extracted from the transcript."""
+    return "." in text and " " not in text and len(text) > 3
+
+
+def _merge_source_refs(existing: Any, found: Any) -> list[dict[str, str]]:
+    """Keep the structured sources (title + url) and add the urls the model kept."""
+    refs = _source_refs(existing)
+    known = {ref["url"] for ref in refs}
+    for item in _text_list(found):
+        if item in known or not _looks_like_a_url(item):
+            continue
+        known.add(item)
+        refs.append({"title": "", "url": item})
+    return refs[:SOURCE_LIMIT]
+
+
+def _write_history_summary(runtime: RuntimeState, content: str) -> dict[str, Any]:
+    """Write ``HISTORY_SUMMARY.md`` inside the workspace; never raises."""
+    record: dict[str, Any] = {"ok": False, "path": HISTORY_SUMMARY_FILE, "error": ""}
+    try:
+        path = runtime.resolve(HISTORY_SUMMARY_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 - persistence is best effort
+        record["error"] = f"{type(exc).__name__}: {exc}"
+        return record
+    record["ok"] = True
+    return record
+
+
+def context_compressor_node(
+    state: WQGraphState,
+    *,
+    model: Any | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    writer: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Compress the transcript into one summary message plus compacted state.
+
+    1. Asks the model (``CONTEXT_COMPRESSION_PROMPT``) for JSON with the resumable
+       state: ``summary``, ``active_goal``, ``completed_work``, ``open_todos``,
+       ``important_files``, ``tool_findings``, ``sources``, ``next_steps``,
+       ``risks``. A model that fails or answers unusable JSON falls back to a
+       deterministic summary of the state facts - an over-budget context must not
+       survive just because the compressor could not run.
+    2. Replaces the history with ``RemoveMessage(REMOVE_ALL_MESSAGES)`` followed by
+       one ``AIMessage(content=summary)``.
+    3. Persists the summary to ``HISTORY_SUMMARY.md`` (best effort).
+    4. Caps every free-text field it writes back (``_short_text`` / ``_trim_handoffs``).
+    5. Returns the new message list, the summary, the recounted tokens, the capped
+       fields and the appended :class:`~wqagent.graph.memory.CompressionEvent`.
+    """
+    runtime = _runtime(state)
+    chat = model if model is not None else get_model()
+    current = list(state.get("messages") or [])
+    memory = build_layered_memory(state, node="context_compressor")
+    _note(memory_event(memory, node="context_compressor"), writer, on_event)
+    payload = _memory_message(memory)
+    tokens_before = _count_tokens(chat, [*current, payload])
+    try:
+        limit = int(state.get("context_token_limit") or DEFAULT_CONTEXT_TOKEN_LIMIT)
+    except (TypeError, ValueError):
+        limit = DEFAULT_CONTEXT_TOKEN_LIMIT
+
+    fields: dict[str, Any] = {}
+    ok = True
+    error = ""
+    try:
+        response = chat.invoke(
+            [
+                SystemMessage(content=CONTEXT_COMPRESSION_PROMPT),
+                HumanMessage(content=_compression_request(state, current)),
+            ]
+        )
+        payload_fields = _json_object(message_text(response))
+        fields = _compression_fields(payload_fields)
+        if not fields.get("summary"):
+            ok, error = False, "the compressor model returned no usable summary"
+    except Exception as exc:  # noqa: BLE001 - a failed compressor still compresses
+        ok, error = False, f"{type(exc).__name__}: {exc}"
+
+    if not ok:
+        fields = _compression_fields({"summary": _fallback_summary(state)})
+
+    summary = _text(fields.get("summary"))
+    new_messages = [RemoveMessage(id=REMOVE_ALL_MESSAGES), AIMessage(content=summary)]
+    tokens_after = _count_tokens(chat, [AIMessage(content=summary), payload])
+    messages_before = len(current)
+    messages_after = 1  # the single summary message the transcript is replaced with
+
+    persisted = _write_history_summary(
+        runtime,
+        _render_history_summary(
+            fields, tokens_before=tokens_before, tokens_after=tokens_after, limit=limit
+        ),
+    )
+    # the durable half of the compression lands in NOTEPAD.md - compressing the
+    # context is exactly the moment the runtime distils what is worth keeping
+    section = (
+        render_notepad_section(
+            fields,
+            index=_compression_count(state) + 1,
+            attempt=int(state.get("attempts") or 0),
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+        )
+        if has_notepad_content(fields)
+        else ""
+    )
+    notepad = (
+        append_notepad(runtime, section)
+        if section
+        else {
+            "ok": False,
+            "path": NOTEPAD_FILE,
+            "error": "no durable fields in the compression",
+            "chars": 0,
+        }
+    )
+    event: CompressionEvent = {
+        "node": "context_compressor",
+        "attempt": int(state.get("attempts") or 0),
+        "tokens_before": tokens_before,
+        "tokens_after": tokens_after,
+        "messages_before": messages_before,
+        "messages_after": messages_after,
+        "token_limit": limit,
+        "summary": summary,
+    }
+    _forward(
+        {
+            "type": "context_compressed",
+            "ok": ok,
+            "error": error,
+            "tokens_before": tokens_before,
+            "tokens_after": tokens_after,
+            "messages_before": messages_before,
+            "messages_after": messages_after,
+            "token_limit": limit,
+            "summary": summary,
+            "persisted": persisted,
+            "notepad": notepad,
+            "history_path": HISTORY_SUMMARY_FILE,
+            "notepad_path": NOTEPAD_FILE,
+        },
+        "context_compressor",
+        on_event,
+        writer,
+    )
+
+    return {
+        "messages": new_messages,
+        "context_summary": summary,
+        "context_token_count": tokens_after,
+        "context_should_compress": False,
+        "context_next_node": str(state.get("context_next_node") or "").strip() or "verifier",
+        # the bulky fields are capped to the budgets the memory layer uses
+        "research_notes": _short_text(state.get("research_notes"), RESEARCH_CHARS),
+        "agent_handoffs": _trim_handoffs(state.get("agent_handoffs")),
+        "sources": _merge_source_refs(state.get("sources"), fields.get("sources")),
+        "code_agent_summary": _short_text(state.get("code_agent_summary"), SUMMARY_CHARS),
+        "history_summary": summary,
+        "compression_events": [
+            *[
+                dict(item)
+                for item in (state.get("compression_events") or [])
+                if isinstance(item, Mapping)
+            ],
+            event,
+        ],
+        # derived data: the next reader rebuilds it from the compacted state
+        "memory_snapshot": {},
+    }
+
+
 def verifier_route(state: WQGraphState) -> str:
     """Route after verification: stop on success or when the budget is spent."""
     if state.get("passed"):
@@ -1205,23 +1874,32 @@ def final_node(
     *,
     model: Any | None = None,
     summarize: bool = True,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    writer: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Write the user-facing ``final_answer``.
 
     A deterministic report is always built from the state; when *summarize* is
     true and a model is reachable, the model rewrites it (``FINAL_PROMPT``) into a
-    concise answer. Any model failure keeps the report, so this node never raises
-    and ``final_answer`` is never empty.
+    concise answer - with the layered memory injected like every other node. Any
+    model failure keeps the report, so this node never raises and ``final_answer``
+    is never empty.
     """
     report = format_final_answer(state)
     if not summarize:
         return {"final_answer": report}
+    memory: dict[str, Any] = {}
+    try:
+        memory = dict(build_layered_memory(state, node="final"))
+    except Exception:  # noqa: BLE001 - memory must never break the answer
+        memory = {}
+    _note(memory_event(memory, node="final"), writer, on_event)
     try:
         chat = model if model is not None else get_model()
         response = chat.invoke(
             [
                 SystemMessage(content=FINAL_PROMPT),
-                HumanMessage(content=_final_instruction(report)),
+                HumanMessage(content=_final_instruction(report, memory)),
             ]
         )
         text = message_text(response).strip()
@@ -1230,9 +1908,10 @@ def final_node(
     return {"final_answer": text or report}
 
 
-def _final_instruction(report: str) -> str:
-    return (
+def _final_instruction(report: str, memory: Mapping[str, Any] | None = None) -> str:
+    facts = (
         "Write the final answer for the user from these facts only.\n\n"
         f"--- facts ---\n{report}\n--- end of facts ---\n\n"
         "Short, no tool calls."
     )
+    return _with_layered_memory(facts, memory)

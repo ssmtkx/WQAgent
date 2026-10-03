@@ -9,6 +9,8 @@
   :data:`~wqagent.prompts.stage3.VERIFIER_PROMPT`,
   :data:`~wqagent.prompts.stage3.SEARCH_AGENT_PROMPT`,
   :data:`~wqagent.prompts.stage3.CODE_AGENT_PROMPT`).
+* :mod:`wqagent.prompts.stage4` - context-window management
+  (:data:`~wqagent.prompts.stage4.CONTEXT_COMPRESSION_PROMPT`).
 """
 
 from wqagent.prompts.stage1 import ACTOR_PROMPT
@@ -19,10 +21,12 @@ from wqagent.prompts.stage3 import (
     SEARCH_AGENT_PROMPT,
     VERIFIER_PROMPT,
 )
+from wqagent.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 
 __all__ = [
     "ACTOR_PROMPT",
     "CODE_AGENT_PROMPT",
+    "CONTEXT_COMPRESSION_PROMPT",
     "FINAL_PROMPT",
     "PLANNER_PROMPT",
     "SEARCH_AGENT_PROMPT",

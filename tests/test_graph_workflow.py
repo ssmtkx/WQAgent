@@ -9,13 +9,24 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage
 
-from helpers import ScriptedModel, answer, code_call, passing_script, plan_call, report_call
+from helpers import (
+    ScriptedModel,
+    answer,
+    code_call,
+    passing_script,
+    plan_call,
+    report_call,
+)
 
 from wqagent.core.state import RuntimeState
 from wqagent.graph import (
+    COMPLEX_NODE_NAMES,
+    COMPRESSOR_ROUTE_TARGETS,
+    CONTEXT_ROUTE_TARGETS,
     NODE_NAMES,
     ROUTE_TARGETS,
     WQGraphState,
+    build_complex_workflow,
     build_workflow,
     final_node,
     format_final_answer,
@@ -24,6 +35,20 @@ from wqagent.graph import (
 )
 from wqagent.graph.state import make_todo
 from wqagent.prompts import stage1, stage2, stage3
+from wqagent.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
+
+#: A compression payload the compressor model can answer with.
+COMPRESSION_PAYLOAD: dict[str, Any] = {
+    "summary": "compressed",
+    "active_goal": "finish hello.py",
+    "completed_work": "wrote hello.py",
+    "open_todos": ["t1: rerun"],
+    "important_files": ["hello.py"],
+    "tool_findings": ["python 3.12"],
+    "sources": ["https://docs.test/python"],
+    "next_steps": ["run it"],
+    "risks": "none",
+}
 
 
 class ScriptedModel:
@@ -318,6 +343,182 @@ def test_workflow_writes_a_failure_answer_when_the_budget_runs_out(tmp_path: Pat
     assert "fix the assertion in test_x.py" in result["last_error"]
     assert len(model.seen) == 7  # planner x3, codeAgent x2, verifier x2... plus final
     assert model.responses == []
+
+
+# -- the complex workflow (with context management) --------------------------
+def _complex_run(tmp_path: Path, model: Any, *, max_attempts: int = 3, **extra: Any):
+    """Run the complex graph once; return (final state, node order)."""
+    state = new_graph_state(
+        "write hello.py", RuntimeState(workspace=tmp_path / "ws"), max_attempts=max_attempts, **extra
+    )
+    app = build_complex_workflow(model=model)
+    order: list[str] = []
+    result: dict[str, Any] = dict(state)
+    for mode, chunk in app.stream(state, stream_mode=["updates", "values"]):
+        if mode == "updates":
+            order.extend(chunk)
+        else:
+            result = chunk
+    return result, order
+
+
+def test_complex_workflow_has_the_expected_nodes_and_edges() -> None:
+    drawing = build_complex_workflow().get_graph()
+
+    node_ids = set(drawing.nodes)
+    for name in COMPLEX_NODE_NAMES:
+        assert name in node_ids, name
+    assert set(COMPLEX_NODE_NAMES) == {
+        "planner",
+        "context_monitor",
+        "context_compressor",
+        "verifier",
+        "final",
+    }
+
+    edges = {(edge.source, edge.target) for edge in drawing.edges}
+    assert ("__start__", "planner") in edges
+    assert ("planner", "context_monitor") in edges
+    assert ("verifier", "context_monitor") in edges  # a verification also passes the monitor
+    assert ("final", "__end__") in edges
+    # nothing bypasses the monitor any more
+    assert ("planner", "verifier") not in edges
+    assert ("verifier", "final") not in edges
+
+    monitor_targets = {target for source, target in edges if source == "context_monitor"}
+    assert monitor_targets == set(CONTEXT_ROUTE_TARGETS.values())
+    compressor_targets = {target for source, target in edges if source == "context_compressor"}
+    assert compressor_targets == set(COMPRESSOR_ROUTE_TARGETS.values())
+
+
+def test_complex_workflow_binds_model_and_loop_budgets() -> None:
+    from functools import partial
+
+    from wqagent.graph import nodes as node_module
+
+    sentinel = object()
+    drawing = build_complex_workflow(
+        model=sentinel, planner_loops=5, verifier_loops=2
+    ).get_graph()
+
+    planner = getattr(drawing.nodes["planner"].data, "func", drawing.nodes["planner"].data)
+    assert isinstance(planner, partial)
+    assert planner.keywords == {"model": sentinel, "max_loops": 5}
+    verifier = getattr(drawing.nodes["verifier"].data, "func", drawing.nodes["verifier"].data)
+    assert verifier.keywords == {"model": sentinel, "max_loops": 2}
+    for name in ("context_monitor", "context_compressor", "final"):
+        wired = getattr(drawing.nodes[name].data, "func", drawing.nodes[name].data)
+        assert isinstance(wired, partial)
+        assert wired.func is getattr(node_module, f"{name}_node")
+        assert wired.keywords == {"model": sentinel}
+
+
+def test_complex_workflow_passes_without_compressing(tmp_path: Path) -> None:
+    model = ScriptedModel(passing_script(final_text="Done: hello.py works."))
+
+    result, order = _complex_run(tmp_path, model)
+
+    assert result["passed"] is True
+    assert result["attempts"] == 1
+    assert result["final_answer"] == "Done: hello.py works."
+    assert order == ["planner", "context_monitor", "verifier", "context_monitor", "final"]
+    # the default budget is far away, so nothing was compressed
+    assert result["compression_events"] == []
+    assert result["context_should_compress"] is False
+    assert not (tmp_path / "ws" / "HISTORY_SUMMARY.md").exists()
+    assert len(model.seen) == 8  # the monitor counts tokens, it does not call the model
+
+
+def test_complex_workflow_compresses_an_over_budget_context(tmp_path: Path) -> None:
+    summary = "compressed: hello.py is written"
+    model = ScriptedModel(
+        [
+            plan_call(),
+            answer("Planned it."),
+            # the compressor asks the model for the nine-key JSON
+            AIMessage(content=json.dumps({**COMPRESSION_PAYLOAD, "summary": summary})),
+            answer("Inspected."),
+            report_call(True),
+            answer("Done after compression."),
+        ]
+    )
+
+    result, order = _complex_run(tmp_path, model, context_token_limit=1)
+
+    assert order == [
+        "planner",
+        "context_monitor",
+        "context_compressor",
+        "verifier",
+        "context_monitor",
+        "final",
+    ]
+    assert result["passed"] is True
+    assert result["context_summary"] == summary
+    assert result["history_summary"] == summary
+    assert [event["summary"] for event in result["compression_events"]] == [summary]
+    # the transcript really was replaced by the one summary message
+    assert [message.type for message in result["messages"]] == ["ai"]
+    assert result["messages"][0].content == summary
+    # ...and the compressor was asked exactly once (limit=1 is unreachable)
+    assert len(model.seen) == 6
+    assert (tmp_path / "ws" / "HISTORY_SUMMARY.md").read_text(encoding="utf-8").startswith(
+        "# History summary"
+    )
+
+
+def test_complex_workflow_stops_at_the_attempt_budget(tmp_path: Path) -> None:
+    """A failing task must end in `final`, not spin through the monitor."""
+    model = ScriptedModel(
+        [
+            plan_call(commands=["exit 1"]),
+            answer("Planned it."),
+            answer("Inspected."),
+            report_call(False, recommended_next_instruction="fix it"),
+            answer("Not done: exit 1 still fails."),
+        ]
+    )
+
+    result, order = _complex_run(tmp_path, model, max_attempts=1)
+
+    assert result["passed"] is False
+    assert result["attempts"] == 1
+    assert result["final_answer"] == "Not done: exit 1 still fails."
+    assert order == ["planner", "context_monitor", "verifier", "context_monitor", "final"]
+    assert len(model.seen) == 5  # no replanning, no runaway loop
+
+
+def test_complex_workflow_replans_after_a_failed_verification(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            plan_call(commands=["exit 1"]),
+            answer("Planned it."),
+            answer("Inspected."),
+            report_call(False),
+            plan_call(summary="second try", commands=["echo ok"]),
+            answer("Replanned."),
+            answer("Inspected again."),
+            report_call(True),
+            answer("Done on the second attempt."),
+        ]
+    )
+
+    result, order = _complex_run(tmp_path, model, max_attempts=2)
+
+    assert result["passed"] is True
+    assert result["attempts"] == 2
+    assert order == [
+        "planner",
+        "context_monitor",
+        "verifier",
+        "context_monitor",
+        "planner",
+        "context_monitor",
+        "verifier",
+        "context_monitor",
+        "final",
+    ]
+    assert len(model.seen) == 9
 
 
 def test_workflow_answers_even_without_a_working_model(tmp_path: Path) -> None:

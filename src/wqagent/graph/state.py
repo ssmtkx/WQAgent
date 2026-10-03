@@ -13,11 +13,15 @@ derives the graph's channels from this schema:
 
 Shape of the workflow this schema is meant for::
 
-    plan    -> plan_summary, todos, acceptance_criteria, verification_commands
-    act     -> messages (via add_messages), todos updates
-    search  -> research_notes (via agents.search_agent.run_search_agent)
-    verify  -> verification_results, verification_checks, passed
-    decide  -> attempts < max_attempts ? back to act : final_answer
+    planner  -> plan_summary, todos, acceptance_criteria, verification_commands
+    delegate -> research_notes, sources, code_agent_summary, agent_handoffs
+    verify   -> verification_results, verification_checks, passed
+    decide   -> attempts < max_attempts ? back to planner : final_answer
+    context  -> context_*, compression_events, memory_snapshot, history_summary
+
+The ``context_*`` / ``memory_snapshot`` / ``history_summary`` fields describe the
+layered memory of a run; :mod:`wqagent.graph.memory` builds the snapshot and
+:data:`~wqagent.graph.memory.DEFAULT_CONTEXT_TOKEN_LIMIT` is the default budget.
 """
 
 from __future__ import annotations
@@ -28,10 +32,18 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 from wqagent.core.state import RuntimeState
+from wqagent.graph.memory import (
+    DEFAULT_CONTEXT_TOKEN_LIMIT,
+    CompressionEvent,
+    LayeredMemory,
+    context_token_limit_from_env,
+)
 
 __all__ = [
     "AgentHandoff",
+    "CompressionEvent",
     "DEFAULT_MAX_ATTEMPTS",
+    "LayeredMemory",
     "SourceItem",
     "TODO_MARKS",
     "TODO_STATUSES",
@@ -130,6 +142,16 @@ class WQGraphState(TypedDict, total=False):
         sources: The web sources those findings came from.
         agent_handoffs: Every delegation the planner made, in order.
         code_agent_summary: What codeAgent reported after implementing.
+        context_summary: Compressed history of this run (replaces older turns).
+        context_token_count: Size of the current context, in estimated tokens.
+        context_token_limit: The budget ``context_token_count`` is compared against.
+        context_should_compress: Whether the context is over that budget.
+        context_next_node: Which node the compressor decided should run next.
+        compression_events: One record per compression, newest last.
+        memory_snapshot: The layered memory last assembled for a node
+            (:func:`wqagent.graph.memory.build_layered_memory`); empty until built.
+        history_summary: Compressed history carried in the state; when empty, the
+            snapshot falls back to ``HISTORY_SUMMARY.md`` in the workspace.
         final_answer: The answer reported back to the user.
     """
 
@@ -151,6 +173,14 @@ class WQGraphState(TypedDict, total=False):
     sources: list[SourceItem]
     agent_handoffs: list[AgentHandoff]
     code_agent_summary: str
+    context_summary: str
+    context_token_count: int
+    context_token_limit: int
+    context_should_compress: bool
+    context_next_node: str
+    compression_events: list[CompressionEvent]
+    memory_snapshot: LayeredMemory
+    history_summary: str
     final_answer: str
 
 
@@ -257,6 +287,14 @@ def new_graph_state(
         "sources": [],
         "agent_handoffs": [],
         "code_agent_summary": "",
+        "context_summary": "",
+        "context_token_count": 0,
+        "context_token_limit": context_token_limit_from_env(DEFAULT_CONTEXT_TOKEN_LIMIT),
+        "context_should_compress": False,
+        "context_next_node": "",
+        "compression_events": [],
+        "memory_snapshot": {},
+        "history_summary": "",
         "final_answer": "",
     }
     state.update(extra)

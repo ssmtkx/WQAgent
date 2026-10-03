@@ -5,12 +5,24 @@ from __future__ import annotations
 import os
 
 from wqagent.core.state import RuntimeState
-from wqagent.tools.bash_tool import SHELL_NAME, BashTool
+from wqagent.tools.bash_tool import SHELL_NAME, BashTool, shell_guidance
 
 
 def test_description_tells_the_model_which_shell_it_gets() -> None:
     assert SHELL_NAME in BashTool.description
     assert "syntax" in BashTool.description
+
+
+def test_shell_guidance_matches_the_platform() -> None:
+    guidance = shell_guidance()
+
+    assert SHELL_NAME in guidance or os.name != "nt"
+    if os.name == "nt":
+        # the constructs that actually broke live runs on Windows PowerShell
+        for trap in ("&&", "test", "python3"):
+            assert trap in guidance, trap
+    else:
+        assert "POSIX" in guidance
 
 
 def _sleep(seconds: int) -> str:

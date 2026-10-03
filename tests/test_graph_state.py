@@ -21,6 +21,7 @@ from wqagent.graph import (
     new_graph_state,
     todo_progress,
 )
+from wqagent.graph.memory import DEFAULT_CONTEXT_TOKEN_LIMIT
 
 EXPECTED_KEYS = {
     "task",
@@ -41,6 +42,14 @@ EXPECTED_KEYS = {
     "sources",
     "agent_handoffs",
     "code_agent_summary",
+    "context_summary",
+    "context_token_count",
+    "context_token_limit",
+    "context_should_compress",
+    "context_next_node",
+    "compression_events",
+    "memory_snapshot",
+    "history_summary",
     "final_answer",
 }
 
@@ -124,6 +133,14 @@ def test_new_graph_state_defaults(tmp_path: Path) -> None:
     assert state["attempts"] == 0
     assert state["max_attempts"] == DEFAULT_MAX_ATTEMPTS
     assert state["final_answer"] == ""
+    # the layered-memory / context-compression fields start empty (see graph/memory.py)
+    assert state["context_summary"] == "" and state["history_summary"] == ""
+    assert state["context_token_count"] == 0
+    assert state["context_token_limit"] == DEFAULT_CONTEXT_TOKEN_LIMIT
+    assert state["context_should_compress"] is False
+    assert state["context_next_node"] == ""
+    assert state["compression_events"] == []
+    assert state["memory_snapshot"] == {}
 
 
 def test_new_graph_state_overrides(tmp_path: Path) -> None:

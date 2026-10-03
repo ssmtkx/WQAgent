@@ -30,6 +30,7 @@ from wqagent import __version__
 from wqagent.core.agent import DEFAULT_MAX_LOOPS, stream_agent_events
 from wqagent.core.paths import WorkspacePathError, resolve_workspace
 from wqagent.core.state import DEFAULT_TIMEOUT_SECONDS, RuntimeState
+from wqagent.graph.memory import CONTEXT_TOKEN_LIMIT_ENV, context_token_limit_from_env
 from wqagent.graph.state import DEFAULT_MAX_ATTEMPTS
 from wqagent.providers import ProviderConfigError, create_model, describe_config
 from wqagent.tools import describe_tools, tool_names
@@ -175,6 +176,8 @@ _NODE_LABELS: dict[str, tuple[str, str]] = {
     "actor": ("🔧 Actor", "Actor"),
     "searchAgent": ("🔍 searchAgent", "searchAgent"),
     "codeAgent": ("🛠 codeAgent", "codeAgent"),
+    "context_monitor": ("🧭 Context", "Context"),
+    "context_compressor": ("🗜 Compressor", "Compressor"),
     "verifier": ("✅ Verifier", "Verifier"),
     "final": ("📝 Final", "Final"),
 }
@@ -213,7 +216,48 @@ def _node_header(node: str, update: dict[str, Any]) -> str:
     return fancy if _can_encode(fancy) else plain
 
 
-def _render_node_update(node: str, update: dict[str, Any]) -> None:
+def _messages_label(count: Any) -> str:
+    try:
+        number = int(count)
+    except (TypeError, ValueError):
+        return "?"
+    return f"{number} msg" if number == 1 else f"{number} msgs"
+
+
+def _context_pair(event: Mapping[str, Any]) -> str:
+    """``"24 msgs/412000 tokens -> 1 msg/3100 tokens"`` for a compression.
+
+    Falls back to the token-only form for events recorded before message counts
+    were tracked.
+    """
+    before_tokens = event.get("tokens_before")
+    after_tokens = event.get("tokens_after")
+    before_messages = event.get("messages_before")
+    after_messages = event.get("messages_after")
+    if before_messages is None and after_messages is None:
+        return f"{before_tokens} -> {after_tokens} tokens"
+    return (
+        f"{_messages_label(before_messages)}/{before_tokens} tokens -> "
+        f"{_messages_label(after_messages)}/{after_tokens} tokens"
+    )
+
+
+def _format_memory(event: Mapping[str, Any]) -> str:
+    """Pretty-print the snapshot carried by a ``memory`` event (verbose mode)."""
+    memory = event.get("memory")
+    if not isinstance(memory, Mapping) or not memory:
+        return ""
+    import json as _json
+
+    try:
+        return _json.dumps(memory, indent=2, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return str(memory)
+
+
+def _render_node_update(
+    node: str, update: dict[str, Any], *, verbose: bool = False
+) -> None:
     """Print what one graph node produced (the header is printed by the caller)."""
     if node == "planner":
         summary = str(update.get("plan_summary") or "").strip()
@@ -233,6 +277,31 @@ def _render_node_update(node: str, update: dict[str, Any]) -> None:
         supervisor = str(update.get("last_actor_summary") or "").strip()
         if supervisor:
             console.print(Text(_preview(supervisor, lines=3, limit=400), style="dim"))
+    elif node == "context_monitor":
+        count = int(update.get("context_token_count") or 0)
+        limit = int(update.get("context_token_limit") or 0)
+        budget = f"/{limit}" if limit else ""
+        state_text = "over budget" if update.get("context_should_compress") else "ok"
+        console.print(
+            Text(
+                f"   {_glyph('result')} {count}{budget} tokens ({state_text})"
+                f" -> next: {update.get('context_next_node') or 'verifier'}",
+                style="dim",
+            )
+        )
+    elif node == "context_compressor":
+        events = update.get("compression_events") or []
+        last = events[-1] if events and isinstance(events[-1], Mapping) else {}
+        console.print(
+            Text(
+                f"   {_glyph('result')} {_context_pair(last)} (limit {last.get('token_limit')})"
+                "; history + notepad written",
+                style="dim",
+            )
+        )
+        summary = str(update.get("context_summary") or "").strip()
+        if summary and verbose:
+            console.print(Text(_preview(summary, lines=6, limit=800), style="dim"))
     elif node == "actor":
         summary = str(update.get("last_actor_summary") or "").strip()
         if summary:
@@ -305,6 +374,54 @@ class _NodeRenderer:
                     f"[red]x {escape(str(event.get('name')))} failed:[/] "
                     f"{escape(error if self.verbose else _preview(error))}"
                 )
+        elif kind == "memory":
+            node = str(event.get("node") or "")
+            self._open(node)
+            digest = str(event.get("digest") or "")
+            chars = int(event.get("chars") or 0)
+            console.print(
+                Text(
+                    f"   {_glyph('result')} memory[{node or 'graph'}]: {digest} ({chars} chars)",
+                    style="dim",
+                )
+            )
+            if self.verbose:
+                # the whole snapshot, so a run can be inspected (and diffed) in detail
+                console.print(
+                    Text(
+                        _preview(
+                            str(event.get("formatted") or "") or _format_memory(event),
+                            lines=60,
+                            limit=6000,
+                        ),
+                        style="dim",
+                    )
+                )
+        elif kind == "context_compressed":
+            persisted = event.get("persisted") or {}
+            notepad = event.get("notepad") or {}
+            ok = bool(event.get("ok", True))
+            written = [
+                name
+                for record, name in (
+                    (persisted, event.get("history_path")),
+                    (notepad, event.get("notepad_path")),
+                )
+                if isinstance(record, Mapping) and record.get("ok") and name
+            ]
+            note = (
+                f"  [{', '.join(str(name) for name in written)}]"
+                if written
+                else "  (history not persisted)"
+            )
+            console.print(
+                Text(
+                    f"   {_glyph('result')} compressed {_context_pair(event)}{note}",
+                    style="dim" if ok else "yellow",
+                )
+            )
+            if not ok and event.get("error"):
+                console.print(Text(f"   fallback summary: {event['error']}", style="yellow"))
         elif kind == "search_results":
             count = len(event.get("results") or [])
             query = str(event.get("query") or "").strip()
@@ -335,7 +452,7 @@ class _NodeRenderer:
             self._opened.discard(node)  # the header was already printed for this round
         else:
             console.print(f"[bold]{escape(_node_header(node, update))}[/]")
-        _render_node_update(node, update)
+        _render_node_update(node, update, verbose=self.verbose)
 
 
 # -- informational commands --------------------------------------------------
@@ -389,6 +506,7 @@ def _print_config(
         ("workspace", f"{resolved_workspace} ({workspace_note})"),
         ("max attempts", str(max_attempts)),
         ("actor loops", f"{max_steps} per attempt"),
+        ("context budget", f"{context_token_limit_from_env()} tokens"),
         ("bash timeout", f"{timeout}s"),
         ("tools", ", ".join(tool_names())),
     ]
@@ -529,6 +647,8 @@ def run_task(
                 f"workflow  : planner -> verifier -> final "
                 f"(planner delegates to searchAgent/codeAgent; "
                 f"max {max_attempts} attempts, {max_steps} planner rounds each)\n"
+                f"context   : {context_token_limit_from_env()} token budget "
+                f"({CONTEXT_TOKEN_LIMIT_ENV})\n"
                 f"tools     : {escape(', '.join(tool_names()))}",
                 border_style="cyan",
                 title="run",

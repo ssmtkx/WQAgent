@@ -240,6 +240,145 @@ def test_renderer_prints_the_handoff_and_specialist_headers(monkeypatch: Any) ->
     assert "$ echo ok" in text
 
 
+def test_renderer_prints_the_context_monitor(tmp_path: Path, monkeypatch: Any) -> None:
+    from io import StringIO
+
+    from rich.console import Console
+
+    stream = StringIO()
+    monkeypatch.setattr(
+        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
+    )
+    monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)  # ASCII path
+    renderer = cli_module._NodeRenderer(verbose=False)
+
+    renderer.render(
+        {
+            "type": "node_end",
+            "node": "context_monitor",
+            "update": {
+                "context_token_count": 1200,
+                "context_token_limit": 400_000,
+                "context_should_compress": False,
+                "context_next_node": "verifier",
+            },
+        }
+    )
+    renderer.render(
+        {
+            "type": "node_end",
+            "node": "context_monitor",
+            "update": {
+                "context_token_count": 401_000,
+                "context_should_compress": True,
+                "context_next_node": "planner",
+            },
+        }
+    )
+
+    text = _flat(stream.getvalue())
+    assert "Context" in text
+    assert "1200/400000 tokens (ok) -> next: verifier" in text
+    assert "401000 tokens (over budget) -> next: planner" in text
+
+
+def test_renderer_prints_the_context_compressor(monkeypatch: Any) -> None:
+    from io import StringIO
+
+    from rich.console import Console
+
+    stream = StringIO()
+    monkeypatch.setattr(
+        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
+    )
+    monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)  # ASCII path
+    renderer = cli_module._NodeRenderer(verbose=False)
+
+    renderer.render(
+        {
+            "type": "context_compressed",
+            "node": "context_compressor",
+            "ok": True,
+            "error": "",
+            "tokens_before": 412_000,
+            "tokens_after": 3_100,
+            "messages_before": 24,
+            "messages_after": 1,
+            "persisted": {"ok": True, "path": "HISTORY_SUMMARY.md", "error": ""},
+            "notepad": {"ok": True, "path": "NOTEPAD.md", "error": ""},
+            "history_path": "HISTORY_SUMMARY.md",
+            "notepad_path": "NOTEPAD.md",
+        }
+    )
+    renderer.render(
+        {
+            "type": "node_end",
+            "node": "context_compressor",
+            "update": {
+                "context_summary": "compressed: hello.py written",
+                "compression_events": [
+                    {
+                        "tokens_before": 412_000,
+                        "tokens_after": 3_100,
+                        "messages_before": 24,
+                        "messages_after": 1,
+                        "token_limit": 400_000,
+                        "summary": "compressed",
+                    }
+                ],
+            },
+        }
+    )
+    # a fallback compression says so
+    renderer.render(
+        {
+            "type": "context_compressed",
+            "node": "context_compressor",
+            "ok": False,
+            "error": "RuntimeError: provider exploded",
+            "tokens_before": 10,
+            "tokens_after": 20,
+            "persisted": {"ok": False, "error": "OSError: read-only"},
+        }
+    )
+
+    text = _flat(stream.getvalue())
+    assert "Compressor" in text
+    # before/after comparison: both message count and tokens
+    assert "compressed 24 msgs/412000 tokens -> 1 msg/3100 tokens [HISTORY_SUMMARY.md, NOTEPAD.md]" in text
+    assert "24 msgs/412000 tokens -> 1 msg/3100 tokens (limit 400000)" in text
+    assert "compressed: hello.py written" not in text  # only in verbose mode
+    assert "compressed 10 -> 20 tokens (history not persisted)" in text
+    assert "fallback summary: RuntimeError: provider exploded" in text
+
+
+def test_renderer_prints_the_injected_memory(monkeypatch: Any) -> None:
+    from io import StringIO
+
+    from rich.console import Console
+
+    stream = StringIO()
+    monkeypatch.setattr(
+        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
+    )
+    monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)  # ASCII path
+    renderer = cli_module._NodeRenderer(verbose=False)
+
+    renderer.render(
+        {
+            "type": "memory",
+            "node": "planner",
+            "digest": "1 todos, 0 sources, 1 handoffs, notepad=yes, history=no",
+            "chars": 1517,
+            "memory": {"rules": {}, "working_memory": {}, "history_summary_store": {}},
+        }
+    )
+
+    text = _flat(stream.getvalue())
+    assert "Planner" in text  # the header opens on the node's first event
+    assert "memory[planner]: 1 todos, 0 sources, 1 handoffs, notepad=yes, history=no (1517 chars)" in text
+
+
 def test_default_workspace_is_created(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
     _use_scripted(monkeypatch, _passing_script())

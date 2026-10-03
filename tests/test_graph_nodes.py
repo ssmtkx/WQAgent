@@ -3,15 +3,31 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from wqagent.core.state import RuntimeState
+from wqagent.graph.memory import (
+    DEFAULT_CONTEXT_TOKEN_LIMIT,
+    HANDOFF_TEXT_CHARS,
+    NOTEPAD_FILE_CHARS,
+    RESEARCH_CHARS,
+    SUMMARY_CHARS,
+    read_todos,
+    write_todos,
+)
 from wqagent.graph.nodes import (
+    COMPRESS_TRANSCRIPT_CHARS,
     actor_node,
+    context_compressor_node,
+    context_compressor_route,
+    context_monitor_node,
+    context_monitor_route,
     get_model,
     planner_node,
     run_verification_commands,
@@ -22,6 +38,8 @@ from wqagent.graph.nodes import (
 from wqagent.graph.state import make_todo, new_graph_state
 from wqagent.prompts.stage1 import ACTOR_PROMPT
 from wqagent.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
+from wqagent.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
+from wqagent.tools.bash_tool import SHELL_NAME, shell_guidance
 
 
 class ScriptedModel:
@@ -508,6 +526,856 @@ def test_verifier_route() -> None:
     assert verifier_route({"passed": False, "attempts": 9, "max_attempts": 3}) == "final"
     assert verifier_route({"passed": False}) == "planner"  # attempts defaults to 0 < 3
     assert verifier_route({}) == "planner"
+
+
+# -- context monitor ---------------------------------------------------------
+class CountingModel:
+    """A model whose token counter is scripted (or broken, for the fallback)."""
+
+    def __init__(self, count: Any = 10) -> None:
+        self.count = count
+        self.seen: list[list[Any]] = []
+
+    def get_num_tokens_from_messages(self, messages: list[Any]) -> Any:
+        self.seen.append(list(messages))
+        if isinstance(self.count, Exception):
+            raise self.count
+        return self.count
+
+
+def test_context_monitor_counts_with_the_models_tokenizer(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state["messages"] = [HumanMessage(content="do the thing")]
+    model = CountingModel(12_345)
+
+    update = context_monitor_node(state, model=model)
+
+    assert update == {
+        "context_token_count": 12_345,
+        "context_should_compress": False,
+        "context_next_node": "verifier",  # default
+    }
+    # the model was asked to count the conversation *plus* the memory payload
+    counted = model.seen[0]
+    assert [message.type for message in counted] == ["human", "system"]
+    assert "Layered memory:" in counted[-1].content
+    assert '"rules"' in counted[-1].content
+
+
+def test_context_monitor_falls_back_to_characters(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state["messages"] = [HumanMessage(content="x" * 4_000)]
+    model = CountingModel(RuntimeError("no tokenizer here"))
+
+    update = context_monitor_node(state, model=model)
+
+    # exactly len(text) // 4 over the message text plus the memory payload
+    text = "x" * 4_000 + "\n" + model.seen[0][-1].content
+    assert update["context_token_count"] == len(text) // 4
+    assert update["context_token_count"] > 1_000
+    assert update["context_should_compress"] is False
+
+
+def test_context_monitor_falls_back_without_the_method(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state["messages"] = [HumanMessage(content="y" * 800)]
+
+    update = context_monitor_node(state, model=ScriptedModel([]))
+
+    assert update["context_token_count"] >= 200
+
+
+def test_context_monitor_handles_a_useless_count(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state["messages"] = [HumanMessage(content="z" * 400)]
+
+    for count in (None, -5, "not a number"):
+        update = context_monitor_node(state, model=CountingModel(count))
+        assert update["context_token_count"] >= 100, count
+
+
+def test_context_monitor_flags_an_over_budget_context(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    model = CountingModel(5_000)
+
+    over = context_monitor_node(state, model=model)
+    assert over["context_should_compress"] is False
+
+    state["context_token_limit"] = 4_999
+    assert context_monitor_node(state, model=model)["context_should_compress"] is True
+
+    state["context_token_limit"] = 5_000  # exactly at the limit is not over it
+    assert context_monitor_node(state, model=model)["context_should_compress"] is False
+
+
+def test_context_monitor_uses_the_default_limit_and_echoes_the_next_node(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state["context_next_node"] = "planner"
+
+    update = context_monitor_node(state, model=CountingModel(1_000))
+
+    assert update["context_next_node"] == "planner"
+    assert DEFAULT_CONTEXT_TOKEN_LIMIT == 400_000
+    # a huge count still does not compress without an explicit smaller limit
+    assert context_monitor_node(state, model=CountingModel(399_999))["context_should_compress"] is False
+    assert context_monitor_node(state, model=CountingModel(400_001))["context_should_compress"] is True
+
+
+def test_context_monitor_reuses_the_stored_snapshot(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state["memory_snapshot"] = {
+        "rules": {"scope": "workspace", "storage": "internal", "rules": ["stored"]},
+        "working_memory": {"node": "planner", "task": "stored task"},
+        "history_summary_store": {},
+    }
+    model = CountingModel(7)
+
+    context_monitor_node(state, model=model)
+
+    payload = model.seen[0][-1].content
+    assert "stored task" in payload
+    assert "stored" in payload
+
+
+@pytest.mark.parametrize("limit", ["abc", None, "", 0, {"nope": 1}])
+def test_context_monitor_survives_a_junk_limit(limit: Any, tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    state["context_token_limit"] = limit  # type: ignore[typeddict-item]
+
+    update = context_monitor_node(state, model=CountingModel(1_000))
+
+    # unparsable (or unset) budgets fall back to the default, they never raise
+    assert update["context_should_compress"] is False
+    assert update["context_token_count"] == 1_000
+
+
+def test_context_monitor_needs_a_runtime() -> None:
+    with pytest.raises(ValueError, match="RuntimeState"):
+        context_monitor_node({"task": "no runtime"}, model=CountingModel(1))  # type: ignore[arg-type]
+
+
+def test_context_monitor_route() -> None:
+    assert context_monitor_route({"passed": True}) == "final"
+    # a pass wins over an over-budget context and a spent budget
+    assert (
+        context_monitor_route({"passed": True, "context_should_compress": True, "attempts": 9})
+        == "final"
+    )
+    # a spent attempt budget stops the run instead of looping planner -> verifier
+    assert context_monitor_route({"passed": False, "attempts": 3, "max_attempts": 3}) == "final"
+    assert (
+        context_monitor_route(
+            {"attempts": 3, "max_attempts": 3, "context_should_compress": True}
+        )
+        == "final"
+    )
+    assert context_monitor_route({"context_should_compress": True}) == "context_compressor"
+    assert context_monitor_route({"attempts": 1, "max_attempts": 3, "context_next_node": "planner"}) == "planner"
+    assert context_monitor_route({"context_next_node": "verifier"}) == "verifier"
+    # unset / empty -> the safe default
+    assert context_monitor_route({}) == "verifier"
+    assert context_monitor_route({"context_next_node": "  "}) == "verifier"
+
+
+def test_context_compressor_route() -> None:
+    assert context_compressor_route({"context_next_node": "verifier"}) == "verifier"
+    assert context_compressor_route({"context_next_node": "planner"}) == "planner"
+    assert context_compressor_route({"context_next_node": "final"}) == "final"
+    # missing or blank -> verification is what normally follows a compression
+    assert context_compressor_route({}) == "verifier"
+    assert context_compressor_route({"context_next_node": None}) == "verifier"  # type: ignore[typeddict-item]
+
+
+def test_context_monitor_does_not_compress_twice_without_progress(tmp_path: Path) -> None:
+    """An unreachable limit must not loop monitor -> compressor for ever."""
+    state = _state(tmp_path, context_token_limit=1)
+    model = CountingModel(5_000)
+
+    first = context_monitor_node(state, model=model)
+    assert first["context_should_compress"] is True
+
+    # the compressor tried and landed at 5_000 tokens - still over the limit
+    state["compression_events"] = [{"tokens_before": 9_000, "tokens_after": 5_000}]
+    state["context_token_limit"] = 1
+    assert context_monitor_node(state, model=CountingModel(5_000))["context_should_compress"] is False
+    # ...even after new work grew the context again: the floor is still too high
+    assert context_monitor_node(state, model=CountingModel(6_000))["context_should_compress"] is False
+
+    # a compression that DID fit the budget keeps the mechanism alive for later growth
+    state["compression_events"] = [{"tokens_before": 9_000, "tokens_after": 400}]
+    state["context_token_limit"] = 1_000
+    assert context_monitor_node(state, model=CountingModel(500))["context_should_compress"] is False
+    assert context_monitor_node(state, model=CountingModel(1_500))["context_should_compress"] is True
+
+
+def test_context_monitor_ignores_junk_compression_events(tmp_path: Path) -> None:
+    state = _state(tmp_path, context_token_limit=1)
+    state["compression_events"] = ["junk", {"tokens_after": "nope"}]  # type: ignore[list-item]
+
+    update = context_monitor_node(state, model=CountingModel(5_000))
+
+    assert update["context_should_compress"] is True  # cannot prove futility -> compress
+
+
+def test_planner_and_verifier_direct_the_context_monitor(tmp_path: Path) -> None:
+    plan_model = ScriptedModel(
+        [
+            _tool_call("todo_write", {"plan_summary": "p", "todos": [{"id": "t1", "content": "c"}]}),
+            AIMessage(content="planned"),
+        ]
+    )
+    assert planner_node(_state(tmp_path), model=plan_model)["context_next_node"] == "verifier"
+
+    failing = ScriptedModel(
+        [
+            AIMessage(content="inspected"),
+            _tool_call(
+                "verification_report",
+                {"passed": False, "reason": "nope", "checks": [], "recommended_next_instruction": "fix"},
+            ),
+        ]
+    )
+    failed = verifier_node(_state(tmp_path, verification_commands=["exit 1"]), model=failing)
+    assert failed["passed"] is False
+    assert failed["context_next_node"] == "planner"
+
+    passing = ScriptedModel(
+        [
+            AIMessage(content="inspected"),
+            _tool_call(
+                "verification_report",
+                {"passed": True, "reason": "fine", "checks": [], "recommended_next_instruction": ""},
+            ),
+        ]
+    )
+    verified = verifier_node(_state(tmp_path, verification_commands=["echo ok"]), model=passing)
+    assert verified["passed"] is True
+    assert "context_next_node" not in verified  # nothing follows but the final node
+
+
+# -- context compressor ------------------------------------------------------
+COMPRESSION_PAYLOAD: dict[str, Any] = {
+    "summary": "compressed: hello.py is written, verification still fails",
+    "active_goal": "make python hello.py exit 0",
+    "completed_work": "hello.py written (22 bytes)",
+    "open_todos": ["t1: rerun the program"],
+    "important_files": ["hello.py"],
+    "tool_findings": ["python 3.12.7 is on PATH"],
+    "sources": ["https://docs.test/python"],
+    "next_steps": ["run python hello.py and check exit code"],
+    "risks": "the verifier command exits 1",
+}
+
+
+def _compression_json(payload: Any = None) -> str:
+    if payload is None:
+        payload = COMPRESSION_PAYLOAD
+    return payload if isinstance(payload, str) else json.dumps(payload)
+
+
+class CompressorModel:
+    """Returns a scripted answer to the compression request and counts tokens."""
+
+    def __init__(self, answer: Any = None, *, tokens: Any = 20) -> None:
+        self.answer = answer if answer is not None else AIMessage(content=_compression_json())
+        self.tokens = tokens
+        self.seen: list[list[Any]] = []
+
+    def invoke(self, messages: list[Any]) -> Any:
+        self.seen.append(list(messages))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+    def get_num_tokens_from_messages(self, messages: list[Any]) -> Any:
+        if isinstance(self.tokens, Exception):
+            raise self.tokens
+        return self.tokens
+
+
+def _compressible_state(tmp_path: Path, **extra: Any):
+    state = _state(
+        tmp_path,
+        todos=[make_todo("t1", "write hello.py")],
+        plan_summary="write hello.py then run it",
+        acceptance_criteria=["it prints Hello"],
+        verification_commands=["python hello.py"],
+        attempts=1,
+        **extra,
+    )
+    state["messages"] = [
+        HumanMessage(content="write hello.py"),
+        AIMessage(content="I will write the file"),
+        _tool_call("file_write", {"file_path": "hello.py", "content": "print('Hello')\n"}),
+        ToolMessage(content="Created hello.py", tool_call_id="c1"),
+        AIMessage(content="now run it"),
+        ToolMessage(content="exit code 1: NameError", tool_call_id="c2"),
+    ]
+    return state
+
+
+def test_context_compressor_replaces_the_transcript(tmp_path: Path) -> None:
+    state = _compressible_state(tmp_path)
+    model = CompressorModel()
+
+    update = context_compressor_node(state, model=model)
+
+    messages = update["messages"]
+    assert len(messages) == 2
+    assert isinstance(messages[0], RemoveMessage)
+    assert messages[0].id == REMOVE_ALL_MESSAGES
+    assert isinstance(messages[1], AIMessage)
+    assert messages[1].content == COMPRESSION_PAYLOAD["summary"]
+
+    # the summary becomes the new context in every field that carries it
+    assert update["context_summary"] == COMPRESSION_PAYLOAD["summary"]
+    assert update["history_summary"] == COMPRESSION_PAYLOAD["summary"]
+    assert update["context_should_compress"] is False
+    assert update["context_token_count"] == 20
+    assert update["context_next_node"] == "verifier"  # echoed/defaulted
+    assert update["memory_snapshot"] == {}  # stale derived data is dropped
+
+
+def test_context_compressor_applies_the_replace_to_a_real_graph(tmp_path: Path) -> None:
+    """add_messages must drop the old transcript and keep only the summary."""
+    from functools import partial
+
+    from langgraph.graph import END, START, StateGraph
+
+    from wqagent.graph import WQGraphState
+
+    state = _compressible_state(tmp_path)
+    graph = StateGraph(WQGraphState)
+    graph.add_node("compress", partial(context_compressor_node, model=CompressorModel()))
+    graph.add_edge(START, "compress")
+    graph.add_edge("compress", END)
+
+    result = graph.compile().invoke(state, {"configurable": {}})
+
+    assert [message.type for message in result["messages"]] == ["ai"]
+    assert result["messages"][0].content == COMPRESSION_PAYLOAD["summary"]
+    assert result["context_summary"] == COMPRESSION_PAYLOAD["summary"]
+
+
+def test_context_compressor_sends_the_prompt_and_the_context(tmp_path: Path) -> None:
+    state = _compressible_state(tmp_path, research_notes="found: use print()")
+
+    context_compressor_node(state, model=CompressorModel())
+    model = CompressorModel()
+    context_compressor_node(state, model=model)
+
+    sent = model.seen[0]
+    assert [message.type for message in sent] == ["system", "human"]
+    assert sent[0].content == CONTEXT_COMPRESSION_PROMPT
+    # task, transcript and the layered memory all reached the compressor
+    assert "write hello.py" in sent[1].content
+    assert "[tool] exit code 1: NameError" in sent[1].content
+    assert "Layered memory:" in sent[1].content
+    assert "found: use print()" in sent[1].content
+
+
+def test_context_compressor_caps_the_fields_it_writes_back(tmp_path: Path) -> None:
+    state = _compressible_state(
+        tmp_path,
+        research_notes="r" * 5_000,
+        code_agent_summary="c" * 5_000,
+        agent_handoffs=[{"instruction": "i" * 900} for _ in range(9)],
+        sources=[{"title": "Docs", "url": "https://docs.test/a", "content": "body", "score": 0.9}],
+    )
+
+    update = context_compressor_node(state, model=CompressorModel())
+
+    assert len(update["research_notes"]) <= RESEARCH_CHARS + 3
+    assert update["research_notes"].endswith("...")
+    assert len(update["code_agent_summary"]) <= SUMMARY_CHARS + 3
+    assert len(update["agent_handoffs"]) == 6  # newest six
+    assert len(update["agent_handoffs"][0]["instruction"]) <= HANDOFF_TEXT_CHARS + 3
+    # structured sources stay, the model's urls are appended as bare urls
+    assert update["sources"][0] == {"title": "Docs", "url": "https://docs.test/a"}
+    assert {"title": "", "url": "https://docs.test/python"} in update["sources"]
+
+
+def test_context_compressor_ignores_junk_source_urls(tmp_path: Path) -> None:
+    state = _compressible_state(tmp_path)
+    model = CompressorModel(
+        AIMessage(content=_compression_json({**COMPRESSION_PAYLOAD, "sources": ["not a url", 42, "ok.test"]}))
+    )
+
+    update = context_compressor_node(state, model=model)
+
+    assert [source["url"] for source in update["sources"]] == ["ok.test"]
+
+
+def test_context_compressor_appends_a_compression_event(tmp_path: Path) -> None:
+    state = _compressible_state(
+        tmp_path, compression_events=[{"node": "old", "attempt": 0, "summary": "previous"}]
+    )
+    model = CompressorModel(tokens=123)
+
+    update = context_compressor_node(state, model=model)
+    events = update["compression_events"]
+
+    assert [event["summary"] for event in events][0] == "previous"  # history kept
+    assert len(events) == 2
+    event = events[-1]
+    assert event["node"] == "context_compressor"
+    assert event["attempt"] == 1
+    assert event["tokens_before"] == 123 and event["tokens_after"] == 123
+    assert event["token_limit"] == DEFAULT_CONTEXT_TOKEN_LIMIT
+    assert event["summary"] == COMPRESSION_PAYLOAD["summary"]
+    # the state list was not mutated in place
+    assert len(state["compression_events"]) == 1
+
+
+def test_context_compressor_writes_history_summary(tmp_path: Path) -> None:
+    state = _compressible_state(tmp_path)
+
+    context_compressor_node(state, model=CompressorModel())
+
+    text = (tmp_path / "ws" / "HISTORY_SUMMARY.md").read_text(encoding="utf-8")
+    assert text.startswith("# History summary")
+    assert COMPRESSION_PAYLOAD["summary"] in text
+    for heading, item in (
+        ("## Active goal", "make python hello.py exit 0"),
+        ("## Completed work", "hello.py written (22 bytes)"),
+        ("## Open todos", "- t1: rerun the program"),
+        ("## Important files", "- hello.py"),
+        ("## Tool findings", "- python 3.12.7 is on PATH"),
+        ("## Sources", "- https://docs.test/python"),
+        ("## Next steps", "- run python hello.py and check exit code"),
+        ("## Risks", "the verifier command exits 1"),
+    ):
+        assert heading in text, heading
+        assert item in text, item
+    assert "compressed by context_compressor_node" in text
+
+
+def test_context_compressor_reports_persistence_in_the_event(tmp_path: Path) -> None:
+    state = _compressible_state(tmp_path)
+    events: list[dict[str, Any]] = []
+
+    context_compressor_node(state, model=CompressorModel(), on_event=events.append)
+
+    compressed = [event for event in events if event["type"] == "context_compressed"]
+    assert len(compressed) == 1
+    assert compressed[0]["node"] == "context_compressor"
+    assert compressed[0]["ok"] is True
+    assert compressed[0]["persisted"]["ok"] is True
+    assert compressed[0]["history_path"] == "HISTORY_SUMMARY.md"
+    assert compressed[0]["tokens_after"] == 20
+
+
+def test_context_compressor_survives_a_failed_write(tmp_path: Path, monkeypatch: Any) -> None:
+    import wqagent.graph.nodes as node_module
+
+    state = _compressible_state(tmp_path)
+    monkeypatch.setattr(
+        node_module,
+        "_write_history_summary",
+        lambda runtime, content: {"ok": False, "path": "HISTORY_SUMMARY.md", "error": "OSError: nope"},
+    )
+    events: list[dict[str, Any]] = []
+
+    update = context_compressor_node(state, model=CompressorModel(), on_event=events.append)
+
+    assert update["context_summary"] == COMPRESSION_PAYLOAD["summary"]  # still compressed
+    assert update["messages"][1].content == COMPRESSION_PAYLOAD["summary"]
+    assert events[-1]["persisted"]["ok"] is False
+    assert not (tmp_path / "ws" / "HISTORY_SUMMARY.md").exists()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        AIMessage(content="```json\n" + _compression_json() + "\n```"),
+        AIMessage(content="Here you go:\n" + _compression_json() + "\nHope that helps!"),
+    ],
+)
+def test_context_compressor_tolerates_fenced_and_prose_json(answer: AIMessage, tmp_path: Path) -> None:
+    update = context_compressor_node(_compressible_state(tmp_path), model=CompressorModel(answer))
+
+    assert update["context_summary"] == COMPRESSION_PAYLOAD["summary"]
+    assert update["compression_events"][-1]["summary"] == COMPRESSION_PAYLOAD["summary"]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        RuntimeError("provider exploded"),
+        AIMessage(content="I am not going to answer in JSON."),
+        AIMessage(content="null"),
+        AIMessage(content='{"active_goal": "no summary key"}'),
+    ],
+)
+def test_context_compressor_falls_back_to_a_deterministic_summary(
+    answer: Any, tmp_path: Path
+) -> None:
+    state = _compressible_state(tmp_path, last_error="command failed: exit 1")
+    events: list[dict[str, Any]] = []
+
+    update = context_compressor_node(state, model=CompressorModel(answer), on_event=events.append)
+
+    # the transcript is still replaced - an over-budget context must not survive
+    assert update["messages"][0].id == REMOVE_ALL_MESSAGES
+    summary = update["context_summary"]
+    assert "write hello.py" in summary  # task
+    assert "python hello.py" in summary  # verification command / plan
+    assert "command failed: exit 1" in summary  # last failure
+    assert "compressed deterministically" in summary
+    assert update["context_should_compress"] is False
+    assert events[-1]["ok"] is False
+    assert update["compression_events"][-1]["summary"] == summary
+
+
+def test_context_compressor_never_grows_past_the_state(tmp_path: Path) -> None:
+    """A bloated transcript is replaced by a much smaller context."""
+    state = _compressible_state(tmp_path)
+    state["messages"] = [HumanMessage(content="x" * 40_000)] + state["messages"]
+    model = CountingModel(RuntimeError("no tokenizer"))
+
+    before = context_monitor_node(state, model=model)["context_token_count"]
+    update = context_compressor_node(state, model=CompressorModel())
+    after = update["context_token_count"]
+
+    assert before > 10_000
+    assert after < before
+
+
+def test_context_compressor_trims_a_huge_transcript_request(tmp_path: Path) -> None:
+    state = _compressible_state(tmp_path)
+    state["messages"] = [HumanMessage(content="HEAD" + "x" * 200_000 + "TAIL")]
+    model = CompressorModel()
+
+    context_compressor_node(state, model=model)
+
+    request = model.seen[0][1].content
+    assert "HEAD" in request and "TAIL" in request
+    assert "characters of transcript dropped" in request
+    assert len(request) < COMPRESS_TRANSCRIPT_CHARS + 30_000
+
+
+def test_context_compressor_writes_the_notepad(tmp_path: Path) -> None:
+    """Compressing is when the runtime distils the durable notes."""
+    state = _compressible_state(tmp_path)
+    events: list[dict[str, Any]] = []
+
+    context_compressor_node(state, model=CompressorModel(), on_event=events.append)
+
+    text = (tmp_path / "ws" / "NOTEPAD.md").read_text(encoding="utf-8")
+    assert text.startswith("# Notepad")
+    assert "## Compression #1 - make python hello.py exit 0" in text
+    # the durable half of the nine keys...
+    assert "**Completed work**\nhello.py written (22 bytes)" in text
+    assert "- hello.py" in text and "- python 3.12.7 is on PATH" in text
+    assert "- https://docs.test/python" in text
+    assert "- run python hello.py and check exit code" in text
+    assert "**Risks**\nthe verifier command exits 1" in text
+    # ...but not the compressed history, which belongs to HISTORY_SUMMARY.md
+    assert COMPRESSION_PAYLOAD["summary"] not in text
+    assert "open_todos" not in text
+    assert "tokens 20 -> 20" in text  # provenance comment
+
+    compressed = [event for event in events if event["type"] == "context_compressed"][-1]
+    assert compressed["notepad"]["ok"] is True
+    assert compressed["notepad_path"] == "NOTEPAD.md"
+
+
+def test_context_compressor_appends_to_an_existing_notepad(tmp_path: Path) -> None:
+    runtime = RuntimeState(workspace=tmp_path / "ws")
+    state = _compressible_state(tmp_path)
+    runtime.workspace.mkdir(parents=True, exist_ok=True)
+    (runtime.workspace / "NOTEPAD.md").write_text(
+        "# Notepad\n\n## Earlier note\n\nkeep me\n", encoding="utf-8"
+    )
+    state["compression_events"] = [{"node": "context_compressor", "attempt": 0}]
+
+    context_compressor_node(state, model=CompressorModel())
+
+    text = (runtime.workspace / "NOTEPAD.md").read_text(encoding="utf-8")
+    assert text.count("# Notepad") == 1  # the title is not repeated
+    assert "## Earlier note" in text and "keep me" in text  # nothing is lost
+    assert "## Compression #2" in text  # numbered after the recorded compression
+    assert text.index("Earlier note") < text.index("Compression #2")  # newest last
+
+
+def test_context_compressor_caps_the_notepad(tmp_path: Path) -> None:
+    runtime = RuntimeState(workspace=tmp_path / "ws")
+    runtime.workspace.mkdir(parents=True, exist_ok=True)
+    (runtime.workspace / "NOTEPAD.md").write_text(
+        "# Notepad\n\n" + "".join(f"## Old #{n}\n\n{'x' * 2000}\n\n" for n in range(10)),
+        encoding="utf-8",
+    )
+    state = _compressible_state(tmp_path)
+
+    context_compressor_node(state, model=CompressorModel())
+
+    text = (runtime.workspace / "NOTEPAD.md").read_text(encoding="utf-8")
+    assert len(text) <= NOTEPAD_FILE_CHARS + 2000  # bounded, newest sections kept
+    assert "## Old #9" in text  # the newest old section survives
+    assert "## Compression #1" in text
+
+
+def test_context_compressor_without_a_model_summary_writes_no_notepad(tmp_path: Path) -> None:
+    """A deterministic fallback has no durable fields to distil."""
+    state = _compressible_state(tmp_path)
+
+    update = context_compressor_node(state, model=CompressorModel(AIMessage(content="not json")))
+
+    assert update["context_summary"]  # the run was still compressed
+    assert not (tmp_path / "ws" / "NOTEPAD.md").exists()
+
+
+def test_compressor_events_report_both_files(tmp_path: Path) -> None:
+    state = _compressible_state(tmp_path)
+    events: list[dict[str, Any]] = []
+
+    context_compressor_node(state, model=CompressorModel(), on_event=events.append)
+
+    event = [item for item in events if item["type"] == "context_compressed"][-1]
+    assert event["persisted"]["ok"] is True
+    assert event["notepad"]["ok"] is True
+    assert event["history_path"] == "HISTORY_SUMMARY.md"
+    assert event["notepad_path"] == "NOTEPAD.md"
+
+
+def test_context_compressor_normalises_stringified_lists(tmp_path: Path) -> None:
+    """Models often stringify list fields; they must not land in the notepad as text."""
+    payload = {
+        **COMPRESSION_PAYLOAD,
+        "important_files": "[]",
+        "tool_findings": '["python 3.12 is on PATH", "exit code 0"]',
+        "sources": "",
+        "next_steps": "not json at all",
+    }
+    state = _compressible_state(tmp_path)
+
+    context_compressor_node(state, model=CompressorModel(AIMessage(content=json.dumps(payload))))
+
+    text = (tmp_path / "ws" / "NOTEPAD.md").read_text(encoding="utf-8")
+    assert "**Important files**" not in text  # an empty list adds nothing
+    assert "**Sources**" not in text
+    assert "- python 3.12 is on PATH" in text and "- exit code 0" in text
+    assert "**Next steps**\n- not json at all" in text  # a real sentence is kept
+    assert "[]" not in text
+
+
+def test_context_compressor_needs_a_runtime() -> None:
+    with pytest.raises(ValueError, match="RuntimeState"):
+        context_compressor_node({"task": "x"}, model=CompressorModel())  # type: ignore[arg-type]
+
+
+# -- layered memory injection ------------------------------------------------
+def test_planner_injects_the_layered_memory(tmp_path: Path) -> None:
+    state = _state(tmp_path, research_notes="found: use python", todos=[make_todo("t1", "do it")])
+    model = ScriptedModel([AIMessage(content="planned")])
+    events: list[dict[str, Any]] = []
+
+    update = planner_node(state, model=model, on_event=events.append)
+
+    prompt = model.seen[0][1].content
+    assert "Layered memory" in prompt
+    assert '"rules"' in prompt and '"working_memory"' in prompt
+    assert "found: use python" in prompt  # research notes ride along
+    assert "[ ] t1: do it" in prompt  # the planning brief is still there
+
+    memory_events = [event for event in events if event["type"] == "memory"]
+    assert len(memory_events) == 1
+    assert memory_events[0]["node"] == "planner"
+    assert memory_events[0]["memory"]["working_memory"]["task"] == "write hello.py"
+    # the snapshot this node showed the model is carried in the update
+    assert update["memory_snapshot"]["working_memory"]["node"] == "planner"
+
+
+def test_verifier_injects_the_layered_memory(tmp_path: Path) -> None:
+    state = _state(tmp_path, verification_commands=["echo ok"])
+    model = ScriptedModel(
+        [
+            AIMessage(content="inspected"),
+            _tool_call(
+                "verification_report",
+                {"passed": True, "reason": "fine", "checks": [], "recommended_next_instruction": ""},
+            ),
+        ]
+    )
+    events: list[dict[str, Any]] = []
+
+    update = verifier_node(state, model=model, on_event=events.append)
+
+    prompt = model.seen[0][1].content
+    assert "Layered memory" in prompt and '"working_memory"' in prompt
+    assert "exit_code=0" in prompt  # the command evidence is still there
+    assert [event["node"] for event in events if event["type"] == "memory"] == ["verifier"]
+    assert update["memory_snapshot"]["working_memory"]["node"] == "verifier"
+
+
+def test_injected_memory_carries_the_durable_files(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    (tmp_path / "ws").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "ws" / "NOTEPAD.md").write_text("durable: always use python3", encoding="utf-8")
+    (tmp_path / "ws" / "HISTORY_SUMMARY.md").write_text("history: earlier attempt", encoding="utf-8")
+    model = ScriptedModel([AIMessage(content="planned")])
+
+    planner_node(state, model=model)
+
+    prompt = model.seen[0][1].content
+    assert "durable: always use python3" in prompt
+    assert "history: earlier attempt" in prompt
+    assert '"notepad_exists": true' in prompt
+    assert '"history_exists": true' in prompt
+
+
+def test_memory_event_is_written_to_the_graph_stream(tmp_path: Path) -> None:
+    """The streamed copy is tagged, so a consumer knows which node injected it."""
+    state = _state(tmp_path)
+    streamed: list[dict[str, Any]] = []
+
+    planner_node(state, model=ScriptedModel([AIMessage(content="planned")]), writer=streamed.append)
+
+    memory_events = [event for event in streamed if event["type"] == "memory"]
+    assert len(memory_events) == 1
+    assert memory_events[0]["node"] == "planner"
+    assert memory_events[0]["digest"].endswith("notepad=no, history=no")
+
+
+# -- TODO.md is the working plan state ---------------------------------------
+def test_planner_persists_the_plan_to_todo_md(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            _tool_call(
+                "todo_write",
+                {
+                    "plan_summary": "write then run",
+                    "todos": [{"id": "t1", "content": "write hello.py"}],
+                    "acceptance_criteria": ["prints Hello"],
+                    "verification_commands": ["python hello.py"],
+                },
+            ),
+            AIMessage(content="planned"),
+        ]
+    )
+
+    update = planner_node(_state(tmp_path), model=model)
+
+    text = (tmp_path / "ws" / "TODO.md").read_text(encoding="utf-8")
+    assert "**Task:** write hello.py" in text
+    assert "write then run" in text
+    assert "- [ ] t1: write hello.py" in text
+    assert "- `python hello.py`" in text
+    plan = read_todos(RuntimeState(workspace=tmp_path / "ws"))
+    assert plan["todos"] == update["todos"]
+    assert plan["acceptance_criteria"] == ["prints Hello"]
+
+
+def test_verifier_persists_completed_todos(tmp_path: Path) -> None:
+    state = _state(
+        tmp_path, todos=[make_todo("t1", "write hello.py")], verification_commands=["echo ok"]
+    )
+    model = ScriptedModel(
+        [
+            AIMessage(content="inspected"),
+            _tool_call(
+                "verification_report",
+                {"passed": True, "reason": "fine", "checks": [], "recommended_next_instruction": ""},
+            ),
+        ]
+    )
+
+    update = verifier_node(state, model=model)
+
+    assert update["passed"] is True
+    assert "- [x] t1: write hello.py" in (tmp_path / "ws" / "TODO.md").read_text(encoding="utf-8")
+
+
+def test_code_agent_updates_todo_md_while_working(tmp_path: Path) -> None:
+    """The code agent's persist hook keeps the file current mid-run."""
+    model = ScriptedModel(
+        [
+            _tool_call("call_code_agent", {"instruction": "write it"}, "c2"),
+            _tool_call("file_write", {"file_path": "hello.py", "content": "print(1)\n"}, "c3"),
+            _tool_call("todo_update", {"updates": [{"id": "t1", "status": "completed"}]}, "c4"),
+            AIMessage(content="wrote hello.py"),
+            AIMessage(content="done"),
+        ]
+    )
+
+    planner_node(_state(tmp_path, todos=[make_todo("t1", "write hello.py")]), model=model, agent_model=model)
+
+    text = (tmp_path / "ws" / "TODO.md").read_text(encoding="utf-8")
+    assert "- [x] t1: write hello.py" in text  # written by the specialist's hook
+
+
+def test_planner_resumes_the_plan_from_todo_md(tmp_path: Path) -> None:
+    runtime = RuntimeState(workspace=tmp_path / "ws")
+    write_todos(
+        runtime,
+        [make_todo("t1", "write hello.py", status="completed"), make_todo("t2", "run it")],
+        task="write hello.py",
+        plan_summary="write then run",
+        acceptance_criteria=["prints Hello"],
+        verification_commands=["python hello.py"],
+    )
+    model = ScriptedModel([AIMessage(content="continuing")])
+
+    update = planner_node(new_graph_state("write hello.py", runtime), model=model)
+
+    prompt = model.seen[0][1].content
+    assert "left an unfinished plan for this exact task in TODO.md" in prompt
+    assert "[x] t1: write hello.py" in prompt  # the recorded progress is loaded
+    assert update["plan_summary"] == "write then run"
+    assert [todo["status"] for todo in update["todos"]] == ["completed", "pending"]
+    assert update["acceptance_criteria"] == ["prints Hello"]
+
+
+def test_planner_ignores_a_todo_md_from_another_task(tmp_path: Path) -> None:
+    runtime = RuntimeState(workspace=tmp_path / "ws")
+    write_todos(runtime, [make_todo("t9", "something else")], task="a different task")
+    model = ScriptedModel([AIMessage(content="fresh plan")])
+
+    update = planner_node(new_graph_state("write hello.py", runtime), model=model)
+
+    assert "unfinished plan" not in model.seen[0][1].content
+    assert update["todos"] == []  # nothing was adopted
+
+
+def test_planner_ignores_a_finished_plan(tmp_path: Path) -> None:
+    """A completed TODO.md is not a resume point - it is just the last run's record."""
+    runtime = RuntimeState(workspace=tmp_path / "ws")
+    write_todos(
+        runtime,
+        [make_todo("t1", "write hello.py", status="completed")],
+        task="write hello.py",
+    )
+    model = ScriptedModel([AIMessage(content="fresh plan")])
+
+    update = planner_node(new_graph_state("write hello.py", runtime), model=model)
+
+    assert "unfinished plan" not in model.seen[0][1].content
+    assert update["todos"] == []
+
+
+def test_planner_keeps_the_state_plan_over_todo_md(tmp_path: Path) -> None:
+    runtime = RuntimeState(workspace=tmp_path / "ws")
+    write_todos(runtime, [make_todo("t9", "stale")], task="write hello.py")
+    state = new_graph_state("write hello.py", runtime, todos=[make_todo("t1", "current")])
+
+    planner_node(state, model=ScriptedModel([AIMessage(content="planned")]))
+
+    assert read_todos(runtime)["todos"][0]["id"] == "t1"  # the state wins, the file is rewritten
+
+
+# -- shell guidance for verification commands --------------------------------
+def test_planner_brief_names_the_shell(tmp_path: Path) -> None:
+    model = ScriptedModel([AIMessage(content="planned")])
+
+    planner_node(_state(tmp_path), model=model)
+
+    prompt = model.seen[0][1].content
+    assert SHELL_NAME in prompt
+    assert "Verification commands run in" in prompt
+    # concrete, machine-specific advice rather than a generic reminder
+    assert shell_guidance() in prompt
+    if os.name == "nt":
+        assert "&&" in prompt
 
 
 # -- model plumbing ----------------------------------------------------------
