@@ -1,49 +1,67 @@
-"""LangGraph nodes of the WQ Agent workflow: plan -> act -> verify -> route.
+"""LangGraph nodes of the WQ Agent workflow: plan/delegate -> verify -> route.
 
-* :func:`planner_node` - turns the task into todos, acceptance criteria and
-  verification commands, and revises them after a failed verification.
-* :func:`actor_node` - runs the ReAct loop with the workspace tools plus
-  ``todo_update``, forwarding one event per step.
+* :func:`planner_node` - the **supervisor**: plans through ``todo_write`` and
+  delegates research/implementation to the specialist agents through the
+  :class:`CallSearchAgentTool` / :class:`CallCodeAgentTool` handoff tools.
+* :func:`_call_search_agent_tool` / :func:`_call_code_agent_tool` - run one
+  handoff and record its state effects (notes, sources, todos, transcripts).
 * :func:`verifier_node` - runs the verification commands, inspects the workspace
   with read-only tools and records a structured verdict.
-* :func:`verifier_route` - stops, or goes back to the planner for another attempt.
+* :func:`final_node` / :func:`verifier_route` - report the outcome, or go back to
+  the planner for another attempt.
+* :func:`actor_node` - the stage-1/2 ReAct actor. Kept for reference and manual
+  wiring, but **not part of the stage-3 graph**: the code agent owns edits now.
 
 Nodes take their model from :func:`get_model` (lazily ``create_model()`` from
 ``.env``); pass ``model=...`` to a single node, or call :func:`set_model` once to
-pin one for the whole graph.
+pin one for the whole graph. The specialists reuse the planner's model unless the
+node is given ``agent_model=...``.
 
 Example wiring::
 
     graph = StateGraph(WQGraphState)
     graph.add_node("planner", planner_node)
-    graph.add_node("actor", actor_node)
     graph.add_node("verifier", verifier_node)
+    graph.add_node("final", final_node)
     graph.add_edge(START, "planner")
-    graph.add_edge("planner", "actor")
-    graph.add_edge("actor", "verifier")
-    graph.add_conditional_edges("verifier", verifier_route, {"planner": "planner", "final": END})
+    graph.add_edge("planner", "verifier")
+    graph.add_conditional_edges("verifier", verifier_route, {"planner": "planner", "final": "final"})
+    graph.add_edge("final", END)
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
-from wqagent.core.agent import message_text, react_loop
+from wqagent.core.agent import (
+    last_ai_text,
+    message_text,
+    react_loop,
+    write_event,
+)
 from wqagent.core.state import RuntimeState
 from wqagent.graph.state import (
     DEFAULT_MAX_ATTEMPTS,
+    TODO_MARKS,
     TODO_STATUSES,
+    AgentHandoff,
+    SourceItem,
     TodoItem,
     VerificationCheck,
     VerificationResult,
     WQGraphState,
     make_todo,
+    normalise_todos,
+    render_todos,
 )
 from wqagent.prompts.stage1 import ACTOR_PROMPT
-from wqagent.prompts.stage2 import FINAL_PROMPT, PLANNER_PROMPT, VERIFIER_PROMPT
+from wqagent.prompts.stage2 import FINAL_PROMPT
+from wqagent.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
 from wqagent.providers import create_model
 from wqagent.tools.bash_tool import BashTool
 from wqagent.tools.graph_tools import (
@@ -54,8 +72,14 @@ from wqagent.tools.graph_tools import (
 )
 from wqagent.tools.registry import build_read_only_tools, build_tools
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from langchain_core.tools import StructuredTool
+
 __all__ = [
+    "CallCodeAgentTool",
+    "CallSearchAgentTool",
     "DEFAULT_ACTOR_LOOPS",
+    "DEFAULT_PLANNER_LOOPS",
     "DEFAULT_VERIFIER_LOOPS",
     "VERIFY_OUTPUT_CHARS",
     "actor_node",
@@ -69,14 +93,14 @@ __all__ = [
     "verifier_route",
 ]
 
-#: ReAct loops the actor may use per attempt.
+#: ReAct loops the supervisor planner may use per round.
+DEFAULT_PLANNER_LOOPS = 10
+#: ReAct loops the (pre-stage-3) actor may use per attempt.
 DEFAULT_ACTOR_LOOPS = 10
 #: Read-only inspection loops the verifier may use before reporting.
 DEFAULT_VERIFIER_LOOPS = 6
 #: stdout/stderr characters kept per verification command in the state.
 VERIFY_OUTPUT_CHARS = 4_000
-
-_TODO_MARK = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]", "blocked": "[!]"}
 
 _MODEL: Any | None = None
 
@@ -107,15 +131,7 @@ def _runtime(state: Mapping[str, Any]) -> RuntimeState:
 
 def _todos(state: Mapping[str, Any]) -> list[TodoItem]:
     """Normalised copy of the plan (never the objects held by the state)."""
-    return [
-        TodoItem(
-            id=str(todo.get("id", "")),
-            content=str(todo.get("content", "")),
-            status=str(todo.get("status", "pending")),
-            note=str(todo.get("note", "")),
-        )
-        for todo in (state.get("todos") or [])
-    ]
+    return normalise_todos(state.get("todos"))
 
 
 def _text(value: Any) -> str:
@@ -174,15 +190,6 @@ def _text_list(value: Any) -> list[str]:
         if text:
             result.append(text)
     return result
-
-
-def _render_todos(todos: Sequence[TodoItem]) -> str:
-    lines = []
-    for todo in todos:
-        mark = _TODO_MARK.get(str(todo.get("status")), "[ ]")
-        note = str(todo.get("note") or "")
-        lines.append(f"{mark} {todo.get('id')}: {todo.get('content')}" + (f"  ({note})" if note else ""))
-    return "\n".join(lines) or "(no todos)"
 
 
 def _coerce_todos(raw: Any, *, fallback: Sequence[TodoItem] = ()) -> list[TodoItem]:
@@ -331,100 +338,502 @@ def _request_structured(
 
 
 # -- event plumbing ----------------------------------------------------------
-def _stream_writer() -> Callable[[Any], None] | None:
-    """LangGraph's custom stream writer (``stream_mode="custom"``), if available."""
-    try:
-        from langgraph.config import get_stream_writer
-
-        writer = get_stream_writer()
-    except Exception:  # noqa: BLE001 - not running inside a graph
-        return None
-    return writer if callable(writer) else None
-
-
 def _forward(
-    event: dict[str, Any], node: str, on_event: Callable[[dict[str, Any]], None] | None
+    event: dict[str, Any],
+    node: str,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    writer: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
-    """Hand one ReAct event to the node's callback and to the graph's stream.
+    """Hand one event to the node's callback and to the graph's stream.
 
-    The streamed copy is tagged with ``node``: LangGraph's custom chunks are
-    otherwise anonymous, and the consumer needs to know who produced them.
+    Both copies are tagged with ``node``: LangGraph's custom chunks are otherwise
+    anonymous, and the consumer needs to know who produced them.
     """
+    tagged = {**event, "node": node}
+    if on_event is not None:
+        try:
+            on_event(tagged)
+        except Exception:  # pragma: no cover - a broken callback must not kill the run
+            pass
+    write_event(writer, tagged)
+
+
+# -- planner (supervisor) ----------------------------------------------------
+class CallAgentInput(BaseModel):
+    """Arguments of the specialist handoff tools."""
+
+    instruction: str = Field(
+        description=(
+            "A self-contained instruction for the specialist: what to do, and what to "
+            "return. It cannot see this conversation."
+        )
+    )
+
+
+@dataclass
+class _HandoffState:
+    """State effects collected while the planner delegates to specialists."""
+
+    plan_summary: str | None = None
+    todos: list[TodoItem] | None = None
+    acceptance_criteria: list[str] | None = None
+    verification_commands: list[str] | None = None
+    research_notes: str = ""
+    sources: list[SourceItem] = field(default_factory=list)
+    code_agent_summary: str = ""
+    messages: list[BaseMessage] = field(default_factory=list)
+    handoffs: list[AgentHandoff] = field(default_factory=list)
+
+
+def _agent_state(state: Mapping[str, Any], collector: _HandoffState | None) -> dict[str, Any]:
+    """The state view handed to a specialist: the plan as it stands right now."""
+    view = dict(state)
+    if collector is None:
+        return view
+    if collector.todos is not None:
+        view["todos"] = [dict(todo) for todo in collector.todos]
+    if collector.plan_summary is not None:
+        view["plan_summary"] = collector.plan_summary
+    if collector.research_notes:
+        view["research_notes"] = collector.research_notes
+    if collector.code_agent_summary:
+        view["code_agent_summary"] = collector.code_agent_summary
+    return view
+
+
+def _agent_writer(
+    writer: Callable[[dict[str, Any]], None] | None,
+    agent: str,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> Callable[[dict[str, Any]], None]:
+    """Tag the specialist's own events with the agent that produced them."""
+
+    def emit(event: dict[str, Any]) -> None:
+        tagged = {**event, "node": agent}
+        if on_event is not None:
+            try:
+                on_event(tagged)
+            except Exception:  # pragma: no cover - a broken callback
+                pass
+        write_event(writer, tagged)
+
+    return emit
+
+
+def _note(
+    event: dict[str, Any],
+    writer: Callable[[dict[str, Any]], None] | None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    """Emit a node-level event (e.g. a handoff) to both sinks."""
     if on_event is not None:
         try:
             on_event(event)
-        except Exception:  # pragma: no cover - a broken callback must not kill the run
+        except Exception:  # pragma: no cover - a broken callback
             pass
-    writer = _stream_writer()
-    if writer is not None:
-        try:
-            writer({**event, "node": node})
-        except Exception:  # pragma: no cover - streaming is best effort
-            pass
+    write_event(writer, event)
 
 
-# -- planner -----------------------------------------------------------------
-def planner_node(state: WQGraphState, *, model: Any | None = None) -> dict[str, Any]:
-    """Create the plan, or revise it after the verifier failed.
+def _merge_notes(existing: str, summary: str, sources: Sequence[Mapping[str, Any]]) -> str:
+    """Append a research summary (with its source URLs) to the notes."""
+    parts = [existing.strip()] if existing.strip() else []
+    if summary.strip():
+        parts.append(summary.strip())
+    urls = [str(source.get("url") or "").strip() for source in sources]
+    urls = [url for url in urls if url]
+    if urls:
+        parts.append("Sources:\n" + "\n".join(f"- {url}" for url in urls))
+    return "\n\n".join(parts)
 
-    Returns the ``plan_summary``, ``todos``, ``acceptance_criteria`` and
-    ``verification_commands`` updates. When a plan already exists and nothing
-    failed, the current plan is returned unchanged (no model call).
+
+def _merge_sources(
+    existing: Sequence[Mapping[str, Any]], found: Sequence[Mapping[str, Any]]
+) -> list[SourceItem]:
+    """Merge source lists, de-duplicating by url."""
+    merged: list[SourceItem] = [dict(source) for source in existing if source.get("url")]
+    known = {str(source.get("url")) for source in merged}
+    for source in found:
+        url = str(source.get("url") or "").strip()
+        if not url or url in known:
+            continue
+        known.add(url)
+        merged.append(dict(source))
+    return merged
+
+
+def _call_search_agent_tool(
+    state: Mapping[str, Any],
+    writer: Callable[[dict[str, Any]], None] | None,
+    instruction: str,
+    *,
+    collector: _HandoffState | None = None,
+    model: Any | None = None,
+    tool: Any | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Delegate *instruction* to searchAgent and record the handoff.
+
+    *state* is the view the specialist sees (see :func:`_agent_state`); the state
+    effects are collected into *collector* so the planner node can return them as
+    its update. The agent's own result dict is returned unchanged.
+    """
+    # Imported here on purpose: `wqagent.tools.graph_tools` pulls in
+    # `wqagent.graph.state`, which executes this package's __init__, so a
+    # module-level import would close a cycle back into graph_tools.
+    from wqagent.agents.search_agent import run_search_agent
+
+    instruction = str(instruction or "").strip()
+    _note(
+        {
+            "type": "handoff",
+            "node": "planner",
+            "from": "planner",
+            "to": "searchAgent",
+            "instruction": instruction,
+        },
+        writer,
+        on_event,
+    )
+    result = run_search_agent(
+        state,
+        instruction,
+        writer=_agent_writer(writer, "searchAgent", on_event),
+        model=model,
+        tool=tool,
+    )
+    if collector is not None:
+        sources = list(result.get("sources") or [])
+        collector.handoffs.append(
+            AgentHandoff(
+                from_agent="planner",
+                to_agent="searchAgent",
+                instruction=instruction,
+                result=str(result.get("summary") or ""),
+            )
+        )
+        collector.research_notes = _merge_notes(
+            collector.research_notes or str(state.get("research_notes") or ""),
+            str(result.get("summary") or ""),
+            sources,
+        )
+        collector.sources = _merge_sources(collector.sources, sources)
+    return result
+
+
+def _call_code_agent_tool(
+    state: Mapping[str, Any],
+    writer: Callable[[dict[str, Any]], None] | None,
+    instruction: str,
+    *,
+    collector: _HandoffState | None = None,
+    model: Any | None = None,
+    tools: Sequence[Any] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Delegate *instruction* to codeAgent and record the handoff.
+
+    The specialist's todos, summary and transcript are collected into *collector*;
+    its own result dict is returned unchanged.
+    """
+    # Local import for the same reason as in _call_search_agent_tool.
+    from wqagent.agents.code_agent import run_code_agent
+
+    instruction = str(instruction or "").strip()
+    _note(
+        {
+            "type": "handoff",
+            "node": "planner",
+            "from": "planner",
+            "to": "codeAgent",
+            "instruction": instruction,
+        },
+        writer,
+        on_event,
+    )
+    result = run_code_agent(
+        state,
+        instruction,
+        writer=_agent_writer(writer, "codeAgent", on_event),
+        model=model,
+        tools=tools,
+    )
+    if collector is not None:
+        collector.handoffs.append(
+            AgentHandoff(
+                from_agent="planner",
+                to_agent="codeAgent",
+                instruction=instruction,
+                result=str(result.get("summary") or ""),
+            )
+        )
+        todos = result.get("todos")
+        if todos:
+            collector.todos = normalise_todos(todos)
+        summary = str(result.get("summary") or "").strip()
+        if summary:
+            collector.code_agent_summary = summary
+        collector.messages.extend(result.get("messages") or [])
+    return result
+
+
+def _specialist_report(agent: str, result: Mapping[str, Any]) -> str:
+    """The compact report the planner model sees as the tool result."""
+    payload: dict[str, Any] = {
+        "agent": agent,
+        "ok": bool(result.get("ok")),
+        "error": str(result.get("error") or ""),
+        "summary": str(result.get("summary") or ""),
+    }
+    if agent == "searchAgent":
+        payload["sources"] = [
+            str(source.get("url") or "") for source in (result.get("sources") or [])
+        ][:8]
+    else:
+        payload["todos"] = [
+            {"id": todo.get("id"), "status": todo.get("status")}
+            for todo in (result.get("todos") or [])
+        ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
+class CallSearchAgentTool:
+    """Planner tool: hand a research instruction to searchAgent."""
+
+    name: str = "call_search_agent"
+    description: str = (
+        "Delegate web/document research to the searchAgent specialist. Give it a "
+        "self-contained question; it returns a research summary and source URLs, which are "
+        "stored in the shared research notes."
+    )
+    args_schema: type[BaseModel] = CallAgentInput
+
+    def __init__(
+        self,
+        state: Mapping[str, Any],
+        *,
+        writer: Callable[[dict[str, Any]], None] | None = None,
+        collector: _HandoffState | None = None,
+        model: Any | None = None,
+        tool: Any | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._state = state
+        self._writer = writer
+        self._collector = collector
+        self._model = model
+        self._tool = tool
+        self._on_event = on_event
+
+    def run(self, instruction: str) -> str:
+        result = _call_search_agent_tool(
+            _agent_state(self._state, self._collector),
+            self._writer,
+            instruction,
+            collector=self._collector,
+            model=self._model,
+            tool=self._tool,
+            on_event=self._on_event,
+        )
+        return _specialist_report("searchAgent", result)
+
+    def as_tool(self) -> "StructuredTool":
+        """Wrap this implementation in a LangChain ``StructuredTool``."""
+        from langchain_core.tools import StructuredTool
+
+        return StructuredTool.from_function(
+            func=self.run,
+            name=self.name,
+            description=self.description,
+            args_schema=self.args_schema,
+        )
+
+
+class CallCodeAgentTool:
+    """Planner tool: hand an implementation instruction to codeAgent."""
+
+    name: str = "call_code_agent"
+    description: str = (
+        "Delegate file/code implementation to the codeAgent specialist. Give it a "
+        "self-contained instruction naming the files involved; it edits the workspace, keeps "
+        "the todo list up to date and returns a summary of what changed."
+    )
+    args_schema: type[BaseModel] = CallAgentInput
+
+    def __init__(
+        self,
+        state: Mapping[str, Any],
+        *,
+        writer: Callable[[dict[str, Any]], None] | None = None,
+        collector: _HandoffState | None = None,
+        model: Any | None = None,
+        tools: Sequence[Any] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._state = state
+        self._writer = writer
+        self._collector = collector
+        self._model = model
+        self._tools = tools
+        self._on_event = on_event
+
+    def run(self, instruction: str) -> str:
+        result = _call_code_agent_tool(
+            _agent_state(self._state, self._collector),
+            self._writer,
+            instruction,
+            collector=self._collector,
+            model=self._model,
+            tools=self._tools,
+            on_event=self._on_event,
+        )
+        return _specialist_report("codeAgent", result)
+
+    def as_tool(self) -> "StructuredTool":
+        """Wrap this implementation in a LangChain ``StructuredTool``."""
+        from langchain_core.tools import StructuredTool
+
+        return StructuredTool.from_function(
+            func=self.run,
+            name=self.name,
+            description=self.description,
+            args_schema=self.args_schema,
+        )
+
+
+def planner_node(
+    state: WQGraphState,
+    *,
+    model: Any | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    writer: Callable[[dict[str, Any]], None] | None = None,
+    max_loops: int = DEFAULT_PLANNER_LOOPS,
+    agent_model: Any | None = None,
+    code_tools: Sequence[Any] | None = None,
+    search_tool: Any | None = None,
+) -> dict[str, Any]:
+    """Supervise the round: plan, delegate to the specialists, summarise.
+
+    The planner cannot touch files or the web itself - it binds three tools
+    (``todo_write``, ``call_search_agent``, ``call_code_agent``) and calls them in
+    whatever order the task needs. Returns the plan, everything the specialists
+    produced (todos, research notes, sources, transcripts, handoff log) and the
+    supervisor summary in ``last_actor_summary``.
     """
     _runtime(state)  # fail fast if the graph state was not built properly
-    existing = _todos(state)
-    last_error = str(state.get("last_error") or "").strip()
-    if existing and not last_error:
-        return {
-            "plan_summary": str(state.get("plan_summary") or ""),
-            "todos": existing,
-            "acceptance_criteria": _text_list(state.get("acceptance_criteria")),
-            "verification_commands": _text_list(state.get("verification_commands")),
-        }
-
     chat = model if model is not None else get_model()
-    args = _request_structured(
-        chat,
-        TodoWriteTool(),
-        [
-            SystemMessage(content=PLANNER_PROMPT),
-            HumanMessage(content=_planner_instruction(state, existing, last_error)),
-        ],
-        keys="plan_summary, todos, acceptance_criteria, verification_commands",
+    # the specialists run on the planner's model unless one is pinned for them
+    specialist_model = agent_model if agent_model is not None else chat
+    collector = _HandoffState(
+        plan_summary=str(state.get("plan_summary") or ""),
+        todos=_todos(state),
+        acceptance_criteria=_text_list(state.get("acceptance_criteria")),
+        verification_commands=_text_list(state.get("verification_commands")),
+        research_notes=str(state.get("research_notes") or ""),
+        sources=[dict(source) for source in (state.get("sources") or [])],
+        code_agent_summary=str(state.get("code_agent_summary") or ""),
     )
+    tools: list[Any] = [
+        TodoWriteTool().as_tool(),
+        CallSearchAgentTool(
+            state,
+            writer=writer,
+            collector=collector,
+            model=specialist_model,
+            tool=search_tool,
+            on_event=on_event,
+        ).as_tool(),
+        CallCodeAgentTool(
+            state,
+            writer=writer,
+            collector=collector,
+            model=specialist_model,
+            tools=code_tools,
+            on_event=on_event,
+        ).as_tool(),
+    ]
 
+    messages: list[BaseMessage] = [
+        SystemMessage(content=PLANNER_PROMPT),
+        HumanMessage(content=_planner_instruction(state)),
+    ]
+
+    def on_react_event(kind: str, payload: dict[str, Any]) -> None:
+        if kind != "tool_call":
+            return
+        if str(payload.get("name") or "") != TodoWriteTool.name:
+            return
+        args = payload.get("args")
+        plan = args if isinstance(args, Mapping) else {}
+        summary = _text(plan.get("plan_summary"))
+        if summary:
+            collector.plan_summary = summary
+        todos = _coerce_todos(plan.get("todos"), fallback=collector.todos or ())
+        if todos:
+            collector.todos = todos
+        criteria = _text_list(plan.get("acceptance_criteria"))
+        if criteria:
+            collector.acceptance_criteria = criteria
+        commands = _text_list(plan.get("verification_commands"))
+        if commands:
+            collector.verification_commands = commands
+
+    final_event: dict[str, Any] = {}
+    for event in react_loop(
+        messages, model=chat, tools=tools, max_loops=max_loops, on_event=on_react_event
+    ):
+        if event.get("type") == "final_answer":
+            final_event = event
+        _forward(event, "planner", on_event, writer)
+
+    summary = (
+        last_ai_text(messages)
+        or str(final_event.get("content") or "").strip()
+        or str(state.get("last_actor_summary") or "")
+    )
     return {
-        "plan_summary": _text(args.get("plan_summary"))
-        or str(state.get("plan_summary") or ""),
-        "todos": _coerce_todos(args.get("todos"), fallback=existing),
-        "acceptance_criteria": _text_list(args.get("acceptance_criteria"))
-        or _text_list(state.get("acceptance_criteria")),
-        "verification_commands": _text_list(args.get("verification_commands"))
-        or _text_list(state.get("verification_commands")),
+        "plan_summary": collector.plan_summary or "",
+        "todos": collector.todos if collector.todos is not None else _todos(state),
+        "acceptance_criteria": collector.acceptance_criteria or [],
+        "verification_commands": collector.verification_commands or [],
+        "messages": collector.messages,
+        "last_actor_summary": summary,
+        "research_notes": collector.research_notes,
+        "sources": collector.sources,
+        "agent_handoffs": [
+            *[dict(handoff) for handoff in (state.get("agent_handoffs") or [])],
+            *collector.handoffs,
+        ],
+        "code_agent_summary": collector.code_agent_summary,
     }
 
 
-def _planner_instruction(
-    state: Mapping[str, Any], existing: Sequence[TodoItem], last_error: str
-) -> str:
+def _planner_instruction(state: Mapping[str, Any]) -> str:
+    """What the supervisor is told before it starts delegating."""
+    existing = _todos(state)
+    last_error = str(state.get("last_error") or "").strip()
     lines = [f"Task:\n{str(state.get('task') or '').strip()}"]
+    plan_summary = str(state.get("plan_summary") or "").strip()
+    if plan_summary:
+        lines.append(f"Approach so far:\n{plan_summary}")
     if existing:
-        lines.append(f"Current plan:\n{_render_todos(existing)}")
+        lines.append(f"Current plan:\n{render_todos(existing)}")
+    criteria = _text_list(state.get("acceptance_criteria"))
+    if criteria:
+        lines.append("Acceptance criteria:\n" + "\n".join(f"- {item}" for item in criteria))
+    commands = _text_list(state.get("verification_commands"))
+    if commands:
+        lines.append("Verification commands:\n" + "\n".join(f"- {command}" for command in commands))
+    notes = str(state.get("research_notes") or "").strip()
+    if notes:
+        lines.append(f"Research notes already collected:\n{notes}")
     if last_error:
         lines.append(
             "The last verification FAILED with:\n"
             f"{last_error}\n\n"
-            "Revise the plan so the next attempt fixes exactly this. Keep completed todos "
-            "completed and rewrite or add the todos that the fix requires."
+            "Revise the plan (todo_write) and delegate only the missing fix."
         )
     else:
-        criteria = _text_list(state.get("acceptance_criteria"))
-        commands = _text_list(state.get("verification_commands"))
-        if criteria:
-            lines.append("Acceptance criteria already recorded:\n" + "\n".join(f"- {c}" for c in criteria))
-        if commands:
-            lines.append("Verification commands already recorded:\n" + "\n".join(f"- {c}" for c in commands))
-        lines.append("Produce the plan for this task.")
+        lines.append("Publish the plan, delegate the work, then summarise.")
     return "\n\n".join(lines)
 
 
@@ -468,7 +877,7 @@ def actor_node(
         (event for event in reversed(events) if event.get("type") == "final_answer"), {}
     )
     summary = (
-        _last_ai_text(messages[first_new:])
+        last_ai_text(messages[first_new:])
         or str(final_event.get("content") or "").strip()
         or str(state.get("last_actor_summary") or "")
     )
@@ -480,15 +889,6 @@ def actor_node(
         "todos": todos,
         "last_actor_summary": summary,
     }
-
-
-def _last_ai_text(messages: Sequence[BaseMessage]) -> str:
-    for message in reversed(messages):
-        if isinstance(message, AIMessage):
-            text = message_text(message).strip()
-            if text:
-                return text
-    return ""
 
 
 def _actor_instruction(state: Mapping[str, Any]) -> str:
@@ -503,7 +903,7 @@ def _actor_instruction(state: Mapping[str, Any]) -> str:
     if todos:
         lines.append(
             "Plan (call the todo_update tool as you start and finish items):\n"
-            f"{_render_todos(todos)}"
+            f"{render_todos(todos)}"
         )
     criteria = _text_list(state.get("acceptance_criteria"))
     if criteria:
@@ -631,7 +1031,7 @@ def _verifier_instruction(
         lines.append(f"Plan summary:\n{plan_summary}")
     todos = _todos(state)
     if todos:
-        lines.append(f"Todos as the actor left them:\n{_render_todos(todos)}")
+        lines.append(f"Todos as the actor left them:\n{render_todos(todos)}")
     criteria = _text_list(state.get("acceptance_criteria"))
     if criteria:
         lines.append("Acceptance criteria:\n" + "\n".join(f"- {item}" for item in criteria))
@@ -657,11 +1057,19 @@ def _verifier_instruction(
         )
 
     summary = str(state.get("last_actor_summary") or "").strip()
-    if summary:
-        lines.append(f"The actor reports:\n{summary}")
+    implementer = str(state.get("code_agent_summary") or "").strip()
+    if implementer:
+        lines.append(f"The implementer (codeAgent) reports:\n{implementer}")
+    if summary and summary != implementer:
+        lines.append(f"The supervisor (planner) reports:\n{summary}")
+    notes = str(state.get("research_notes") or "").strip()
+    if notes:
+        lines.append(f"Research notes gathered for this task:\n{notes}")
     lines.append(
-        "Inspect the workspace with the read-only tools, then report with the "
-        "`verification_report` tool."
+        "Inspect the actual workspace with the read-only tools (do not trust the summaries "
+        "above), then return the JSON verdict - as a `verification_report` tool call, or as "
+        "plain JSON in your answer with the keys passed / reason / checks / "
+        "recommended_next_instruction."
     )
     return "\n\n".join(lines)
 
@@ -718,7 +1126,7 @@ def format_final_answer(state: Mapping[str, Any]) -> str:
     if todos:
         lines.append("**Plan:**")
         for todo in todos:
-            mark = _TODO_MARK.get(str(todo.get("status")), "[ ]")
+            mark = TODO_MARKS.get(str(todo.get("status")), TODO_MARKS["pending"])
             note = str(todo.get("note") or "")
             lines.append(
                 f"- {mark} {todo.get('id')}: {todo.get('content')}"
@@ -749,9 +1157,37 @@ def format_final_answer(state: Mapping[str, Any]) -> str:
             outcome = "ok" if result.get("ok") else "failed"
             lines.append(f"- `{result.get('command')}` -> exit code {result.get('exit_code')} ({outcome})")
 
-    actor_summary = str(state.get("last_actor_summary") or "").strip()
+    actor_summary = str(state.get("code_agent_summary") or "").strip() or str(
+        state.get("last_actor_summary") or ""
+    ).strip()
     if actor_summary:
-        lines.append(f"**What the actor reported:**\n{actor_summary}")
+        lines.append(f"**What the implementer reported:**\n{actor_summary}")
+
+    sources = [
+        source
+        for source in (state.get("sources") or [])
+        if isinstance(source, Mapping) and source.get("url")
+    ]
+    if sources:
+        lines.append("**Sources:**")
+        for source in sources[:10]:
+            title = str(source.get("title") or "").strip()
+            lines.append(
+                f"- {title}: {source.get('url')}" if title else f"- {source.get('url')}"
+            )
+
+    handoffs = [
+        handoff
+        for handoff in (state.get("agent_handoffs") or [])
+        if isinstance(handoff, Mapping)
+    ]
+    if handoffs:
+        lines.append("**Delegations:**")
+        for handoff in handoffs:
+            lines.append(
+                f"- {handoff.get('from_agent')} -> {handoff.get('to_agent')}: "
+                f"{handoff.get('instruction')}"
+            )
 
     last_error = str(state.get("last_error") or "").strip()
     if not passed and last_error:

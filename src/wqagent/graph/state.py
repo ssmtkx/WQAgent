@@ -15,13 +15,14 @@ Shape of the workflow this schema is meant for::
 
     plan    -> plan_summary, todos, acceptance_criteria, verification_commands
     act     -> messages (via add_messages), todos updates
-    verify  -> verification_results, passed
+    search  -> research_notes (via agents.search_agent.run_search_agent)
+    verify  -> verification_results, verification_checks, passed
     decide  -> attempts < max_attempts ? back to act : final_answer
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Mapping, Sequence, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
@@ -29,7 +30,10 @@ from langgraph.graph.message import add_messages
 from wqagent.core.state import RuntimeState
 
 __all__ = [
+    "AgentHandoff",
     "DEFAULT_MAX_ATTEMPTS",
+    "SourceItem",
+    "TODO_MARKS",
     "TODO_STATUSES",
     "TodoItem",
     "VerificationCheck",
@@ -37,11 +41,21 @@ __all__ = [
     "WQGraphState",
     "make_todo",
     "new_graph_state",
+    "normalise_todos",
+    "render_todos",
     "todo_progress",
 ]
 
 #: Allowed values for :attr:`TodoItem.status`.
 TODO_STATUSES: tuple[str, ...] = ("pending", "in_progress", "completed", "blocked")
+
+#: Checkbox marks used when rendering a todo list into a prompt.
+TODO_MARKS: dict[str, str] = {
+    "pending": "[ ]",
+    "in_progress": "[~]",
+    "completed": "[x]",
+    "blocked": "[!]",
+}
 
 #: Default retry budget of the act/verify loop.
 DEFAULT_MAX_ATTEMPTS = 3
@@ -74,6 +88,24 @@ class VerificationCheck(TypedDict):
     detail: str
 
 
+class SourceItem(TypedDict, total=False):
+    """One web source kept from a searchAgent handoff."""
+
+    title: str
+    url: str
+    content: str
+    score: float
+
+
+class AgentHandoff(TypedDict, total=False):
+    """One delegation from the planner/supervisor to a specialist agent."""
+
+    from_agent: str
+    to_agent: str
+    instruction: str
+    result: str
+
+
 class WQGraphState(TypedDict, total=False):
     """Shared state of the WQ Agent graph; every key is optional.
 
@@ -89,10 +121,15 @@ class WQGraphState(TypedDict, total=False):
         verification_results: What those commands actually returned.
         verification_checks: The verifier's per-criterion verdicts.
         passed: Whether verification succeeded.
-        attempts: How many act/verify rounds have run so far.
+        attempts: How many planner/verify rounds have run so far.
         max_attempts: Budget for those rounds.
-        last_actor_summary: What the actor reported at the end of its last turn.
+        last_actor_summary: The last supervisor summary for this round (the actor's
+            report in the pre-stage-3 workflow).
         last_error: Why the last verification failed (empty once it passes).
+        research_notes: External findings gathered by searchAgent.
+        sources: The web sources those findings came from.
+        agent_handoffs: Every delegation the planner made, in order.
+        code_agent_summary: What codeAgent reported after implementing.
         final_answer: The answer reported back to the user.
     """
 
@@ -110,6 +147,10 @@ class WQGraphState(TypedDict, total=False):
     max_attempts: int
     last_actor_summary: str
     last_error: str
+    research_notes: str
+    sources: list[SourceItem]
+    agent_handoffs: list[AgentHandoff]
+    code_agent_summary: str
     final_answer: str
 
 
@@ -135,6 +176,45 @@ def todo_progress(todos: list[TodoItem]) -> str:
     blocked = sum(1 for todo in todos if todo.get("status") == "blocked")
     summary = f"{done}/{total} todos completed"
     return f"{summary} ({blocked} blocked)" if blocked else summary
+
+
+def normalise_todos(value: Any) -> list[TodoItem]:
+    """Coerce anything list-like of mappings into valid :class:`TodoItem` dicts.
+
+    A single object becomes a one-item list; scalars and junk are skipped, so a
+    hand-written or model-produced value can be used without raising.
+    """
+    if isinstance(value, Mapping):
+        items: list[Any] = [value]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = []
+    todos: list[TodoItem] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        todos.append(
+            TodoItem(
+                id=str(item.get("id", "")),
+                content=str(item.get("content", "")),
+                status=str(item.get("status", "pending")),
+                note=str(item.get("note", "")),
+            )
+        )
+    return todos
+
+
+def render_todos(todos: Sequence[Mapping[str, Any]]) -> str:
+    """Render a todo list as ``[x] t1: content  (note)`` lines."""
+    lines: list[str] = []
+    for todo in todos or []:
+        mark = TODO_MARKS.get(str(todo.get("status")), TODO_MARKS["pending"])
+        note = str(todo.get("note") or "")
+        lines.append(
+            f"{mark} {todo.get('id')}: {todo.get('content')}" + (f"  ({note})" if note else "")
+        )
+    return "\n".join(lines) or "(no todos)"
 
 
 def new_graph_state(
@@ -173,6 +253,10 @@ def new_graph_state(
         "max_attempts": max(1, int(max_attempts)),
         "last_actor_summary": "",
         "last_error": "",
+        "research_notes": "",
+        "sources": [],
+        "agent_handoffs": [],
+        "code_agent_summary": "",
         "final_answer": "",
     }
     state.update(extra)

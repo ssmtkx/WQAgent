@@ -33,14 +33,14 @@ class ScriptedModel:
         return self.responses.pop(0)
 
 
-def _tool_call(name: str, args: dict[str, Any]) -> AIMessage:
+def _tool_call(name: str, args: dict[str, Any], call_id: str = "c1") -> AIMessage:
     return AIMessage(
-        content="", tool_calls=[{"name": name, "args": args, "id": "call_1", "type": "tool_call"}]
+        content="", tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}]
     )
 
 
 def _passing_script(file_path: str = "hello.py", content: str = "print('hi')\n") -> list[Any]:
-    """The six responses a passing planner -> actor -> verifier -> final run needs."""
+    """The eight responses a passing planner -> codeAgent -> verifier -> final run needs."""
     return [
         _tool_call(
             "todo_write",
@@ -51,8 +51,10 @@ def _passing_script(file_path: str = "hello.py", content: str = "print('hi')\n")
                 "verification_commands": ["echo ok"],
             },
         ),
-        _tool_call("file_write", {"file_path": file_path, "content": content}),
+        _tool_call("call_code_agent", {"instruction": f"write {file_path}"}, "c2"),
+        _tool_call("file_write", {"file_path": file_path, "content": content}, "c3"),
         AIMessage(content=f"Created {file_path}."),
+        AIMessage(content="Delegated the implementation."),
         AIMessage(content="Inspected the file."),
         _tool_call(
             "verification_report",
@@ -193,10 +195,49 @@ def test_run_end_to_end_with_a_scripted_model(tmp_path: Path, monkeypatch: Any) 
     assert (workspace / "hello.py").read_text(encoding="utf-8") == "print('hi')\n"
     output = _flat(result.output)
     assert "Done: created hello.py and verified it." in output
-    # every node reported itself
-    for marker in ("📋 Planner", "🔧 Actor", "✅ Verifier", "📝 Final"):
+    # every node and the delegated specialist reported itself (labels fall back to
+    # ASCII when the captured stream cannot encode the emoji)
+    for marker in ("Planner", "codeAgent", "Verifier", "Final"):
         assert marker in output, marker
     assert "verdict" in output and "passed" in output
+
+
+def test_renderer_prints_the_handoff_and_specialist_headers(monkeypatch: Any) -> None:
+    """The handoff line and the specialist header, rendered into a clean stream."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    stream = StringIO()
+    monkeypatch.setattr(
+        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
+    )
+    monkeypatch.setattr(cli_module, "_can_encode", lambda text: True)  # emoji path
+    renderer = cli_module._NodeRenderer(verbose=False)
+
+    renderer.render(
+        {"type": "handoff", "node": "planner", "from": "planner", "to": "codeAgent",
+         "instruction": "write hello.py"}
+    )
+    renderer.render(
+        {"type": "tool_call", "node": "codeAgent", "name": "file_write",
+         "args": {"file_path": "hello.py", "content": "print('hi')\n"}}
+    )
+    renderer.render(
+        {"type": "node_end", "node": "planner",
+         "update": {"plan_summary": "write it", "todos": [{"id": "t1", "content": "write it"}],
+                    "verification_commands": ["echo ok"],
+                    "agent_handoffs": [{"to_agent": "codeAgent", "instruction": "write hello.py"}],
+                    "last_actor_summary": "Delegated the implementation."}}
+    )
+
+    text = stream.getvalue()
+    assert "↪ planner → 🛠 codeAgent" in text
+    assert "   write hello.py" in text
+    assert "🛠 codeAgent" in text  # the specialist introduced itself on its first event
+    assert "📋 Planner" in text
+    assert "-> file_write hello.py" in text
+    assert "$ echo ok" in text
 
 
 def test_default_workspace_is_created(tmp_path: Path, monkeypatch: Any) -> None:
@@ -235,7 +276,9 @@ def test_failed_verification_exits_with_an_error(tmp_path: Path, monkeypatch: An
                     "verification_commands": ["exit 1"],
                 },
             ),
+            _tool_call("call_code_agent", {"instruction": "do the thing"}, "c2"),
             AIMessage(content="Tried the thing."),
+            AIMessage(content="Delegated it."),
             AIMessage(content="It still fails."),
             _tool_call(
                 "verification_report",
@@ -258,11 +301,11 @@ def test_failed_verification_exits_with_an_error(tmp_path: Path, monkeypatch: An
     output = _flat(result.output)
     # the answer goes through the Markdown renderer, so inline-code backticks are gone
     assert "Not done: exit 1 still fails." in output
-    assert "❌ Verifier" in output
+    assert "Verifier (failed)" in output or "❌ Verifier" in output
     assert "failed" in output  # the verdict row
 
 
-def test_actor_step_limit_is_reported(tmp_path: Path, monkeypatch: Any) -> None:
+def test_planner_step_limit_is_reported(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
     script: list[Any] = [
         _tool_call(
@@ -273,9 +316,10 @@ def test_actor_step_limit_is_reported(tmp_path: Path, monkeypatch: Any) -> None:
                 "acceptance_criteria": ["never"],
                 "verification_commands": ["echo ok"],
             },
+            f"c{i}",
         )
+        for i in range(3)
     ]
-    script.extend(_tool_call("file_read", {"file_path": "missing.txt"}) for _ in range(3))
     script.extend(
         [
             AIMessage(content="Inspected."),

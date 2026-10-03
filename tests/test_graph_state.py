@@ -37,6 +37,10 @@ EXPECTED_KEYS = {
     "max_attempts",
     "last_actor_summary",
     "last_error",
+    "research_notes",
+    "sources",
+    "agent_handoffs",
+    "code_agent_summary",
     "final_answer",
 }
 

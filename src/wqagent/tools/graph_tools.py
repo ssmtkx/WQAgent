@@ -77,11 +77,14 @@ class TodoWriteTool:
         acceptance_criteria: list[str] | None = None,
         verification_commands: list[str] | None = None,
     ) -> str:
-        statuses = ", ".join(f"{todo.get('id')}={todo.get('status', 'pending')}" for todo in todos)
+        items = [_as_dict(todo) for todo in _as_items(todos)]
+        statuses = ", ".join(
+            f"{todo.get('id')}={todo.get('status', 'pending')}" for todo in items
+        )
         return (
-            f"Plan recorded: {len(todos)} todos ({statuses}); "
-            f"{len(acceptance_criteria or [])} acceptance criteria; "
-            f"{len(verification_commands or [])} verification commands."
+            f"Plan recorded: {len(items)} todos ({statuses}); "
+            f"{len(_as_items(acceptance_criteria))} acceptance criteria; "
+            f"{len(_as_items(verification_commands))} verification commands."
         )
 
     def as_tool(self) -> "StructuredTool":
@@ -123,6 +126,27 @@ def _as_items(raw: Any) -> list[Any]:
         return []
 
 
+def _as_dict(item: Any) -> dict[str, Any]:
+    """Normalise one tool argument item.
+
+    LangChain hands the *validated pydantic models* to the tool body (not the raw
+    dicts), so nested items arrive as ``TodoWriteItem``/``TodoUpdateItem``
+    instances; both those and plain mappings must work.
+    """
+    if isinstance(item, Mapping):
+        return dict(item)
+    dump = getattr(item, "model_dump", None)
+    if callable(dump):
+        try:
+            return dict(dump())
+        except Exception:  # noqa: BLE001 - fall through to the generic path
+            pass
+    try:
+        return dict(item)
+    except (TypeError, ValueError):
+        return {}
+
+
 def parse_todo_updates(
     raw: Iterable[Mapping[str, Any]] | None,
 ) -> tuple[list[TodoUpdateItem], list[str]]:
@@ -135,7 +159,7 @@ def parse_todo_updates(
     problems: list[str] = []
     for index, item in enumerate(_as_items(raw)):
         try:
-            update = TodoUpdateItem(**dict(item))
+            update = TodoUpdateItem(**_as_dict(item))
         except Exception as exc:  # noqa: BLE001 - report, do not raise at the node boundary
             problems.append(f"update #{index}: {exc}")
             continue

@@ -21,7 +21,7 @@ from wqagent.graph.nodes import (
 )
 from wqagent.graph.state import make_todo, new_graph_state
 from wqagent.prompts.stage1 import ACTOR_PROMPT
-from wqagent.prompts.stage2 import PLANNER_PROMPT, VERIFIER_PROMPT
+from wqagent.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
 
 
 class ScriptedModel:
@@ -43,21 +43,6 @@ class ScriptedModel:
         return self.responses.pop(0)
 
 
-class JsonModel:
-    """Always answers with plain JSON content (no tool calls)."""
-
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
-        self.seen: list[list[Any]] = []
-
-    def bind_tools(self, tools: list[Any], **kwargs: Any) -> "JsonModel":
-        return self
-
-    def invoke(self, messages: list[Any]) -> Any:
-        self.seen.append(list(messages))
-        return AIMessage(content=json.dumps(self.payload))
-
-
 def _tool_call(name: str, args: dict[str, Any], call_id: str = "c1") -> AIMessage:
     return AIMessage(
         content="", tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}]
@@ -76,7 +61,7 @@ def _reset_module_model():
     set_model(None)
 
 
-# -- planner -----------------------------------------------------------------
+# -- planner (supervisor) ----------------------------------------------------
 def test_planner_creates_the_plan(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
@@ -91,7 +76,8 @@ def test_planner_creates_the_plan(tmp_path: Path) -> None:
                     "acceptance_criteria": ["hello.py prints Hello"],
                     "verification_commands": ["python hello.py"],
                 },
-            )
+            ),
+            AIMessage(content="Planned two steps; nothing to delegate yet."),
         ]
     )
 
@@ -103,10 +89,13 @@ def test_planner_creates_the_plan(tmp_path: Path) -> None:
     assert update["todos"][1]["note"] == "python hello.py"
     assert update["acceptance_criteria"] == ["hello.py prints Hello"]
     assert update["verification_commands"] == ["python hello.py"]
+    assert update["last_actor_summary"] == "Planned two steps; nothing to delegate yet."
+    assert update["agent_handoffs"] == []
 
-    tools_bound, tool_choice = model.bound[0]
-    assert tools_bound == ["todo_write"]
-    assert tool_choice == "todo_write"  # forced structured output
+    # the supervisor binds its three tools - no forced tool_choice any more
+    names, tool_choice = model.bound[0]
+    assert names == ["todo_write", "call_search_agent", "call_code_agent"]
+    assert tool_choice is None
     sent = model.seen[0]
     assert sent[0].content == PLANNER_PROMPT
     assert "write hello.py" in sent[1].content
@@ -132,7 +121,8 @@ def test_planner_revises_the_plan_after_a_failure(tmp_path: Path) -> None:
                     "acceptance_criteria": ["hello.py prints Hello"],
                     "verification_commands": ["python hello.py"],
                 },
-            )
+            ),
+            AIMessage(content="Revised the plan and delegated the fix."),
         ]
     )
 
@@ -142,43 +132,112 @@ def test_planner_revises_the_plan_after_a_failure(tmp_path: Path) -> None:
     assert "FAILED" in prompt
     assert "exit code 1" in prompt and "NameError" in prompt
     assert "[x] t1" in prompt  # the completed todo is shown as completed
+    assert "delegate only the missing fix" in prompt
     assert [todo["id"] for todo in update["todos"]] == ["t1", "t2", "t3"]
     assert update["todos"][0]["status"] == "completed"
 
 
-def test_planner_keeps_an_existing_plan_without_calling_the_model(tmp_path: Path) -> None:
+def test_planner_delegates_research_then_implementation(tmp_path: Path) -> None:
+    """The supervisor handoff: searchAgent first, codeAgent second."""
+    from wqagent.tools.web_search_tool import WebSearchTool
+
+    class FakeSearchTool(WebSearchTool):
+        def __init__(self) -> None:
+            super().__init__(api_key="fake")
+            self.queries: list[str] = []
+
+        def search(self, query: str, **kwargs: Any) -> dict[str, Any]:
+            self.queries.append(query)
+            return {
+                "ok": True,
+                "query": query,
+                "answer": "FastAPI 0.115 is current.",
+                "results": [
+                    {
+                        "title": "FastAPI",
+                        "url": "https://fastapi.tiangolo.com/",
+                        "content": "docs",
+                        "score": 0.9,
+                    }
+                ],
+                "error": "",
+            }
+
+    search_tool = FakeSearchTool()
+    model = ScriptedModel(
+        [
+            _tool_call(
+                "todo_write",
+                {
+                    "plan_summary": "research then build",
+                    "todos": [{"id": "t1", "content": "pin fastapi"}],
+                },
+            ),
+            _tool_call("call_search_agent", {"instruction": "which fastapi version?"}, "c2"),
+            # the search agent runs on the same model
+            _tool_call("web_search", {"query": "which fastapi version?"}, "s1"),
+            AIMessage(content="FastAPI 0.115 is current."),
+            _tool_call("call_code_agent", {"instruction": "pin fastapi==0.115"}, "c3"),
+            _tool_call("file_write", {"file_path": "requirements.txt", "content": "fastapi==0.115\n"}),
+            AIMessage(content="Wrote requirements.txt."),
+            AIMessage(content="Researched the version and pinned it."),
+        ]
+    )
+    events: list[dict[str, Any]] = []
+
+    update = planner_node(
+        _state(tmp_path), model=model, agent_model=model, search_tool=search_tool,
+        on_event=events.append,
+    )
+
+    assert search_tool.queries == ["which fastapi version?"]
+    assert (tmp_path / "ws" / "requirements.txt").read_text(encoding="utf-8") == "fastapi==0.115\n"
+
+    # research effects landed in the state update
+    assert "FastAPI 0.115 is current." in update["research_notes"]
+    assert "https://fastapi.tiangolo.com/" in update["research_notes"]
+    assert [source["url"] for source in update["sources"]] == ["https://fastapi.tiangolo.com/"]
+
+    # both handoffs were logged, with their instructions and results
+    assert [(h["from_agent"], h["to_agent"]) for h in update["agent_handoffs"]] == [
+        ("planner", "searchAgent"),
+        ("planner", "codeAgent"),
+    ]
+    assert update["agent_handoffs"][0]["instruction"] == "which fastapi version?"
+    assert update["agent_handoffs"][1]["result"] == "Wrote requirements.txt."
+
+    # the implementer's summary and transcript are kept
+    assert update["code_agent_summary"] == "Wrote requirements.txt."
+    assert update["todos"][0]["status"] == "pending"  # nobody updated the todos
+    assert update["messages"]  # codeAgent's transcript
+
+    # the handoff events were streamed, tagged with the specialist that ran
+    kinds = [(event["type"], event.get("node")) for event in events]
+    assert ("handoff", "planner") in kinds
+    assert ("tool_call", "searchAgent") in kinds
+    assert ("tool_call", "codeAgent") in kinds
+    handoffs = [event for event in events if event["type"] == "handoff"]
+    assert handoffs[0]["to"] == "searchAgent"
+    assert handoffs[1]["to"] == "codeAgent"
+    assert handoffs[1]["instruction"] == "pin fastapi==0.115"
+
+
+def test_planner_appends_to_the_existing_handoff_log(tmp_path: Path) -> None:
     state = _state(
         tmp_path,
-        plan_summary="already planned",
-        todos=[make_todo("t1", "do it")],
-        acceptance_criteria=["it works"],
-        verification_commands=["echo ok"],
+        agent_handoffs=[{"from_agent": "planner", "to_agent": "searchAgent", "instruction": "old"}],
     )
-    model = ScriptedModel([])  # would raise if invoked
-
-    update = planner_node(state, model=model)
-
-    assert update["plan_summary"] == "already planned"
-    assert update["todos"][0]["id"] == "t1"
-    assert update["acceptance_criteria"] == ["it works"]
-    assert model.seen == [] and model.bound == []
-
-
-def test_planner_falls_back_to_json_content(tmp_path: Path) -> None:
-    model = JsonModel(
-        {
-            "plan_summary": "json plan",
-            "todos": [{"id": "t1", "content": "do it"}],
-            "acceptance_criteria": ["ok"],
-            "verification_commands": ["echo ok"],
-        }
+    model = ScriptedModel(
+        [
+            _tool_call("call_code_agent", {"instruction": "do it"}, "c1"),
+            AIMessage(content="codeAgent did it."),
+            AIMessage(content="done"),
+        ]
     )
 
-    update = planner_node(_state(tmp_path), model=model)
+    update = planner_node(state, model=model, agent_model=model)
 
-    assert update["plan_summary"] == "json plan"
-    assert update["todos"][0]["content"] == "do it"
-    assert update["verification_commands"] == ["echo ok"]
+    assert [h["instruction"] for h in update["agent_handoffs"]] == ["old", "do it"]
 
 
 def test_planner_keeps_the_previous_todos_when_the_model_answers_nothing(
@@ -332,6 +391,37 @@ def test_verifier_passes_and_marks_the_plan_completed(tmp_path: Path) -> None:
     assert "exit_code=0" in model.seen[0][1].content
 
 
+def test_verifier_survives_a_tool_its_prompt_names_but_it_does_not_have(
+    tmp_path: Path,
+) -> None:
+    """The prompt mentions NotepadReadTool / web_search; a call must only degrade."""
+    state = _state(tmp_path, todos=[make_todo("t1", "do it")], verification_commands=["echo ok"])
+    model = ScriptedModel(
+        [
+            _tool_call("NotepadReadTool", {}, "v1"),
+            _tool_call("web_search", {"query": "anything"}, "v2"),
+            AIMessage(content="no notepad and no web tool here; judging from the files"),
+            _tool_call(
+                "verification_report",
+                {
+                    "passed": True,
+                    "reason": "the file is there and the command succeeded",
+                    "checks": [{"name": "it works", "passed": True, "detail": "exit 0"}],
+                    "recommended_next_instruction": "",
+                },
+            ),
+        ]
+    )
+
+    update = verifier_node(state, model=model)
+
+    # unknown tools are fed back as errors, the verdict still lands
+    assert update["passed"] is True
+    assert model.seen[1][-1].type == "tool"  # the NotepadReadTool failure came back
+    assert "unknown tool" in model.seen[1][-1].content
+    assert "unknown tool" in model.seen[2][-1].content  # ...and the web_search one
+
+
 def test_verifier_overrules_a_pass_when_a_command_fails(tmp_path: Path) -> None:
     state = _state(tmp_path, todos=[make_todo("t1", "do it")], verification_commands=["exit 3"])
     model = ScriptedModel(
@@ -444,7 +534,7 @@ def test_get_model_is_lazy_and_cached(tmp_path: Path, monkeypatch: Any) -> None:
 
 # -- the whole loop, wired into a real graph ---------------------------------
 def test_graph_retries_after_a_failed_verification(tmp_path: Path) -> None:
-    """planner -> actor -> verifier (fails) -> planner -> actor -> verifier (passes) -> END."""
+    """planner -> verifier (fails) -> planner -> verifier (passes) -> END."""
     from langgraph.graph import END, START, StateGraph
 
     from wqagent.graph import WQGraphState
@@ -453,7 +543,7 @@ def test_graph_retries_after_a_failed_verification(tmp_path: Path) -> None:
     runtime = RuntimeState(workspace=workspace)
     model = ScriptedModel(
         [
-            # attempt 1: plan whose verification command fails
+            # attempt 1: plan + delegate, with a verification command that fails
             _tool_call(
                 "todo_write",
                 {
@@ -463,8 +553,10 @@ def test_graph_retries_after_a_failed_verification(tmp_path: Path) -> None:
                     "verification_commands": ["exit 1"],
                 },
             ),
+            _tool_call("call_code_agent", {"instruction": "write hello.py"}, "c2"),
             _tool_call("file_write", {"file_path": "hello.py", "content": "print('Hello')\n"}),
             AIMessage(content="Wrote hello.py."),
+            AIMessage(content="Delegated the implementation."),
             AIMessage(content="Inspected the file, it looks right."),
             _tool_call(
                 "verification_report",
@@ -477,7 +569,7 @@ def test_graph_retries_after_a_failed_verification(tmp_path: Path) -> None:
                     "recommended_next_instruction": "re-run the program and make it exit 0",
                 },
             ),
-            # attempt 2: revised plan with a command that passes
+            # attempt 2: revised plan (a command that passes) and the missing fix
             _tool_call(
                 "todo_write",
                 {
@@ -487,7 +579,9 @@ def test_graph_retries_after_a_failed_verification(tmp_path: Path) -> None:
                     "verification_commands": ["echo ok"],
                 },
             ),
+            _tool_call("call_code_agent", {"instruction": "make it exit 0"}, "c3"),
             AIMessage(content="Re-ran the program, it works."),
+            AIMessage(content="Delegated the fix."),
             AIMessage(content="Verified the file and the command output."),
             _tool_call(
                 "verification_report",
@@ -504,11 +598,9 @@ def test_graph_retries_after_a_failed_verification(tmp_path: Path) -> None:
 
     graph = StateGraph(WQGraphState)
     graph.add_node("planner", planner_node)
-    graph.add_node("actor", actor_node)
     graph.add_node("verifier", verifier_node)
     graph.add_edge(START, "planner")
-    graph.add_edge("planner", "actor")
-    graph.add_edge("actor", "verifier")
+    graph.add_edge("planner", "verifier")
     graph.add_conditional_edges(
         "verifier", verifier_route, {"planner": "planner", "final": END}
     )
@@ -523,17 +615,16 @@ def test_graph_retries_after_a_failed_verification(tmp_path: Path) -> None:
     assert [check["ok"] for check in result["verification_results"]] == [True]
     assert result["verification_results"][0]["command"] == "echo ok"
     assert (workspace / "hello.py").read_text(encoding="utf-8") == "print('Hello')\n"
-    # both attempts landed in the transcript, merged by add_messages
-    assert [message.type for message in result["messages"]] == [
-        "human",
-        "ai",
-        "tool",
-        "ai",
-        "human",
-        "ai",
+    # every delegation is in the handoff log, both rounds included
+    assert [handoff["to_agent"] for handoff in result["agent_handoffs"]] == [
+        "codeAgent",
+        "codeAgent",
     ]
-    # exactly the nine model calls the two attempts need - no extras
-    assert len(model.seen) == 9
+    # the specialists' transcripts landed in the graph transcript
+    assert any(message.type == "tool" for message in result["messages"])
+    assert result["code_agent_summary"] == "Re-ran the program, it works."
+    # exactly the thirteen model calls the two rounds need - no extras
+    assert len(model.seen) == 13
     assert model.responses == []
 
 
@@ -545,7 +636,7 @@ def test_graph_gives_up_after_max_attempts(tmp_path: Path) -> None:
 
     runtime = RuntimeState(workspace=tmp_path / "ws")
     responses: list[Any] = []
-    for attempt in range(2):  # max_attempts=2 -> two planning rounds
+    for attempt in range(2):  # max_attempts=2 -> two planner rounds
         responses.extend(
             [
                 _tool_call(
@@ -557,7 +648,7 @@ def test_graph_gives_up_after_max_attempts(tmp_path: Path) -> None:
                         "verification_commands": ["exit 1"],
                     },
                 ),
-                AIMessage(content=f"actor attempt {attempt + 1}"),
+                AIMessage(content=f"planner round {attempt + 1}"),
                 AIMessage(content="inspected"),
                 _tool_call(
                     "verification_report",
@@ -575,11 +666,9 @@ def test_graph_gives_up_after_max_attempts(tmp_path: Path) -> None:
 
     graph = StateGraph(WQGraphState)
     graph.add_node("planner", planner_node)
-    graph.add_node("actor", actor_node)
     graph.add_node("verifier", verifier_node)
     graph.add_edge(START, "planner")
-    graph.add_edge("planner", "actor")
-    graph.add_edge("actor", "verifier")
+    graph.add_edge("planner", "verifier")
     graph.add_conditional_edges(
         "verifier", verifier_route, {"planner": "planner", "final": END}
     )

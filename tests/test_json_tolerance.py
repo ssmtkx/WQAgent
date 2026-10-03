@@ -16,6 +16,8 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage
 
+from helpers import ScriptedModel, tool_call
+
 from wqagent.core.state import RuntimeState
 from wqagent.graph.nodes import (
     _as_items,
@@ -328,91 +330,156 @@ def test_request_structured_returns_empty_when_everything_fails() -> None:
 
 
 # -- planner end to end ------------------------------------------------------
-RECOVERABLE_PLANS = [
-    ("fenced", "```json\n" + json.dumps(PLAN) + "\n```"),
-    ("prose", "Here is the plan:\n" + json.dumps(PLAN) + "\nLet me know!"),
-    ("array-wrapped", json.dumps([PLAN])),
-    ("duplicated-object", json.dumps(PLAN) + "\n" + json.dumps(PLAN)),
-]
-
-
-@pytest.mark.parametrize("name, content", RECOVERABLE_PLANS, ids=[n for n, _ in RECOVERABLE_PLANS])
-def test_planner_parses_messy_but_valid_output(
-    name: str, content: str, revision_state: Any
-) -> None:
-    update = planner_node(revision_state, model=ContentModel(content))
-
-    assert update["plan_summary"] == PLAN["plan_summary"]
-    assert [todo["id"] for todo in update["todos"]] == ["t1", "t2"]
-    assert update["todos"][1]["note"] == "python hello.py"
-    assert update["acceptance_criteria"] == ["prints Hello"]
-    assert update["verification_commands"] == ["python hello.py"]
-
-
-BROKEN_PLANS = [
+# The supervisor planner reads its plan from `todo_write` *tool calls*, so a model
+# that answers with prose/JSON content cannot corrupt the plan - the previous one
+# is kept. Tolerance now lives in the tool-argument path.
+JUNK_CONTENT = [
     ("empty", ""),
     ("prose-only", "I am not sure what the plan should be."),
+    ("fenced-json", "```json\n" + json.dumps(PLAN) + "\n```"),
     ("truncated", '{"plan_summary": "half", "todos": [{"id": "t1", "cont'),
     ("trailing-comma", '{"plan_summary": "x", "todos": [{"id": "t1", "content": "c",}],}'),
     ("single-quotes", "{'plan_summary': 'x', 'todos': []}"),
     ("json-null", "null"),
-    ("wrong-types", '{"plan_summary": 42, "todos": "not a list", "acceptance_criteria": 7, "verification_commands": true}'),
+    ("wrong-types", '{"plan_summary": 42, "todos": "not a list"}'),
     ("deep-garbage", '{"todos": {"nested": {"weird": [1, {"x": null}]}}}'),
+    ("array-wrapped", json.dumps([PLAN])),
 ]
 
+PLANNER_KEYS = {
+    "plan_summary",
+    "todos",
+    "acceptance_criteria",
+    "verification_commands",
+    "messages",
+    "last_actor_summary",
+    "research_notes",
+    "sources",
+    "agent_handoffs",
+    "code_agent_summary",
+}
 
-@pytest.mark.parametrize("name, content", BROKEN_PLANS, ids=[n for n, _ in BROKEN_PLANS])
-def test_planner_survives_broken_output(name: str, content: str, revision_state: Any) -> None:
+
+@pytest.mark.parametrize("name, content", JUNK_CONTENT, ids=[n for n, _ in JUNK_CONTENT])
+def test_planner_keeps_the_previous_plan_when_no_tool_is_called(
+    name: str, content: str, revision_state: Any
+) -> None:
     update = planner_node(revision_state, model=ContentModel(content))
 
     # the node always returns a complete, usable update ...
-    assert set(update) == {
-        "plan_summary",
-        "todos",
-        "acceptance_criteria",
-        "verification_commands",
-    }
+    assert PLANNER_KEYS <= set(update)
     assert isinstance(update["plan_summary"], str)
     assert isinstance(update["acceptance_criteria"], list)
     assert isinstance(update["verification_commands"], list)
-    # ... with valid todos: the previous plan is kept when nothing parses
+    # ... and the plan survives untouched
     assert [todo["id"] for todo in update["todos"]] == ["t0"]
     assert all(todo["status"] in TODO_STATUSES for todo in update["todos"])
+    assert update["agent_handoffs"] == []
 
 
-def test_planner_uses_partial_output(revision_state: Any) -> None:
+GARBAGE_PLAN_ARGS: list[tuple[str, Any]] = [
+    ("missing-todos", {"plan_summary": "only a summary"}),
+    ("todos-not-a-list", {"plan_summary": "x", "todos": "not a list"}),
+    ("todos-of-junk", {"plan_summary": "x", "todos": [None, 42, "", {"id": "", "content": ""}]}),
+    (
+        "wrong-types",
+        {"plan_summary": 42, "todos": "nope", "acceptance_criteria": 7, "verification_commands": True},
+    ),
+    ("deep-garbage", {"todos": {"nested": {"weird": [1, {"x": None}]}}}),
+    ("empty-object", {}),
+]
+
+
+@pytest.mark.parametrize(
+    "name, args", GARBAGE_PLAN_ARGS, ids=[n for n, _ in GARBAGE_PLAN_ARGS]
+)
+def test_planner_survives_garbage_todo_write_arguments(
+    name: str, args: Any, revision_state: Any
+) -> None:
+    model = ScriptedModel([tool_call("todo_write", args), AIMessage(content="done")])
+
+    update = planner_node(revision_state, model=model)
+
+    assert PLANNER_KEYS <= set(update)
+    assert isinstance(update["plan_summary"], str)
+    assert isinstance(update["acceptance_criteria"], list)
+    assert isinstance(update["verification_commands"], list)
+    assert update["todos"], "the planner must always return a usable plan"
+    assert all(todo["status"] in TODO_STATUSES for todo in update["todos"])
+    assert all(isinstance(todo["id"], str) and todo["id"] for todo in update["todos"])
+
+
+def test_planner_uses_partial_tool_arguments(revision_state: Any) -> None:
     """A plan with only some usable fields keeps the rest from the previous state."""
-    content = json.dumps({"todos": [{"id": "t1", "content": "only todos survived"}]})
+    model = ScriptedModel(
+        [
+            tool_call("todo_write", {"todos": [{"id": "t1", "content": "only todos survived"}]}),
+            AIMessage(content="planned"),
+        ]
+    )
 
-    update = planner_node(revision_state, model=ContentModel(content))
+    update = planner_node(revision_state, model=model)
 
     assert [todo["id"] for todo in update["todos"]] == ["t1"]
+    assert update["todos"][0]["status"] == "pending"  # defaults, not a crash
     assert update["acceptance_criteria"] == []
     assert update["verification_commands"] == []
-    assert isinstance(update["plan_summary"], str)
+    assert update["plan_summary"] == ""  # nothing usable -> state fallback
 
 
 def test_planner_tolerates_type_and_status_garbage(revision_state: Any) -> None:
-    content = json.dumps(
-        {
-            "plan_summary": 42,
-            "todos": [
-                None,
-                42,
-                {"id": "t1", "content": "keep me", "status": "DONE"},
-                {"content": ""},
-            ],
-            "acceptance_criteria": 7,
-            "verification_commands": {"not": "a list"},
-        }
+    model = ScriptedModel(
+        [
+            tool_call(
+                "todo_write",
+                {
+                    "plan_summary": 42,
+                    "todos": [
+                        None,
+                        42,
+                        {"id": "t1", "content": "keep me", "status": "DONE"},
+                        {"content": ""},
+                    ],
+                    "acceptance_criteria": 7,
+                    "verification_commands": {"not": "a list"},
+                },
+            ),
+            AIMessage(content="planned"),
+        ]
     )
 
-    update = planner_node(revision_state, model=ContentModel(content))
+    update = planner_node(revision_state, model=model)
 
     assert update["plan_summary"] == ""  # 42 is not a usable summary -> state fallback
     assert [(todo["id"], todo["status"]) for todo in update["todos"]] == [("t1", "pending")]
     assert update["acceptance_criteria"] == []
     assert update["verification_commands"] == []
+
+
+def test_planner_ignores_unparsable_tool_calls(tmp_path: Path) -> None:
+    """A tool call whose arguments the provider could not parse cannot corrupt the plan."""
+    broken = AIMessage(
+        content="",
+        invalid_tool_calls=[
+            {
+                "name": "todo_write",
+                "args": '{"plan_summary": "half", "todos": [',
+                "id": "c1",
+                "error": "unparsable arguments",
+                "type": "invalid_tool_call",
+            }
+        ],
+    )
+    state = new_graph_state(
+        "do the thing",
+        RuntimeState(workspace=tmp_path / "ws"),
+        todos=[make_todo("t0", "old plan")],
+    )
+
+    update = planner_node(state, model=ScriptedModel([broken]))
+
+    assert [todo["id"] for todo in update["todos"]] == ["t0"]  # untouched, no crash
+    assert update["agent_handoffs"] == []
 
 
 # -- verifier end to end -----------------------------------------------------

@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage
 
+from helpers import ScriptedModel, answer, code_call, passing_script, plan_call, report_call
+
 from wqagent.core.state import RuntimeState
 from wqagent.graph import (
     NODE_NAMES,
@@ -21,7 +23,7 @@ from wqagent.graph import (
     set_model,
 )
 from wqagent.graph.state import make_todo
-from wqagent.prompts import stage1, stage2
+from wqagent.prompts import stage1, stage2, stage3
 
 
 class ScriptedModel:
@@ -73,17 +75,18 @@ def test_workflow_has_the_expected_nodes_and_edges() -> None:
     for name in NODE_NAMES:
         assert name in node_ids, name
     assert {"__start__", "__end__"} <= node_ids
+    assert "actor" not in node_ids  # stage 3: the planner delegates instead
 
     edges = {(edge.source, edge.target) for edge in drawing.edges}
     assert ("__start__", "planner") in edges
-    assert ("planner", "actor") in edges
-    assert ("actor", "verifier") in edges
+    assert ("planner", "verifier") in edges
     assert ("final", "__end__") in edges
+    assert ("planner", "actor") not in edges
 
     # the verifier branches: one edge per route target
     verifier_targets = {target for source, target in edges if source == "verifier"}
     assert verifier_targets == set(ROUTE_TARGETS.values()) == {"final", "planner"}
-    assert set(NODE_NAMES) == {"planner", "actor", "verifier", "final"}
+    assert set(NODE_NAMES) == {"planner", "verifier", "final"}
 
 
 def test_every_node_is_the_function_from_nodes_module() -> None:
@@ -103,16 +106,23 @@ def test_build_workflow_binds_model_and_loop_budgets() -> None:
     from wqagent.graph import nodes as node_module
 
     sentinel = object()
-    drawing = build_workflow(model=sentinel, actor_loops=3).get_graph()
-
-    actor = getattr(drawing.nodes["actor"].data, "func", drawing.nodes["actor"].data)
-    assert isinstance(actor, partial)
-    assert actor.func is node_module.actor_node
-    assert actor.keywords == {"model": sentinel, "max_loops": 3}
+    specialist = object()
+    drawing = build_workflow(
+        model=sentinel, planner_loops=3, agent_model=specialist
+    ).get_graph()
 
     planner = getattr(drawing.nodes["planner"].data, "func", drawing.nodes["planner"].data)
     assert isinstance(planner, partial)
-    assert planner.keywords == {"model": sentinel}
+    assert planner.func is node_module.planner_node
+    assert planner.keywords == {
+        "model": sentinel,
+        "max_loops": 3,
+        "agent_model": specialist,
+    }
+
+    verifier = getattr(drawing.nodes["verifier"].data, "func", drawing.nodes["verifier"].data)
+    assert isinstance(verifier, partial)
+    assert verifier.keywords == {"model": sentinel}
 
 
 # -- final_node --------------------------------------------------------------
@@ -224,49 +234,35 @@ def test_all_four_prompts_are_available_from_stage2() -> None:
         text = getattr(stage2, name)
         assert isinstance(text, str) and len(text) > 100, name
         assert name in stage2.__all__, name
-    # ACTOR_PROMPT still comes from stage 1 - same object, single source of truth
+    # ACTOR_PROMPT still comes from stage 1, the planner/verifier prompts from stage 3
     assert stage2.ACTOR_PROMPT is stage1.ACTOR_PROMPT
+    assert stage2.PLANNER_PROMPT is stage3.PLANNER_PROMPT
+    assert stage2.VERIFIER_PROMPT is stage3.VERIFIER_PROMPT
 
 
-def test_planner_and_verifier_prompts_describe_their_json() -> None:
-    assert "todo_write" in stage2.PLANNER_PROMPT
-    for key in ("plan_summary", "todos", "acceptance_criteria", "verification_commands"):
-        assert key in stage2.PLANNER_PROMPT
-    assert "verification_report" in stage2.VERIFIER_PROMPT
+def test_planner_prompt_is_the_stage3_supervisor_prompt() -> None:
+    assert "planner/supervisor" in stage3.PLANNER_PROMPT
+    for tool in ("TodoWriteTool", "CallSearchAgentTool", "CallCodeAgentTool"):
+        assert tool in stage3.PLANNER_PROMPT
+    assert "Always call TodoWriteTool before delegating new work" in stage3.PLANNER_PROMPT
+
+
+def test_prompts_describe_their_json_and_tools() -> None:
+    assert "You are verifier" in stage3.VERIFIER_PROMPT
+    assert "Return only JSON" in stage3.VERIFIER_PROMPT
     for key in ("passed", "reason", "checks", "recommended_next_instruction"):
-        assert key in stage2.VERIFIER_PROMPT
+        assert key in stage3.VERIFIER_PROMPT
+    assert "must not modify files" in stage3.VERIFIER_PROMPT
     assert "tool call" in stage2.FINAL_PROMPT or "No tool calls" in stage2.FINAL_PROMPT
+    # the specialist prompts name their own tools
+    assert "WebSearchTool" in stage3.SEARCH_AGENT_PROMPT
+    assert "TodoUpdateTool" in stage3.CODE_AGENT_PROMPT
 
 
 # -- the whole workflow ------------------------------------------------------
 def test_workflow_passes_on_the_first_attempt(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
-    model = ScriptedModel(
-        [
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "write hello.py then run it",
-                    "todos": [{"id": "t1", "content": "write hello.py"}],
-                    "acceptance_criteria": ["hello.py runs cleanly"],
-                    "verification_commands": ["echo ok"],
-                },
-            ),
-            _tool_call("file_write", {"file_path": "hello.py", "content": "print('Hello')\n"}),
-            AIMessage(content="Wrote hello.py."),
-            AIMessage(content="Read the file, it looks right."),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": True,
-                    "reason": "the file exists and the command succeeded",
-                    "checks": [{"name": "hello.py runs cleanly", "passed": True, "detail": "exit 0"}],
-                    "recommended_next_instruction": "",
-                },
-            ),
-            AIMessage(content="Done: hello.py prints Hello and `echo ok` passed."),
-        ]
-    )
+    model = ScriptedModel(passing_script(final_text="Done: hello.py prints Hello."))
     set_model(model)
 
     result = build_workflow().invoke(
@@ -275,10 +271,14 @@ def test_workflow_passes_on_the_first_attempt(tmp_path: Path) -> None:
 
     assert result["passed"] is True
     assert result["attempts"] == 1
-    assert result["final_answer"] == "Done: hello.py prints Hello and `echo ok` passed."
+    assert result["final_answer"] == "Done: hello.py prints Hello."
     assert [todo["status"] for todo in result["todos"]] == ["completed"]
     assert (workspace / "hello.py").read_text(encoding="utf-8") == "print('Hello')\n"
-    assert len(model.seen) == 6  # planner, actor x2, verifier x2, final
+    # the delegation is recorded, and the implementer's report reached the state
+    assert [handoff["to_agent"] for handoff in result["agent_handoffs"]] == ["codeAgent"]
+    assert result["code_agent_summary"] == "Wrote hello.py."
+    # planner x3, codeAgent x2, verifier x2, final x1
+    assert len(model.seen) == 8
     assert model.responses == []
 
 
@@ -286,27 +286,23 @@ def test_workflow_writes_a_failure_answer_when_the_budget_runs_out(tmp_path: Pat
     workspace = tmp_path / "ws"
     model = ScriptedModel(
         [
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "try to make the test pass",
-                    "todos": [{"id": "t1", "content": "fix the failing test"}],
-                    "acceptance_criteria": ["pytest passes"],
-                    "verification_commands": ["exit 1"],
-                },
+            plan_call(
+                summary="try to make the test pass",
+                todos=[{"id": "t1", "content": "fix the failing test"}],
+                criteria=["pytest passes"],
+                commands=["exit 1"],
             ),
-            AIMessage(content="Tried to fix it."),
-            AIMessage(content="The test still fails."),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": False,
-                    "reason": "the test command still exits 1",
-                    "checks": [{"name": "pytest passes", "passed": False, "detail": "exit 1"}],
-                    "recommended_next_instruction": "fix the assertion in test_x.py",
-                },
+            code_call("fix the failing test"),
+            answer("Tried to fix it."),
+            answer("Delegated the fix to codeAgent."),
+            answer("The test still fails."),
+            report_call(
+                False,
+                reason="the test command still exits 1",
+                checks=[{"name": "pytest passes", "passed": False, "detail": "exit 1"}],
+                recommended_next_instruction="fix the assertion in test_x.py",
             ),
-            AIMessage(content="Not done: `exit 1` still fails; next step is to fix the assertion."),
+            answer("Not done: `exit 1` still fails; next step is to fix the assertion."),
         ]
     )
     set_model(model)
@@ -320,7 +316,7 @@ def test_workflow_writes_a_failure_answer_when_the_budget_runs_out(tmp_path: Pat
     assert "Not done" in result["final_answer"]
     assert result["final_answer"]  # never empty
     assert "fix the assertion in test_x.py" in result["last_error"]
-    assert len(model.seen) == 5  # planner, actor, verifier x2, final
+    assert len(model.seen) == 7  # planner x3, codeAgent x2, verifier x2... plus final
     assert model.responses == []
 
 

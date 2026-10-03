@@ -2,9 +2,9 @@
 
 * :func:`stream_agent_events` - **the agent entry point**. It no longer drives a
   bare ReAct loop: it streams the compiled LangGraph workflow
-  (``planner -> actor -> verifier -> final``) via
-  ``build_workflow().stream(inputs, stream_mode=["updates", "custom"])`` and
-  translates the graph chunks into one flat event stream for the CLI.
+  (``planner -> verifier -> final``, the planner delegating to the specialist
+  agents) via ``build_workflow().stream(inputs, stream_mode=["updates", "custom"])``
+  and translates the graph chunks into one flat event stream for the CLI.
 * :func:`react_loop` - the ReAct engine used *inside* that workflow by the actor
   node (:func:`wqagent.graph.nodes.actor_node`): think, call tools, observe.
 * :class:`Agent` - object wrapper around :func:`react_loop` (the engine-level API).
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from langchain_core.messages import (
+    AIMessage,
     BaseMessage,
     HumanMessage,
     SystemMessage,
@@ -42,9 +43,12 @@ __all__ = [
     "SYSTEM_PROMPT",
     "default_system_prompt",
     "execute_tool",
+    "last_ai_text",
     "message_text",
     "react_loop",
     "stream_agent_events",
+    "stream_writer",
+    "write_event",
 ]
 
 #: Loop budget of :func:`stream_agent_events` (and of the ``wq`` default).
@@ -117,6 +121,47 @@ def message_text(message: Any) -> str:
                     parts.append(text)
         return "\n".join(parts)
     return str(content)
+
+
+def last_ai_text(messages: Sequence[BaseMessage]) -> str:
+    """The text of the last AI message that has any (skips tool-call-only turns)."""
+    for message in reversed(list(messages)):
+        if isinstance(message, AIMessage):
+            text = message_text(message).strip()
+            if text:
+                return text
+    return ""
+
+
+def stream_writer() -> Callable[[Any], None] | None:
+    """LangGraph's custom stream writer (``stream_mode="custom"``), if available.
+
+    Returns ``None`` when not running inside a graph, so callers can treat
+    streaming as best effort.
+    """
+    try:
+        from langgraph.config import get_stream_writer
+
+        writer = get_stream_writer()
+    except Exception:  # noqa: BLE001 - not running inside a graph
+        return None
+    return writer if callable(writer) else None
+
+
+def write_event(
+    writer: Callable[[dict[str, Any]], None] | None, event: dict[str, Any]
+) -> None:
+    """Send one event to *writer*, falling back to the graph's custom stream.
+
+    Writers are best effort: a failing sink must never break a run.
+    """
+    sink = writer if writer is not None else stream_writer()
+    if sink is None:
+        return
+    try:
+        sink(event)
+    except Exception:  # pragma: no cover - streaming is best effort
+        pass
 
 
 def default_system_prompt(state: RuntimeState, tools: Sequence[Any] = ()) -> str:
@@ -293,8 +338,8 @@ def stream_agent_events(
     Args:
         task: What the agent should do, in natural language.
         workspace: Workspace root; created automatically when missing.
-        max_attempts: Plan/act/verify rounds before the run stops (default 3).
-        max_loops: ReAct loops the actor may use per attempt (default 10).
+        max_attempts: Plan/delegate/verify rounds before the run stops (default 3).
+        max_loops: Tool rounds the planner may use per attempt (default 10).
         model: Chat model to use; defaults to the nodes' ``create_model()``
             (``.env`` configuration).
         state: Reuse an existing :class:`RuntimeState` (CLI timeouts, output
@@ -320,7 +365,7 @@ def stream_agent_events(
             task, runtime, max_attempts=max_attempts or DEFAULT_MAX_ATTEMPTS
         )
 
-    app = graph if graph is not None else build_workflow(model=model, actor_loops=max_loops)
+    app = graph if graph is not None else build_workflow(model=model, planner_loops=max_loops)
 
     passed = False
     attempts = 0

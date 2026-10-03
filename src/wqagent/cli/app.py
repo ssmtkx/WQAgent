@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any, NoReturn, Optional
+from typing import Any, Mapping, NoReturn, Optional
 
 import typer
 from rich.console import Console
@@ -155,7 +155,9 @@ class _EventSummary:
             if name in {"file_write", "file_edit"} and path and path not in self.files:
                 self.files.append(path)
         elif kind == "tool_result":
-            if not (event.get("result") or {}).get("ok", True):
+            result = event.get("result")
+            ok = result.get("ok", True) if isinstance(result, Mapping) else event.get("ok", True)
+            if ok is False:
                 self.failures += 1
         elif kind == "node_end":
             node = str(event.get("node") or "")
@@ -166,20 +168,49 @@ class _EventSummary:
                 self.passed = bool(update.get("passed"))
 
 
-#: One header per node, so the CLI shows which part of the graph is reporting.
-NODE_HEADERS = {
-    "planner": "📋 Planner",
-    "actor": "🔧 Actor",
-    "verifier": "✅ Verifier",
-    "final": "📝 Final",
+#: Node headers: the emoji form, plus an ASCII fallback for streams that cannot
+#: encode it (a GBK console/pipe raises UnicodeEncodeError deep inside rich).
+_NODE_LABELS: dict[str, tuple[str, str]] = {
+    "planner": ("📋 Planner", "Planner"),
+    "actor": ("🔧 Actor", "Actor"),
+    "searchAgent": ("🔍 searchAgent", "searchAgent"),
+    "codeAgent": ("🛠 codeAgent", "codeAgent"),
+    "verifier": ("✅ Verifier", "Verifier"),
+    "final": ("📝 Final", "Final"),
 }
-NODE_FAILED_HEADERS = {"verifier": "❌ Verifier"}
+_FAILED_LABELS: dict[str, tuple[str, str]] = {"verifier": ("❌ Verifier", "Verifier (failed)")}
+
+#: Other non-ASCII glyphs, with ASCII fallbacks.
+_GLYPHS: dict[str, tuple[str, str]] = {
+    "to": ("→", "->"),
+    "handoff": ("↪", ">>"),
+    "result": ("↳", "->"),
+    "ok": ("✓", "OK"),
+    "fail": ("✗", "X"),
+}
+
+
+def _can_encode(text: str) -> bool:
+    """True when the console stream can write *text* as-is."""
+    encoding = getattr(console.file, "encoding", None) or "utf-8"
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError, TypeError):
+        return False
+    return True
+
+
+def _glyph(name: str) -> str:
+    fancy, plain = _GLYPHS[name]
+    return fancy if _can_encode(fancy) else plain
 
 
 def _node_header(node: str, update: dict[str, Any]) -> str:
     if node == "verifier" and not update.get("passed"):
-        return NODE_FAILED_HEADERS["verifier"]
-    return NODE_HEADERS.get(node, node or "node")
+        fancy, plain = _FAILED_LABELS["verifier"]
+    else:
+        fancy, plain = _NODE_LABELS.get(node, (node or "node", node or "node"))
+    return fancy if _can_encode(fancy) else plain
 
 
 def _render_node_update(node: str, update: dict[str, Any]) -> None:
@@ -194,6 +225,14 @@ def _render_node_update(node: str, update: dict[str, Any]) -> None:
             )
         for command in update.get("verification_commands") or []:
             console.print(f"   [dim]$ {escape(str(command))}[/]")
+        for handoff in update.get("agent_handoffs") or []:
+            console.print(
+                f"   [dim]{_glyph('handoff')} {escape(str(handoff.get('to_agent')))}: "
+                f"{escape(str(handoff.get('instruction')))}[/]"
+            )
+        supervisor = str(update.get("last_actor_summary") or "").strip()
+        if supervisor:
+            console.print(Text(_preview(supervisor, lines=3, limit=400), style="dim"))
     elif node == "actor":
         summary = str(update.get("last_actor_summary") or "").strip()
         if summary:
@@ -203,7 +242,7 @@ def _render_node_update(node: str, update: dict[str, Any]) -> None:
             ok = bool(result.get("ok"))
             console.print(
                 Text(
-                    f"   {'✓' if ok else '✗'} {result.get('command')} "
+                    f"   {_glyph('ok') if ok else _glyph('fail')} {result.get('command')} "
                     f"-> exit code {result.get('exit_code')}",
                     style="dim" if ok else "red",
                 )
@@ -216,15 +255,15 @@ def _render_node_update(node: str, update: dict[str, Any]) -> None:
 
 
 class _NodeRenderer:
-    """Prints the unified event stream, one header per graph node.
+    """Prints the unified event stream, one header per node or specialist.
 
-    The actor streams its tool events *before* the graph reports the node's state
-    update, so its header is opened by the first event instead of by ``node_end``.
+    Nodes stream their tool events *before* the graph reports their state update,
+    so a header is opened by the first event and not repeated by ``node_end``.
     """
 
     def __init__(self, *, verbose: bool) -> None:
         self.verbose = verbose
-        self._actor_open = False
+        self._opened: set[str] = set()
 
     def render(self, event: dict[str, Any]) -> None:
         kind = event.get("type")
@@ -232,20 +271,32 @@ class _NodeRenderer:
             names = [str(name) for name in event.get("tool_calls") or []]
             if not self.verbose or not names:
                 return
-            self._open("actor")
+            self._open(str(event.get("node") or ""))
             content = str(event.get("content") or "").strip()
             if content:
                 console.print(Text(content, style="dim"))
             console.print(f"[dim]   calling: {escape(', '.join(names))}[/]")
+        elif kind == "handoff":
+            target = str(event.get("to") or "")
+            console.print(
+                f"[bold magenta]{_glyph('handoff')} {escape(str(event.get('from') or ''))} "
+                f"{_glyph('to')} {escape(_node_header(target, {}))}[/]"
+            )
+            instruction = str(event.get("instruction") or "").strip()
+            if instruction:
+                console.print(Text(f"   {instruction}", style="dim"))
+            self._opened.discard(target)  # let the specialist introduce itself again
         elif kind == "tool_call":
-            self._open(str(event.get("node") or "actor"))
+            self._open(str(event.get("node") or ""))
             console.print(
                 f"[bold cyan]-> {escape(str(event.get('name')))}[/] "
                 f"[dim]{escape(_summarize_args(dict(event.get('args') or {})))}[/]"
             )
         elif kind == "tool_result":
-            result = dict(event.get("result") or {})
-            if result.get("ok", True):
+            result = event.get("result")
+            if not isinstance(result, Mapping):
+                console.print(Text(_preview(str(result or "")), style="dim"))
+            elif result.get("ok", True):
                 output = str(result.get("result") or "")
                 console.print(Text(output if self.verbose else _preview(output), style="dim"))
             else:
@@ -254,27 +305,36 @@ class _NodeRenderer:
                     f"[red]x {escape(str(event.get('name')))} failed:[/] "
                     f"{escape(error if self.verbose else _preview(error))}"
                 )
+        elif kind == "search_results":
+            count = len(event.get("results") or [])
+            query = str(event.get("query") or "").strip()
+            style = "dim" if event.get("ok") else "red"
+            console.print(Text(f"   {_glyph('result')} {count} result(s) for {query!r}", style=style))
+        elif kind == "todo_update":
+            todos = event.get("todos") or []
+            summary = ", ".join(
+                f"{todo.get('id')}={todo.get('status')}" for todo in todos
+            )
+            console.print(Text(f"   {_glyph('result')} plan: {summary}", style="dim"))
         elif kind == "node_end":
             self._render_node_end(
                 str(event.get("node") or ""), dict(event.get("update") or {})
             )
 
     def _open(self, node: str) -> None:
-        if node == "actor":
-            if not self._actor_open:
-                console.print(f"[bold]{NODE_HEADERS['actor']}[/]")
-                self._actor_open = True
+        if not node or node in self._opened:
             return
-        console.print(f"[bold]{_node_header(node, {})}[/]")
+        console.print(f"[bold]{escape(_node_header(node, {}))}[/]")
+        self._opened.add(node)
 
     def _render_node_end(self, node: str, update: dict[str, Any]) -> None:
         if node == "final":
             # the answer is printed by the closing panel in _render_result
             return
-        if node == "actor" and self._actor_open:
-            self._actor_open = False  # the header was already printed for this round
+        if node in self._opened:
+            self._opened.discard(node)  # the header was already printed for this round
         else:
-            console.print(f"[bold]{_node_header(node, update)}[/]")
+            console.print(f"[bold]{escape(_node_header(node, update))}[/]")
         _render_node_update(node, update)
 
 
@@ -370,7 +430,7 @@ def run_task(
         "--max-steps",
         min=1,
         max=200,
-        help="ReAct loops the actor may use per attempt.",
+        help="Tool rounds the planner may use per attempt.",
         show_default=True,
     ),
     max_attempts: int = typer.Option(
@@ -466,8 +526,9 @@ def run_task(
                 f"task      : {escape(task.strip())}\n"
                 f"workspace : {escape(str(state.workspace))}\n"
                 f"model     : {escape(_model_label(chat))}\n"
-                f"workflow  : planner -> actor -> verifier -> final "
-                f"(max {max_attempts} attempts, {max_steps} loops each)\n"
+                f"workflow  : planner -> verifier -> final "
+                f"(planner delegates to searchAgent/codeAgent; "
+                f"max {max_attempts} attempts, {max_steps} planner rounds each)\n"
                 f"tools     : {escape(', '.join(tool_names()))}",
                 border_style="cyan",
                 title="run",
@@ -515,7 +576,7 @@ def _render_result(
     passed = bool(final.get("passed"))
     answer = str(final.get("content") or "").strip() or "(the model returned an empty answer)"
     if not quiet:
-        console.print(f"[bold]{NODE_HEADERS['final']}[/]")
+        console.print(f"[bold]{_node_header('final', {})}[/]")
     console.print(
         Panel(
             Markdown(answer),
