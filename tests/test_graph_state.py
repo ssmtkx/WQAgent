@@ -50,6 +50,10 @@ EXPECTED_KEYS = {
     "compression_events",
     "memory_snapshot",
     "history_summary",
+    "intent_route",
+    "intent_reason",
+    "intent_confidence",
+    "chat_response",
     "final_answer",
 }
 

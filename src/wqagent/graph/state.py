@@ -152,6 +152,10 @@ class WQGraphState(TypedDict, total=False):
             (:func:`wqagent.graph.memory.build_layered_memory`); empty until built.
         history_summary: Compressed history carried in the state; when empty, the
             snapshot falls back to ``HISTORY_SUMMARY.md`` in the workspace.
+        intent_route: What the entry graph decided: ``chat`` or ``workflow``.
+        intent_reason: The router's one-line reason for that decision.
+        intent_confidence: How sure the router was (0.0-1.0).
+        chat_response: The reply of the light chat branch (chat route only).
         final_answer: The answer reported back to the user.
     """
 
@@ -181,6 +185,10 @@ class WQGraphState(TypedDict, total=False):
     compression_events: list[CompressionEvent]
     memory_snapshot: LayeredMemory
     history_summary: str
+    intent_route: str
+    intent_reason: str
+    intent_confidence: float
+    chat_response: str
     final_answer: str
 
 
@@ -295,7 +303,19 @@ def new_graph_state(
         "compression_events": [],
         "memory_snapshot": {},
         "history_summary": "",
+        "intent_route": "",
+        "intent_reason": "",
+        "intent_confidence": 0.0,
+        "chat_response": "",
         "final_answer": "",
     }
+    # only carry a session that actually exists, so the memory layer can keep its own
+    # fallback (attempts + 1) for runs that are not part of a conversation
+    session_id = str(getattr(runtime, "session_id", "") or "")
+    if session_id:
+        state["session_id"] = session_id
+    session_turn = int(getattr(runtime, "session_turn", 0) or 0)
+    if session_turn:
+        state["session_turn"] = session_turn
     state.update(extra)
     return state

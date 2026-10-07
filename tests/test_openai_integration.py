@@ -157,6 +157,8 @@ def test_cli_round_trip_over_http(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
     workspace = tmp_path / "cli-ws"
     scripted = [
+        # the entry router runs first and sends this run to the workflow
+        _answer_response('{"route":"workflow","reason":"writes a file","confidence":0.9}'),
         _tool_call_response(
             "todo_write",
             {
@@ -201,14 +203,15 @@ def test_cli_round_trip_over_http(tmp_path: Path, monkeypatch: Any) -> None:
     assert result.exit_code == 0, result.output
     assert (workspace / "notes" / "todo.md").read_text(encoding="utf-8") == "- [ ] ship it\n"
     assert "Done: notes/todo.md is written and verified." in result.output
-    # eight calls: planner x3, codeAgent x2, verifier x2 (inspect + report), final
-    assert len(requests) == 8
+    # nine calls: router, then planner x3, codeAgent x2, verifier x2 (inspect + report), final
+    assert len(requests) == 9
+    assert "tools" not in requests[0] or not requests[0]["tools"]  # the router binds nothing
     assert sorted(
-        tool["function"]["name"] for tool in requests[0]["tools"]
+        tool["function"]["name"] for tool in requests[1]["tools"]
     ) == ["call_code_agent", "call_search_agent", "todo_write"]
     assert sorted(
-        tool["function"]["name"] for tool in requests[2]["tools"]
+        tool["function"]["name"] for tool in requests[3]["tools"]
     ) == ["bash", "file_edit", "file_read", "file_write", "grep", "todo_update"]
     assert sorted(
-        tool["function"]["name"] for tool in requests[5]["tools"]
+        tool["function"]["name"] for tool in requests[6]["tools"]
     ) == ["file_read", "grep"]

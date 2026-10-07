@@ -53,6 +53,8 @@ __all__ = [
     "NOTEPAD_FILE_CHARS",
     "NOTEPAD_SECTIONS",
     "RESEARCH_CHARS",
+    "SESSION_CHARS",
+    "SESSION_FILE",
     "RULES_LAYER",
     "SUMMARY_CHARS",
     "TODO_FILE",
@@ -70,6 +72,7 @@ __all__ = [
     "memory_event",
     "read_history_summary",
     "read_notepad",
+    "read_session",
     "read_todos",
     "render_notepad_section",
     "render_todo_plan",
@@ -93,6 +96,8 @@ RULES_LAYER: dict[str, Any] = {
 NOTEPAD_FILE = "NOTEPAD.md"
 #: Compressed history file, relative to the workspace.
 HISTORY_SUMMARY_FILE = "HISTORY_SUMMARY.md"
+#: Display path of the conversation session (see :mod:`wqagent.core.session`).
+SESSION_FILE = ".wqagent/session/session.json"
 #: Working-plan file, relative to the workspace (a mirror of the state's todos).
 TODO_FILE = "TODO.md"
 
@@ -122,6 +127,8 @@ def context_token_limit_from_env(default: int = DEFAULT_CONTEXT_TOKEN_LIMIT) -> 
 NOTEPAD_CHARS = 1_800
 HISTORY_CHARS = 2_200
 RESEARCH_CHARS = 1_600
+#: Characters of the conversation-session block kept in the working memory.
+SESSION_CHARS = 1_600
 SUMMARY_CHARS = 1_000
 ERROR_CHARS = 1_400
 CONTEXT_SUMMARY_CHARS = 1_600
@@ -198,6 +205,9 @@ class HistorySummaryStore(TypedDict, total=False):
     notepad_path: str
     notepad_exists: bool
     notepad: str
+    session_path: str
+    session_exists: bool
+    session: str
     context_summary: str
     compression_events: list[CompressionEvent]
 
@@ -350,6 +360,36 @@ def read_notepad(runtime: RuntimeState) -> dict[str, Any]:
 def read_history_summary(runtime: RuntimeState) -> dict[str, Any]:
     """Read ``HISTORY_SUMMARY.md`` from the workspace (same contract as notepad)."""
     return _read_memory_file(runtime, HISTORY_SUMMARY_FILE)
+
+
+def read_session(runtime: RuntimeState) -> dict[str, Any]:
+    """The conversation session as a memory block (``{path, exists, content, error}``).
+
+    Built from ``.wqagent/session`` via
+    :func:`wqagent.core.session.build_session_context`, so every node - planner,
+    verifier, both specialists - knows what earlier turns in this workspace were about.
+    A missing or broken session is simply ``exists=False``.
+    """
+    record: dict[str, Any] = {
+        "path": SESSION_FILE,
+        "exists": False,
+        "content": "",
+        "error": "",
+    }
+    try:
+        from wqagent.core.session import build_session_context, session_path
+
+        path = session_path(runtime)
+        record["path"] = str(path)
+        if not path.is_file():
+            return record
+        content = build_session_context(runtime).strip()
+    except Exception as exc:  # noqa: BLE001 - memory must never break a run
+        record["error"] = f"{type(exc).__name__}: {exc}"
+        return record
+    record["exists"] = bool(content)
+    record["content"] = content
+    return record
 
 
 # -- the notepad (durable notes, written when the context is compressed) -----
@@ -639,6 +679,7 @@ def build_layered_memory(state: Mapping[str, Any], *, node: str = "graph") -> La
 
     notepad = read_notepad(runtime)
     history = read_history_summary(runtime)
+    session = read_session(runtime)
     # the state's own (compressed) history wins over the file on disk
     history_summary = str(state.get("history_summary") or history.get("content") or "")
 
@@ -669,6 +710,9 @@ def build_layered_memory(state: Mapping[str, Any], *, node: str = "graph") -> La
         "notepad_path": NOTEPAD_FILE,
         "notepad_exists": bool(notepad.get("exists", False)),
         "notepad": _short_text(notepad.get("content", ""), NOTEPAD_CHARS),
+        "session_path": SESSION_FILE,
+        "session_exists": bool(session.get("exists", False)),
+        "session": _short_text(session.get("content", ""), SESSION_CHARS),
         "context_summary": _short_text(state.get("context_summary"), CONTEXT_SUMMARY_CHARS),
         "compression_events": list(_as_sequence(state.get("compression_events")))[
             -COMPRESSION_EVENT_LIMIT:

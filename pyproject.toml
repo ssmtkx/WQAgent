@@ -29,6 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+tui = ["textual>=0.80"]
 
 [project.scripts]
 wq = "wqagent.cli.app:main"

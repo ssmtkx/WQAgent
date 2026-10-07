@@ -89,6 +89,7 @@ from wqagent.graph.state import (
     normalise_todos,
     render_todos,
 )
+from wqagent.prompts.entry import CHAT_RESPONDER_PROMPT, INTENT_ROUTER_PROMPT
 from wqagent.prompts.stage1 import ACTOR_PROMPT
 from wqagent.prompts.stage2 import FINAL_PROMPT
 from wqagent.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
@@ -1915,3 +1916,164 @@ def _final_instruction(report: str, memory: Mapping[str, Any] | None = None) -> 
         "Short, no tool calls."
     )
     return _with_layered_memory(facts, memory)
+
+
+# -- entry graph: intent routing and light chat ------------------------------
+#: Confidence below which the router's answer is not trusted (it then routes to the
+#: workflow, which can always fall back to asking/working).
+INTENT_CONFIDENCE_THRESHOLD = 0.55
+#: The routes the router may pick, and the default when it is unusable.
+INTENT_ROUTES: tuple[str, ...] = ("chat", "workflow")
+DEFAULT_INTENT_ROUTE = "workflow"
+
+
+def _session_context(state: Mapping[str, Any]) -> str:
+    """The bit of session context the entry nodes are allowed to use.
+
+    Two sources, in this order: the on-disk conversation session
+    (:func:`wqagent.core.session.build_session_context` - what happened in previous
+    turns) and the current run's own state (task, compressed summary, plan). Workspace
+    *facts* still belong to the workflow route, so nothing here claims to have read a
+    file; the file list is only there to disambiguate follow-ups like "继续".
+    """
+    runtime = state.get("runtime")
+    parts: list[str] = []
+    workspace = getattr(runtime, "workspace", None)
+    if workspace is not None:
+        try:
+            from wqagent.core.session import build_session_context
+
+            on_disk = build_session_context(workspace).strip()
+        except Exception:  # noqa: BLE001 - the session is context, never a requirement
+            on_disk = ""
+        if on_disk:
+            parts.append(on_disk)
+    session_id = str(getattr(runtime, "session_id", "") or state.get("session_id") or "")
+    if session_id:
+        parts.append(f"session: {session_id}")
+    summary = _text(state.get("context_summary")) or _text(state.get("history_summary"))
+    if summary:
+        parts.append(f"earlier summary: {summary[:800]}")
+    todos = _todos(state)
+    if todos:
+        parts.append("previous plan: " + "; ".join(f"{todo['id']}={todo['status']}" for todo in todos[:8]))
+    messages = state.get("messages")
+    if isinstance(messages, list):
+        recent = [
+            f"{getattr(message, 'type', '?')}: {message_text(message)[:300]}"
+            for message in messages[-6:]
+            if message_text(message).strip()
+        ]
+        if recent:
+            parts.append("recent turns:\n" + "\n".join(recent))
+    return "\n".join(parts)
+
+
+def _entry_messages(system: str, instruction: str, state: Mapping[str, Any]) -> list[BaseMessage]:
+    """System prompt + the session context block + the user's input."""
+    context = _session_context(state)
+    body = f"--- user input ---\n{_text(state.get('task')) or '(none)'}\n--- end of user input ---"
+    if context:
+        body = f"{body}\n\n--- session context ---\n{context}\n--- end of session context ---"
+    return [SystemMessage(content=system), HumanMessage(content=f"{instruction}\n\n{body}")]
+
+
+def intent_router_node(
+    state: WQGraphState,
+    *,
+    model: Any | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    writer: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Decide whether the user's input is conversation (``chat``) or work.
+
+    Asks the model for ``{"route", "reason", "confidence"}``. Anything unusable - bad
+    JSON, an unknown route, a confidence below :data:`INTENT_CONFIDENCE_THRESHOLD` -
+    falls back to ``workflow``, so a broken router can only ever cost one extra round
+    of real work, never a wrongly skipped one.
+    """
+    route = DEFAULT_INTENT_ROUTE
+    reason = "router unavailable; defaulting to workflow"
+    confidence = 0.0
+    try:
+        chat = model if model is not None else get_model()
+        response = chat.invoke(
+            _entry_messages(
+                INTENT_ROUTER_PROMPT,
+                "Classify the user input above and answer with the JSON object only.",
+                state,
+            )
+        )
+        payload = _json_object(message_text(response))
+        candidate = str(payload.get("route") or "").strip().lower()
+        reason = _text(payload.get("reason")) or reason
+        confidence = _confidence(payload.get("confidence"))
+        if candidate not in INTENT_ROUTES:
+            route = DEFAULT_INTENT_ROUTE
+            reason = f"unusable route {candidate!r}; {reason}"
+        elif confidence < INTENT_CONFIDENCE_THRESHOLD:
+            route = DEFAULT_INTENT_ROUTE
+            reason = (
+                f"confidence {confidence:.2f} below {INTENT_CONFIDENCE_THRESHOLD}; "
+                f"router said {candidate} ({reason})"
+            )
+        else:
+            route = candidate
+    except Exception as exc:  # noqa: BLE001 - routing must never break the run
+        reason = f"router failed ({type(exc).__name__}: {exc}); defaulting to workflow"
+
+    update = {
+        "intent_route": route,
+        "intent_reason": reason,
+        "intent_confidence": confidence,
+    }
+    event = {"type": "intent", "node": "intent_router", **update}
+    _note(event, writer, on_event)
+    return update
+
+
+def chat_responder_node(
+    state: WQGraphState,
+    *,
+    model: Any | None = None,
+    on_event: Callable[[str | dict[str, Any]], None] | None = None,
+    writer: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Answer a conversational input directly - with no tools at all.
+
+    Returns both ``chat_response`` and ``final_answer`` so the run closes exactly like
+    a workflow run does.
+    """
+    try:
+        chat = model if model is not None else get_model()
+        response = chat.invoke(
+            _entry_messages(
+                CHAT_RESPONDER_PROMPT,
+                "Reply to the user input above. No tool calls, no invented workspace facts.",
+                state,
+            )
+        )
+        text = message_text(response).strip()
+    except Exception as exc:  # noqa: BLE001 - always answer something
+        text = f"(chat unavailable: {type(exc).__name__}: {exc})"
+    if not text:
+        text = "I can chat, but I have nothing to add - ask me a question or give me a task."
+    update = {"chat_response": text, "final_answer": text}
+    _note({"type": "chat_response", "node": "chat_responder", **update}, writer, on_event)
+    return update
+
+
+def intent_route_fn(state: WQGraphState) -> str:
+    """Entry-graph router: the node to run (``chat_responder``) or ``planner``."""
+    return "chat_responder" if state.get("intent_route") == "chat" else "planner"
+
+
+def _confidence(value: Any) -> float:
+    """A 0.0-1.0 confidence from model output (bad values become 0.0)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number:  # NaN
+        return 0.0
+    return min(1.0, max(0.0, number))

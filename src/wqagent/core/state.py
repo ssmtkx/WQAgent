@@ -10,16 +10,30 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable, Mapping
 
+from wqagent.core.approval import (
+    ApprovalDecision,
+    ApprovalRequest,
+    approval_mode_from_env,
+    normalize_approval_mode,
+)
+from wqagent.core.checkpoint import checkpoint_mode_from_env, normalize_checkpoint_mode
 from wqagent.core.paths import (
     is_within_workspace,
     relative_to_workspace,
     resolve_in_workspace,
     resolve_workspace,
 )
+from wqagent.core.trace import (
+    new_trace_id,
+    normalize_trace_mode,
+    trace_mode_from_env,
+)
 
 __all__ = [
     "RuntimeState",
+    "create_runtime",
     "truncate_text",
     "DEFAULT_MAX_OUTPUT_CHARS",
     "DEFAULT_MAX_SCAN_BYTES",
@@ -79,6 +93,23 @@ class RuntimeState:
         max_read_lines: Default page size of ``file_read``.
         max_scan_bytes: ``grep`` skips files larger than this.
         blocked_command_patterns: Regexes ``bash`` refuses to run.
+        approval_mode: Policy for *risky* commands - ``inline`` (ask the handler, deny
+            without one), ``auto`` (run, marked) or ``deny`` (refuse). ``None`` means
+            "not specified": ``WQ_APPROVAL_MODE`` (else ``inline``) is used.
+        approval_handler: Called with an :class:`~wqagent.core.approval.ApprovalRequest`
+            in ``inline`` mode; the CLI passes an interactive prompt. ``None`` denies.
+        checkpoint_mode: What to save for a resume - ``light`` (metadata, recovery
+            guide, git snapshot), ``strict`` (plus the full state and every event) or
+            ``off``. ``None`` means "not specified": ``WQ_CHECKPOINT_MODE`` (else
+            ``light``) is used.
+        trace_mode: What to record about the run - ``summary``/``on`` (counters +
+            timeline), ``full`` (plus ``events.jsonl``) or ``off``. ``None`` means
+            "not specified": ``WQ_TRACE_MODE`` (else ``summary``) is used.
+        trace_id: Identifier of this run's trace directory; generated when empty.
+        resume_from: Workspace a run was resumed from, empty for a fresh run.
+        session_id: Conversation session this run belongs to (``core/session.py``);
+            empty means "no session", which the memory layer treats as a default.
+        session_turn: Turn number inside that session (0 = not recorded yet).
         started_at: UTC timestamp of the run (useful for logs).
     """
 
@@ -88,10 +119,35 @@ class RuntimeState:
     max_read_lines: int = DEFAULT_READ_LINES
     max_scan_bytes: int = DEFAULT_MAX_SCAN_BYTES
     blocked_command_patterns: tuple[str, ...] = DEFAULT_BLOCKED_COMMAND_PATTERNS
+    approval_mode: str | None = None
+    approval_handler: Callable[[ApprovalRequest], ApprovalDecision] | None = field(
+        default=None, repr=False, compare=False
+    )
+    checkpoint_mode: str | None = None
+    trace_mode: str | None = None
+    trace_id: str = ""
+    resume_from: str = ""
+    session_id: str = ""
+    session_turn: int = 0
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:
         self.workspace = resolve_workspace(self.workspace, create=True)
+        self.approval_mode = (
+            approval_mode_from_env()
+            if self.approval_mode is None
+            else normalize_approval_mode(self.approval_mode)
+        )
+        self.checkpoint_mode = (
+            checkpoint_mode_from_env()
+            if self.checkpoint_mode is None
+            else normalize_checkpoint_mode(self.checkpoint_mode)
+        )
+        self.trace_mode = (
+            trace_mode_from_env() if self.trace_mode is None else normalize_trace_mode(self.trace_mode)
+        )
+        if not self.trace_id:
+            self.trace_id = new_trace_id()
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if self.max_output_chars < 500:
@@ -129,5 +185,53 @@ class RuntimeState:
         """One-line description of the run, used by the CLI banner."""
         return (
             f"workspace={self.workspace} timeout={self.timeout_seconds}s "
-            f"max_output={self.max_output_chars} chars"
+            f"max_output={self.max_output_chars} chars approval={self.approval_mode}"
         )
+
+
+def create_runtime(
+    workspace: str | Path,
+    *,
+    approval_mode: str | None = "inline",
+    approval_handler: Callable[[ApprovalRequest], ApprovalDecision] | None = None,
+    checkpoint_mode: str | None = "light",
+    trace_mode: str | None = "on",
+    resume_from: str | Path | None = None,
+    session: Mapping[str, Any] | None = None,
+    **options: Any,
+) -> RuntimeState:
+    """Build the :class:`RuntimeState` of one run.
+
+    The mode arguments are the *defaults* of a run; pass ``None`` for any of them to
+    fall back to its environment variable (``WQ_APPROVAL_MODE``,
+    ``WQ_CHECKPOINT_MODE``, ``WQ_TRACE_MODE``).
+
+    Args:
+        workspace: Workspace root (created on demand).
+        approval_mode: ``inline`` / ``auto`` / ``deny`` for risky shell commands.
+        approval_handler: Consulted in ``inline`` mode; ``None`` denies.
+        checkpoint_mode: ``light`` / ``strict`` / ``off``.
+        trace_mode: ``summary`` (or its alias ``on``) / ``full`` / ``off``.
+        resume_from: Workspace to resume; it becomes the run's workspace.
+        session: A session record (``core/session.py``); its id and turn number are
+            carried on the runtime so memory and reports can label the run.
+        **options: Any other :class:`RuntimeState` field (``timeout_seconds``, ...).
+
+    Returns:
+        A :class:`RuntimeState` ready to hand to the tools and the workflow.
+    """
+    target = resume_from if resume_from is not None else workspace
+    state = RuntimeState(
+        workspace=target,
+        approval_mode=approval_mode,
+        approval_handler=approval_handler,
+        checkpoint_mode=checkpoint_mode,
+        trace_mode=trace_mode,
+        **options,
+    )
+    if resume_from is not None:
+        state.resume_from = str(state.workspace)
+    if session:
+        state.session_id = str(session.get("session_id") or "")
+        state.session_turn = int(session.get("turn_index") or 0)
+    return state

@@ -31,7 +31,18 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import BaseTool
 
-from wqagent.core.state import RuntimeState
+from wqagent.core.checkpoint import CheckpointManager
+from wqagent.core.session import (
+    append_assistant_turn,
+    append_user_turn,
+    build_session_context,
+    load_or_create_session,
+    save_session,
+    session_path,
+    summary_path,
+)
+from wqagent.core.state import RuntimeState, create_runtime
+from wqagent.core.trace import TraceRecorder
 from wqagent.prompts.stage1 import ACTOR_PROMPT
 
 __all__ = [
@@ -48,12 +59,33 @@ __all__ = [
     "message_text",
     "react_loop",
     "stream_agent_events",
+    "stream_session_events",
     "stream_writer",
     "write_event",
 ]
 
 #: Loop budget of :func:`stream_agent_events` (and of the ``wq`` default).
 DEFAULT_MAX_LOOPS = 10
+#: Custom events that earn a checkpoint of their own, between node boundaries.
+CHECKPOINT_CUSTOM_EVENTS: frozenset[str] = frozenset({"handoff", "context_compressed"})
+#: Node-update keys left out of the *event logs* - the transcript is written in full
+#: to ``state.json`` (strict checkpoints), and repeating it per node would dwarf the
+#: logs. The event stream handed to callers always carries the complete update.
+LOG_OMITTED_UPDATE_KEYS: tuple[str, ...] = ("messages",)
+
+
+def _log_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    """The form of a node event written to the logs (see :data:`LOG_OMITTED_UPDATE_KEYS`)."""
+    update = event.get("update")
+    if not isinstance(update, Mapping):
+        return dict(event)
+    if not any(key in update for key in LOG_OMITTED_UPDATE_KEYS):
+        return dict(event)
+    slim = {key: value for key, value in update.items() if key not in LOG_OMITTED_UPDATE_KEYS}
+    messages = update.get("messages")
+    if isinstance(messages, (list, tuple)):
+        slim["message_count"] = len(messages)
+    return {**dict(event), "update": slim}
 
 #: Loop budget of :class:`Agent`, which ships a richer default prompt.
 DEFAULT_MAX_STEPS = 30
@@ -214,6 +246,91 @@ def _publish(on_event: EventCallback | None, event: dict[str, Any]) -> dict[str,
     return event
 
 
+def _pump_graph(
+    app: Any,
+    inputs: Mapping[str, Any],
+    merged: dict[str, Any],
+    *,
+    manager: CheckpointManager,
+    tracer: TraceRecorder,
+    on_event: EventCallback | None,
+    progress: dict[str, str],
+) -> Iterator[dict[str, Any]]:
+    """Stream one compiled graph into the flat event protocol.
+
+    Used for both the entry graph and the main workflow, so the two bookkeep
+    identically: node updates are merged into *merged*, checkpoints are written, the
+    trace is flushed, and every event reaches the caller. ``progress["latest_node"]``
+    tracks where the run is (the entry and main graphs share one progress dict).
+    """
+    for mode, chunk in app.stream(inputs, stream_mode=["updates", "custom"]):
+        if mode == "custom":
+            event = dict(chunk or {})
+            if event.get("type") == "final_answer":
+                # The actor round's own end marker - only the `final` node closes
+                # the run, and that answer is emitted once at the end.
+                continue
+            if manager.strict:
+                manager.append_event(event)
+            tracer.record_custom_event(event)
+            yield _publish(on_event, event)
+            if _custom_event_needs_checkpoint(event):
+                # after the event, so the checkpoint is "everything up to here"
+                saved = manager.save(
+                    merged,
+                    status="running",
+                    latest_node=progress["latest_node"],
+                    event=event,
+                )
+                if saved is not None:
+                    tracer.record_custom_event(saved)
+                    tracer.snapshot(status="running", latest_node=progress["latest_node"])
+                    yield _publish(on_event, saved)
+            continue
+
+        for node, update in dict(chunk or {}).items():
+            patch = dict(update or {})
+            merged.update(patch)
+            progress["latest_node"] = str(node)
+            node_event = {"type": "node_end", "node": str(node), "update": patch}
+            logged = _log_event(node_event)
+            tracer.record_graph_update(logged)
+            saved = manager.save(
+                merged, status="running", latest_node=progress["latest_node"], event=logged
+            )
+            if saved is not None:
+                tracer.record_custom_event(saved)
+            # flush the trace at every node boundary, before the caller is told the node
+            # finished: a run that is killed (or that stalls inside a model call) must
+            # still leave a usable trace behind
+            tracer.snapshot(status="running", latest_node=progress["latest_node"])
+            yield _publish(on_event, node_event)
+            if saved is not None:
+                yield _publish(on_event, saved)
+
+
+def _close_run(
+    manager: CheckpointManager,
+    tracer: TraceRecorder,
+    state: Mapping[str, Any],
+    *,
+    status: str,
+    latest_node: str,
+) -> None:
+    """Record the end of a run that did not finish normally (best effort).
+
+    Called from ``except`` blocks, so it never yields and never raises: the original
+    exception must stay the one the caller sees.
+    """
+    try:
+        saved = manager.save(state, status=status, latest_node=latest_node)
+        if saved is not None:
+            tracer.record_custom_event(saved)
+        tracer.end(status=status, latest_node=latest_node, final_state=state)
+    except Exception:  # noqa: BLE001 - bookkeeping must not mask the real error
+        pass
+
+
 def react_loop(
     messages: list[BaseMessage],
     *,
@@ -303,6 +420,16 @@ def react_loop(
     )
 
 
+def _custom_event_needs_checkpoint(event: Mapping[str, Any]) -> bool:
+    """True for custom events worth a checkpoint of their own.
+
+    Node boundaries are checkpointed anyway; in between, a *delegation* and a
+    *context compression* change enough state to be worth saving immediately (a
+    crash right after either would otherwise lose it).
+    """
+    return str(event.get("type") or "") in CHECKPOINT_CUSTOM_EVENTS
+
+
 def stream_agent_events(
     task: str,
     *,
@@ -313,27 +440,42 @@ def stream_agent_events(
     state: RuntimeState | None = None,
     inputs: Any | None = None,
     graph: Any | None = None,
+    approval_mode: str | None = "inline",
+    approval_handler: Any | None = None,
+    checkpoint_mode: str | None = "light",
+    resume_workspace: str | Path | None = None,
+    trace_mode: str | None = "on",
+    entry_router: bool | None = False,
+    resume_event: Mapping[str, Any] | None = None,
     on_event: EventCallback | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Run *task* through the compiled workflow, yielding one flat event stream.
 
     Instead of driving a bare ReAct loop, this streams
-    :func:`wqagent.graph.workflow.build_workflow` with
+    :func:`wqagent.graph.workflow.build_complex_workflow` with
     ``stream_mode=["updates", "custom"]``:
 
     * ``custom`` chunks are the actor's per-step ReAct events - forwarded as they
       are (they already carry ``node``);
     * ``updates`` chunks are each node's state update - emitted as ``node_end``
-      events so the CLI can report planner / actor / verifier / final;
+      events so the CLI can report planner / verifier / final;
+    * every event is recorded by a :class:`~wqagent.core.trace.TraceRecorder`, and
+      checkpoints are written by a :class:`~wqagent.core.checkpoint.CheckpointManager`
+      at the start, on every node boundary (plus delegations and compressions), and
+      at the end;
     * the run is closed with a single ``final_answer`` built from the ``final``
       node's text plus the verdict the verifier recorded.
 
-    Events:
-        ``{"type": "ai_message", "node": "actor", "content": str, "tool_calls": [str], "loop": int}``
-        ``{"type": "tool_call", "node": "actor", "name": str, "args": dict, "loop": int}``
-        ``{"type": "tool_result", "node": "actor", "name": str, "result": dict, "loop": int}``
-        ``{"type": "node_end", "node": "planner"|"actor"|"verifier"|"final", "update": dict}``
-        ``{"type": "final_answer", "content": str, "passed": bool, "attempts": int, "stopped_early": bool}``
+    Events (flat - each dict has ``type`` plus its own fields):
+        ``{"type": "ai_message", "node": str, "content": str, "tool_calls": [str], "loop": int}``
+        ``{"type": "tool_call", "node": str, "name": str, "args": dict, "loop": int}``
+        ``{"type": "tool_result", "node": str, "name": str, "result": dict, "loop": int}``
+        ``{"type": "handoff"|"memory"|"context_compressed"|"checkpoint_saved"|..., ...}``
+        ``{"type": "intent", "intent_route": "chat"|"workflow", "intent_reason": str, "intent_confidence": float}``
+        ``{"type": "chat_response", "chat_response": str, "final_answer": str}``
+        ``{"type": "node_end", "node": str, "update": dict}``
+        ``{"type": "trace_saved", "trace_id": str, "path": str, ...}``
+        ``{"type": "final_answer", "content": str, "passed": bool, "attempts": int, "stopped_early": bool, "route": "chat"|"workflow"}``
             Always the last event.
 
     Args:
@@ -343,28 +485,79 @@ def stream_agent_events(
         max_loops: Tool rounds the planner may use per attempt (default 10).
         model: Chat model to use; defaults to the nodes' ``create_model()``
             (``.env`` configuration).
-        state: Reuse an existing :class:`RuntimeState` (CLI timeouts, output
-            budget); takes precedence over ``workspace``.
+        state: Reuse an existing :class:`RuntimeState` (CLI timeouts, output budget);
+            takes precedence over ``workspace`` and keeps its own modes.
         inputs: A ready-made ``WQGraphState``; skips building one from *task*.
         graph: A prebuilt workflow app; skips ``build_complex_workflow``.
+        approval_mode: ``inline`` / ``auto`` / ``deny`` for risky shell commands
+            (only used when this function builds the runtime; ``None`` -> env).
+        approval_handler: Consulted in ``inline`` mode; ``None`` denies.
+        checkpoint_mode: ``light`` (metadata + recovery guide + git snapshot),
+            ``strict`` (plus full state and every event) or ``off``.
+        resume_workspace: Workspace to resume: its checkpoint is loaded, its workspace
+            snapshot restored and, when no checkpoint exists, ``LookupError`` is
+            raised. Takes precedence over ``workspace``.
+        trace_mode: ``summary`` (alias ``on``), ``full`` or ``off``.
+        entry_router: Run :func:`~wqagent.graph.workflow.build_entry_workflow` first, so
+            conversation ("你好") is answered by one cheap model call instead of the
+            whole planner/verifier pipeline. Off by default (the library keeps its
+            existing behaviour); the CLI turns it on and ``--no-router`` turns it off.
+        resume_event: The event ``load_resume_inputs`` returned (used for the trace
+            and to label the run as resumed).
         on_event: Optional ``(event_type, payload)`` callback mirroring the events.
+
+    Raises:
+        ValueError: When no workspace, state or inputs say where to work.
+        LookupError: When ``resume_workspace`` holds no usable checkpoint.
     """
     # Imported lazily on purpose: the workflow's nodes import this module for
     # `react_loop`, so a module-level import here would be circular.
     from wqagent.graph.state import DEFAULT_MAX_ATTEMPTS, new_graph_state
-    from wqagent.graph.workflow import build_complex_workflow
+    from wqagent.graph.workflow import build_complex_workflow, build_entry_workflow
 
+    provided_inputs = inputs is not None
+    # 1. where to work: an existing state/inputs wins over a freshly built runtime
     if inputs is None:
         runtime = state
         if runtime is None:
-            if workspace is None:
-                raise ValueError(
-                    "pass workspace=, state= or inputs= so the agent knows where to work"
+            if resume_workspace is not None:
+                runtime = create_runtime(
+                    resume_workspace,
+                    approval_mode=approval_mode,
+                    approval_handler=approval_handler,
+                    checkpoint_mode=checkpoint_mode,
+                    trace_mode=trace_mode,
+                    resume_from=resume_workspace,
                 )
-            runtime = RuntimeState(workspace=workspace)
-        inputs = new_graph_state(
-            task, runtime, max_attempts=max_attempts or DEFAULT_MAX_ATTEMPTS
-        )
+                inputs, loaded = CheckpointManager.load_resume_inputs(
+                    runtime,
+                    task or None,
+                    max_attempts=max_attempts or DEFAULT_MAX_ATTEMPTS,
+                )
+                if inputs is None:
+                    reasons = "; ".join(str(item) for item in (loaded.get("warnings") or []))
+                    raise LookupError(
+                        f"no checkpoint to resume in {runtime.workspace}"
+                        f" ({reasons or 'not found'})"
+                    )
+                resume_event = loaded
+            else:
+                if workspace is None:
+                    raise ValueError(
+                        "pass workspace=, state=, inputs= or resume_workspace= so the "
+                        "agent knows where to work"
+                    )
+                runtime = create_runtime(
+                    workspace,
+                    approval_mode=approval_mode,
+                    approval_handler=approval_handler,
+                    checkpoint_mode=checkpoint_mode,
+                    trace_mode=trace_mode,
+                )
+        if inputs is None:
+            inputs = new_graph_state(
+                task, runtime, max_attempts=max_attempts or DEFAULT_MAX_ATTEMPTS
+            )
 
     app = (
         graph
@@ -372,40 +565,286 @@ def stream_agent_events(
         else build_complex_workflow(model=model, planner_loops=max_loops)
     )
 
-    passed = False
-    attempts = 0
-    final_text = ""
-    for mode, chunk in app.stream(inputs, stream_mode=["updates", "custom"]):
-        if mode == "custom":
-            event = dict(chunk or {})
-            if event.get("type") == "final_answer":
-                # The actor round's own end marker - only the `final` node closes
-                # the run, and that answer is emitted once at the end.
-                continue
-            yield _publish(on_event, event)
-            continue
+    # 2. one checkpoint manager and one tracer for the run
+    manager = CheckpointManager(inputs.get("runtime"), str(inputs.get("task") or task))
+    tracer = TraceRecorder(inputs.get("runtime"), str(inputs.get("task") or task))
+    merged: dict[str, Any] = dict(inputs)
+    progress = {"latest_node": "start"}
 
-        for node, update in dict(chunk or {}).items():
-            patch = dict(update or {})
-            if node == "verifier":
-                if "attempts" in patch:
-                    attempts = int(patch.get("attempts") or attempts)
-                if "passed" in patch:
-                    passed = bool(patch.get("passed"))
-            elif node == "final":
-                final_text = str(patch.get("final_answer") or final_text)
-            yield _publish(
-                on_event, {"type": "node_end", "node": str(node), "update": patch}
-            )
+    # 3. the opening events: trace the run and save the starting checkpoint
+    tracer.start(merged, resumed=resume_event is not None, resume_event=resume_event)
+    tracer.snapshot(status="started", latest_node=progress["latest_node"])
+    opening = manager.save(merged, status="started", latest_node=progress["latest_node"])
+    if opening is not None:
+        tracer.record_custom_event(opening)
+        yield _publish(on_event, opening)
 
-    yield _publish(
-        on_event,
-        {
+    router = bool(entry_router)
+    route = "workflow"
+    try:
+        # 4. the entry graph: conversation or work? (`workflow` ends it immediately)
+        if router:
+            entry_app = build_entry_workflow(model=model)
+            for event in _pump_graph(
+                entry_app,
+                inputs,
+                merged,
+                manager=manager,
+                tracer=tracer,
+                on_event=on_event,
+                progress=progress,
+            ):
+                yield event
+            route = str(merged.get("intent_route") or "workflow")
+            if route not in {"chat", "workflow"}:
+                route = "workflow"
+
+        # 5. the main workflow (skipped entirely for the chat route)
+        if route != "chat":
+            for event in _pump_graph(
+                app,
+                inputs,
+                merged,
+                manager=manager,
+                tracer=tracer,
+                on_event=on_event,
+                progress=progress,
+            ):
+                yield event
+    except KeyboardInterrupt:
+        # an interrupted run is still resumable: close both records, then let the
+        # interrupt travel on (the CLI turns it into its own exit code)
+        _close_run(
+            manager, tracer, merged, status="interrupted", latest_node=progress["latest_node"]
+        )
+        raise
+    except Exception:
+        # a crash (API error, bad tool, ...) must leave the same trail as an interrupt
+        _close_run(
+            manager, tracer, merged, status="failed", latest_node=progress["latest_node"]
+        )
+        raise
+
+    # 6. the closing events: final checkpoint, then the trace summary, then the answer
+    if route == "chat":
+        final_event = {
             "type": "final_answer",
-            "content": final_text,
+            "content": str(merged.get("chat_response") or merged.get("final_answer") or ""),
+            "passed": True,
+            "attempts": 0,
+            "stopped_early": False,
+            "route": "chat",
+            "intent_route": "chat",
+            "intent_reason": str(merged.get("intent_reason") or ""),
+            "intent_confidence": float(merged.get("intent_confidence") or 0.0),
+        }
+        status = "passed"
+    else:
+        passed = bool(merged.get("passed"))
+        attempts = int(merged.get("attempts") or 0)
+        final_event = {
+            "type": "final_answer",
+            "content": str(merged.get("final_answer") or ""),
             "passed": passed,
             "attempts": attempts,
             "stopped_early": not passed,
+            "route": "workflow",
+            "intent_route": str(merged.get("intent_route") or ""),
+        }
+        status = "passed" if passed else "failed"
+    # the closing checkpoint is written (and counted) before the trace is closed, so
+    # every counter covers the whole run
+    saved = manager.save(merged, status=status, latest_node="final")
+    if saved is not None:
+        tracer.record_custom_event(saved)
+    tracer.record_custom_event(final_event)
+    trace = tracer.end(status=status, latest_node="final", final_state=merged)
+    if saved is not None:
+        yield _publish(on_event, saved)
+    if trace is not None:
+        yield _publish(
+            on_event,
+            {
+                "type": "trace_saved",
+                "trace_id": trace["trace_id"],
+                "path": str(tracer.trace_path),
+                "mode": trace["mode"],
+                "status": trace["status"],
+                "duration_ms": trace["duration_ms"],
+                "tool_calls": trace["tool_calls"],
+                "failed_tool_calls": trace["failed_tool_calls"],
+                "approval_count": trace["approval_count"],
+                "checkpoint_count": trace["checkpoint_count"],
+                "handoff_count": trace["handoff_count"],
+                "node_visits": trace["node_visits"],
+                "timeline_total": trace["timeline_total"],
+            },
+        )
+    yield _publish(on_event, final_event)
+
+
+SESSION_CONTEXT_HEADER = "--- session context ---"
+SESSION_CONTEXT_FOOTER = "--- end of session context ---"
+
+
+def _summary_line(text: str, limit: int = 200) -> str:
+    """The first sentence of *text*, for the turn summary (empty when there is none)."""
+    body = " ".join(str(text or "").split())
+    if not body:
+        return ""
+    for separator in (". ", "。", "! ", "? ", "\n"):
+        index = body.find(separator)
+        if 0 < index < limit:
+            return body[: index + len(separator.strip())].strip()
+    return body[:limit].strip()
+
+
+def stream_session_events(
+    task: str,
+    *,
+    session_workspace: str | Path | None = None,
+    workspace: str | Path | None = None,
+    session: dict[str, Any] | None = None,
+    save: bool = True,
+    model: Any | None = None,
+    max_attempts: int | None = None,
+    max_loops: int | None = None,
+    approval_mode: str | None = None,
+    approval_handler: Any | None = None,
+    checkpoint_mode: str | None = None,
+    trace_mode: str | None = None,
+    entry_router: bool = True,
+    graph: Any | None = None,
+    on_event: EventCallback | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Run one **session turn**: conversation state in, the usual event stream out.
+
+    The steps, in order:
+
+    1. load ``.wqagent/session/session.json`` (or start a session) in
+       *session_workspace*;
+    2. record the user's turn (``append_user_turn``), which is what makes the turn
+       number in the context block advance;
+    3. build the session context - session id, turn number, the newest workspace files
+       and the last exchanges (:func:`~wqagent.core.session.build_session_context`);
+    4. run the entry graph: ``intent_router`` sends conversation to ``chat_responder``
+       (answered directly, no tools) and everything else to
+       ``build_complex_workflow()`` - the whole planner/verifier pipeline;
+    5. record the assistant's turn (``route`` from the final event, ``summary`` from
+       its first sentence) and write ``session.json`` + ``SESSION_SUMMARY.md``;
+    6. yield a closing ``session_saved`` event with the turn numbers and paths.
+
+    The context reaches both sides: the entry nodes read it from disk (so "继续" can be
+    understood), and the seeded system message puts it in front of every workflow node
+    (so the planner knows what earlier turns did).
+
+    Args:
+        task: This turn's user input.
+        session_workspace: Workspace whose session this is (its ``.wqagent``); also the
+            run's workspace.
+        workspace: Alias for *session_workspace*.
+        session: An in-memory session to continue (skips the disk read); the same dict
+            stays up to date for the next turn.
+        save: Write the session files (``False`` keeps everything in memory).
+        model: Chat model for every node; defaults to the nodes' lazy ``create_model()``.
+        max_attempts: Plan/delegate/verify rounds before the run stops.
+        max_loops: Tool rounds the planner may use per attempt.
+        approval_mode: ``inline`` / ``auto`` / ``deny``; ``None`` keeps the environment.
+        approval_handler: Consulted in ``inline`` mode.
+        checkpoint_mode: ``light`` / ``strict`` / ``off``; ``None`` keeps the default.
+        trace_mode: ``summary`` / ``full`` / ``off``; ``None`` keeps the default.
+        entry_router: ``False`` skips the router and always runs the workflow.
+        graph: A prebuilt workflow app; skips ``build_complex_workflow``.
+        on_event: Optional ``(event_type, payload)`` callback mirroring the events.
+
+    Events: everything :func:`stream_agent_events` yields, plus a final
+
+        ``{"type": "session_saved", "session_id": str, "turn": int, "reply_turn": int,
+           "turn_index": int, "route": "chat"|"workflow", "path": str,
+           "summary_path": str, "turns": int}``
+    """
+    target = session_workspace if session_workspace is not None else workspace
+    if target is None:
+        raise ValueError(
+            "pass session_workspace= (or workspace=) so the session has a home: the "
+            "run's tools need a workspace too"
+        )
+    record = session if session is not None else load_or_create_session(target)
+    turn = append_user_turn(record, task)
+    if save:
+        # persist the user's turn *now*: the entry nodes and the memory layer read the
+        # session from disk, so the turn number they see must already be this turn's
+        save_session(target, record)
+
+    try:
+        context = build_session_context(target, record)
+    except Exception:  # noqa: BLE001 - context is a bonus, never a requirement
+        context = ""
+
+    runtime = create_runtime(
+        target,
+        approval_mode=approval_mode,
+        approval_handler=approval_handler,
+        checkpoint_mode=checkpoint_mode,
+        trace_mode=trace_mode,
+        session=record,
+    )
+    # Imported lazily for the same reason as in stream_agent_events.
+    from wqagent.graph.state import DEFAULT_MAX_ATTEMPTS, new_graph_state
+
+    inputs = new_graph_state(
+        task, runtime, max_attempts=max_attempts or DEFAULT_MAX_ATTEMPTS
+    )
+
+    final: dict[str, Any] = {}
+    try:
+        for event in stream_agent_events(
+            task,
+            workspace=target or None,
+            state=runtime,
+            inputs=inputs,
+            model=model,
+            max_attempts=max_attempts,
+            max_loops=max_loops,
+            graph=graph,
+            entry_router=entry_router,
+            on_event=on_event,
+        ):
+            if event.get("type") == "final_answer":
+                final = event
+            yield event
+    except BaseException:
+        # a crashed or interrupted turn still belongs to the session: keep the user's
+        # message (nothing else) so the conversation is not silently reset
+        if save:
+            save_session(target, record)
+        raise
+
+    route = str(final.get("route") or "workflow")
+    content = str(final.get("content") or "")
+    append_assistant_turn(
+        record,
+        turn=turn,
+        route=route,
+        content=content,
+        summary=_summary_line(content),
+    )
+    if save:
+        save_session(target, record)
+    reply_turn = int(record.get("turn_index") or turn)
+    yield _publish(
+        on_event,
+        {
+            "type": "session_saved",
+            "session_id": str(record.get("session_id") or ""),
+            "turn": turn,
+            "reply_turn": reply_turn,
+            "turn_index": int(record.get("turn_index") or turn),
+            "route": route,
+            "path": str(session_path(target)),
+            "summary_path": str(summary_path(target)),
+            "turns": len(record.get("recent_turns") or []),
+            "saved": bool(save),
         },
     )
 

@@ -23,7 +23,7 @@ wq "创建 hello.py，打印 Hello, World，然后运行它" --workspace ./demo
 
 Python 3.10+（依赖 `langchain-core`、`langchain-openai`、`langgraph`、`typer`、`python-dotenv`、`rich`）。
 
-已通过的验证环境（`pytest`：**401 passed, 1 skipped**，跳过项是 Windows 下需要管理员权限的符号链接用例）：
+已通过的验证环境（`pytest`：**726 passed, 1 skipped**，跳过项是 Windows 下需要管理员权限的符号链接用例）：
 
 | 组件 | 版本 |
 | --- | --- |
@@ -111,9 +111,16 @@ python -m wqagent "同一个任务"
 
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
-| `TASK` | 任务描述（自然语言） | 必填 |
+| `TASK` | 任务描述（自然语言）；`--resume` 时可省略（用检查点里的任务） | 必填 |
 | `-w, --workspace` | 工作区目录，不存在会自动创建 | `./workspace`（`$WQ_WORKSPACE`） |
+| `--resume PATH` | 从该工作区的检查点恢复并继续（**替代 `-w`**，同时传入会提示；命令见 `RECOVERY.md`；跳过意图路由） | — |
+| `--no-router` | 跳过意图路由，任何输入都当任务跑主工作流 | 关（默认先做意图路由） |
+| `--tui` | 打开 Textual 交互界面（Plan 面板 / 事件流 / 审批弹窗；**无需 TASK**） | 关（需 `pip install "wqagent[tui]"`） |
 | `WQ_CONTEXT_TOKEN_LIMIT`（环境变量） | 上下文 token 预算，超出即触发压缩 | `400000` |
+| `--approval-mode` | 风险命令策略：`inline`（先问）/ `auto`（放行并标记）/ `deny`（拒绝） | `$WQ_APPROVAL_MODE` 或 `inline` |
+| `WQ_APPROVAL_TIMEOUT`（环境变量） | `inline` 问话等待秒数，超时按"否"；`0` 表示一直等 | `300` |
+| `--checkpoint-mode` | 断点保存：`light`（每个节点存元数据+恢复指南+git 快照）/ `strict`（另存全量 state 与每个事件）/ `off` | `$WQ_CHECKPOINT_MODE` 或 `light` |
+| `--trace-mode` | 执行追踪：`on`（=`summary`，统计+时间线）/ `full`（另存 `events.jsonl`）/ `off` | `$WQ_TRACE_MODE` 或 `on` |
 | `-m, --model` | 模型名，覆盖 `$MODEL` | `.env` 的 `MODEL` |
 | `--base-url` | OpenAI 兼容端点，覆盖 `$BASE_URL` | `.env` 的 `BASE_URL` |
 | `--api-key` | API Key，覆盖 `$API_KEY` | `.env` 的 `API_KEY` |
@@ -122,6 +129,7 @@ python -m wqagent "同一个任务"
 | `--max-steps` | **每次 attempt 内** planner 的工具轮数（含专家交接） | `10` |
 | `-t, --temperature` | 采样温度 | `0.0` |
 | `--timeout` | 单条 shell 命令的默认超时（秒） | `120` |
+| `--request-timeout` | 等**一次模型响应**的上限（秒；失败重试 2 次） | `$WQ_REQUEST_TIMEOUT` 或 `120` |
 | `-v, --verbose` | 打印每一步、工具参数与完整输出 | 关 |
 | `-q, --quiet` | 只输出最终答案 | 关 |
 | `--list-tools` | 列出已注册工具后退出 | — |
@@ -129,6 +137,41 @@ python -m wqagent "同一个任务"
 | `-V, --version` | 版本号 | — |
 
 退出码：`0` 成功、`1` 运行失败（含触发步数上限）、`2` 用法错误、`130` 用户中断。
+
+### Ctrl+C 中断（为什么以前像"没反应"，现在怎么做的）
+
+langgraph 把每个同步节点丢进**工作线程**执行，主线程用 `concurrent.futures.wait` 等它（`langgraph/pregel/_executor.py`：`if pending := {...}: concurrent.futures.wait(pending)`）。在 Windows 上这个锁等待**不会执行 Python 层的信号处理器**，于是 Ctrl+C 只能"排队"到当前节点返回为止——实测（12 秒的 shell 命令，第 3 秒发 SIGINT）：
+
+```text
+[t+ 0.06] register pid=34436            # 命令已登记在跑的清单里
+[t+ 3.02s] sending SIGINT               # 按下 Ctrl+C
+[t+12.53] UNREGISTER pid=34436 rc=0     # 命令自己跑完了，处理器这时才运行
+[t+12.55s] KeyboardInterrupt reached the caller    # 反应延迟 9.55s，且子进程活到了最后
+```
+
+修好之后同一实验：
+
+```text
+[t+ 3.02s] sending SIGINT (running shell commands: 1)
+interrupt received - stopped 1 running command(s): finishing the current step, ...
+[t+ 3.11] UNREGISTER pid=13980 rc=1     # 命令被杀掉
+[t+ 3.11s] KeyboardInterrupt reached the caller    # 反应延迟 0.11s，子进程没活下来
+```
+
+具体做法（`cli/app.py::_InterruptGuard` + `tools/bash_tool.py`）：
+
+- bash 工具把每个在跑的子进程登记到一张进程级清单里，跑完就注销；`kill_running_commands()` 可以随时杀掉它们（`taskkill /F /T` / `killpg`）。
+- CLI 运行期间安装 `_InterruptGuard`：它用 `signal.set_wakeup_fd`（C 层处理器**立刻**写一个字节）+ 一个守护线程 `select` 这个 fd，所以**不等主线程**就能反应——打印提示、杀掉在跑的命令，节点于是马上返回。
+- 第一次 Ctrl+C：提示 + 杀命令，随后主线程的 `KeyboardInterrupt` 照常走完（检查点与 trace 记为 `interrupted`，退出码 130）。第二次 Ctrl+C：直接 `os._exit(130)`，不再等线程或子进程（长模型调用杀不掉，这是逃生口）。
+- 局限（如实说明）：正在进行的**模型 HTTP 调用**无法中断，第一次 Ctrl+C 后仍需等它返回；那时按第二次即可立刻退出。
+
+三个模式参数用 `Annotated[Literal[...], typer.Option(..., envvar=...)]` 声明（`ApprovalMode` / `CheckpointMode` / `TraceMode`）：`--help` 里直接列出可选值（`<inline|auto|deny>` 等），**非法值会被 click 当场拒绝**（退出码 2，例如 `--approval-mode junk` 报 `'junk' is not one of …`），环境变量写错也同样拒绝（报错里会带上 `env var: 'WQ_APPROVAL_MODE'`）；大小写不敏感（`--trace-mode ON` = `--approval-mode DENY` 都接受，随后由 `normalize_*()` 归一化）。库层面仍保留「非法值回落默认」的宽容语义（`normalize_approval_mode()` 等）。`--show-config` 的 `approval/checkpoints/traces/workspace` 行会附上取值来源 `(cli|env|default)`（由 `ctx.get_parameter_source()` 得出），例如：
+
+```text
+workspace   : D:\ai-python-prompt\WQAgent (exists) (cli)
+approval    : inline (default)
+traces      : full (env)
+```
 
 ## 项目结构
 
@@ -138,11 +181,16 @@ src/wqagent/
 ├── __main__.py            # python -m wqagent
 ├── core/
 │   ├── __init__.py
-│   ├── state.py           # RuntimeState 数据类（workspace、超时、输出预算、命令黑名单）
+│   ├── state.py           # RuntimeState 数据类（workspace、超时、输出预算、命令黑名单、审批/检查点/追踪策略）与 create_runtime()
+│   ├── approval.py        # 风险命令分类（RISK_PATTERNS）与审批请求/决策
+│   ├── checkpoint.py      # 断点保存/恢复：checkpoint.json、RECOVERY.md、git 快照
+│   ├── session.py         # 会话：session.json + SESSION_SUMMARY.md + 上下文块
+│   ├── trace.py           # 执行追踪：trace.json、events.jsonl、timeline.md
 │   ├── paths.py           # 工作区路径工具（resolve_in_workspace 等）
-│   └── agent.py           # 入口：驱动 LangGraph 工作流并翻译事件；react_loop/Agent 是图内 ReAct 引擎
+│   └── agent.py           # 入口：驱动 LangGraph 工作流并翻译事件；stream_session_events() 负责一轮对话
 ├── prompts/
 │   ├── __init__.py
+│   ├── entry.py           # INTENT_ROUTER_PROMPT + CHAT_RESPONDER_PROMPT（入口图）
 │   ├── stage1.py          # ACTOR_PROMPT（早期 actor 节点的系统提示词，保留）
 │   ├── stage2.py          # FINAL_PROMPT（并转出 PLANNER_PROMPT / VERIFIER_PROMPT / ACTOR_PROMPT）
 │   ├── stage3.py          # PLANNER_PROMPT（主管）+ VERIFIER_PROMPT + SEARCH_AGENT_PROMPT / CODE_AGENT_PROMPT
@@ -156,7 +204,7 @@ src/wqagent/
 │   ├── state.py           # LangGraph 共享状态：WQGraphState / TodoItem / SourceItem / AgentHandoff
 │   ├── memory.py          # 三层 Memory：RULES_LAYER / build_layered_memory / NOTEPAD.md 读取
 │   ├── nodes.py           # planner / context_monitor / context_compressor / verifier / final + 路由
-│   └── workflow.py        # build_workflow()（短流程）与 build_complex_workflow()（带上下文管理）
+│   └── workflow.py        # build_entry_workflow()（意图路由）、build_workflow()（短流程）与 build_complex_workflow()（带上下文管理）
 ├── tools/
 │   ├── __init__.py
 │   ├── registry.py        # build_tools(state) / build_read_only_tools(state)
@@ -170,25 +218,304 @@ src/wqagent/
 │   └── openai_provider.py # create_model() / load_env() / describe_config()
 └── cli/
     ├── __init__.py
-    └── app.py             # typer 入口，wq 命令（消费事件流并实时渲染）
+    ├── app.py             # typer 入口，wq 命令（消费事件流并实时渲染；--tui 交给 cli/tui）
+    └── tui/
+        ├── __init__.py    # run_tui()：可选依赖的懒加载与友好报错
+        ├── logo.py        # 启动 Logo：ASCII Art + rich 渐变 + 揭幕动画（自动降级）
+        ├── app.py         # WQAgentTuiApp：Plan 面板 / 事件流 / 状态栏 / 输入框
+        └── approval.py    # ApprovalModal（弹窗）+ ApprovalGate（工具线程 ↔ UI 线程握手）
 
-tests/                     # pytest：路径围栏、5 个工具、ReAct 事件流、图状态、两个专家、CLI 端到端（含真实 HTTP）
+tests/                     # pytest：路径围栏、5 个工具、ReAct 事件流、图状态、两个专家、CLI 端到端（含真实 HTTP）、命令审批、断点恢复、执行追踪、会话、TUI
 ```
+
+### 多轮入口：`stream_session_events()`
+
+`stream_agent_events()` 是"一次运行"，`stream_session_events()` 是"**一轮对话**"：把会话读写、意图路由和收尾打包在一起（[core/agent.py](src/wqagent/core/agent.py)）。
+
+```python
+from wqagent.core.agent import stream_session_events
+
+for event in stream_session_events("继续加个登录接口", session_workspace="./demo"):
+    print(event["type"], event.get("node", ""), event.get("route", ""))
+```
+
+它依次做六件事（对应实现里的六步）：
+
+1. `load_or_create_session(session_workspace)`——读 `.wqagent/session/session.json`，没有就新建；
+2. `append_user_turn(session, task)` 记录用户这一轮，**并立刻落盘**（这样第 4 步里入口节点与 Memory 从磁盘读到的就是本轮编号）；
+3. `build_session_context()` 构建上下文块（会话 id、轮次、最近 30 个文件、最近 10 轮）；
+4. 跑入口图：`chat` → `chat_responder` 直接答（不碰工具）；`workflow` → `build_complex_workflow()` 全流程；
+5. `append_assistant_turn(route=最终事件的 route, summary=回答首句)` + `save_session()`（写 `session.json` 与 `SESSION_SUMMARY.md`）；
+6. 收尾发一条 `session_saved` 事件：
+
+```python
+{"type": "session_saved", "session_id": "…", "turn": 1, "reply_turn": 2,
+ "turn_index": 2, "route": "chat", "path": ".../session.json",
+ "summary_path": ".../SESSION_SUMMARY.md", "turns": 2, "saved": True}
+```
+
+**上下文对两边都生效**：入口节点从磁盘读（所以"继续"能被理解成对上一轮工作的跟进）；工作流的每个节点则通过 **Memory 第三层**拿到它——`build_layered_memory()` 里新增了 `read_session()`/`session` 字段（与 `notepad`、`history_summary` 并列，上限 `SESSION_CHARS = 1600`），所以 planner / verifier / codeAgent 都知道"之前聊过什么"。
+
+关键参数：`session_workspace=`（必填，也是运行的工作区；`workspace=` 是别名）、`session=`（复用内存里的会话，省一次读盘）、`save=False`（只更新内存、不写盘）、`entry_router=False`（跳过路由、一律走工作流）、以及 `model` / `max_attempts` / `max_loops` / `approval_mode` / `approval_handler` / `checkpoint_mode` / `trace_mode` / `graph` / `on_event`。
+
+实测（同一工作区两轮）：
+
+```
+turn 1: chat     → session_saved{turn: 1, reply_turn: 2, turns: 2, route: chat}
+turn 2: workflow → final_answer{route: workflow, passed: True} / nodes: intent_router → planner → context_monitor → verifier → context_monitor → final
+         session.json: [(1,'user'),(2,'assistant','chat'),(3,'user'),(4,'assistant','workflow')]
+```
+
+运行被 Ctrl-C 或异常打断时：用户那一轮已经落盘，不会记助手轮（对话不会被悄悄重置）。
+
+## TUI（`wq --tui`，Textual）
+
+### 启动 Logo（`cli/tui/logo.py`）
+
+启动时先由 **rich** 画一块 ASCII Art 横幅（带颜色；终端上还有"逐行揭幕 + 色块扫过"的动画，约 0.5 秒）：
+
+```
+  🐺 WQ Agent
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Stage 6 · MultiAgent + Context/Harness
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ██╗    ██╗ ██████╗
+  ██║    ██║██╔═══██╗
+  ██║ █╗ ██║██║   ██║
+  ██║███╗██║██║▄▄ ██║
+  ╚███╔███╔╝╚██████╔╝
+   ╚══╝╚══╝  ╚══▀▀═╝
+```
+
+字标用方块字符（`██╗` 一类），从左到右走一条 cyan→magenta 渐变；揭幕期间未出现的列是暗色、正被扫过的那一列高亮。控制方式（环境变量，不用改代码）：
+
+| 变量 | 作用 |
+| --- | --- |
+| `WQ_NO_LOGO=1` | 完全不打印 logo |
+| `WQ_NO_ANIMATION=1` | 只打印静态横幅（不播动画） |
+
+其余自动降级：**非终端**（重定向到文件/管道）只画一次、不播动画；控制台编码装不下 `━`/`🐺`（例如 GBK）时自动换成**纯 ASCII 版**（`WQ Agent` + `-` 规则行 + `##` 字标）；动画预算超过 1.5 秒自动转静态；任何异常都被吞掉（logo 永远不会拖垮启动）。
+
+```python
+from rich.console import Console
+from wqagent.cli.tui.logo import print_logo, logo_lines, logo_text, frames_of
+
+print_logo(Console())                     # 终端上带动画，否则静态
+print_logo(Console(), animate=False)      # 强制静态
+print_logo(Console(), ascii_only=True)    # 强制纯 ASCII
+logo_lines()                              # 纯文本行（无颜色）
+len(frames_of(Console()))                 # 动画帧数（可预览/测试）
+```
+
+### 启动 TUI
+
+三步启动（`--tui` **不需要 TASK**，进界面后再输入）：
+
+```powershell
+# 1) 装可选依赖（本仓库的 .venv 里已经装好 textual 8.2.8）
+pip install "wqagent[tui]"           # 或 pip install textual
+
+# 2) 启动（-w 指定工作区；不写就用 ./workspace）
+wq --tui -w .\demo
+
+# 等价入口
+python -m wqagent --tui
+```
+
+进界面后：底部输入框打字 → **Enter** 提交，每次提交就是一个 session turn；`Ctrl+L` 清屏，`Ctrl+C` 退出。其余参数照常在命令行给（`--approval-mode auto`、`--trace-mode full`、`--no-router`、`--max-attempts` 等都会带进 TUI）：
+
+```powershell
+wq --tui -w .\demo --approval-mode auto --trace-mode full
+```
+
+常见情况：
+
+- **必须在真实终端里跑**（Windows Terminal / PowerShell 窗口 / VS Code 终端都行）：Textual 需要 TTY，重定向到管道或文件时会报终端相关错误 ✗；
+- 没装 textual 时不会崩，会打印 `the TUI needs the optional 'textual' dependency: pip install "wqagent[tui]"` 并退出码 2；
+- 会话仍然落在工作区里（`.wqagent/session/`），所以 `--tui` 与普通 `wq "<task>"` 交替使用是**同一条会话**；
+- 危险命令会弹出审批弹窗，`Y`/Enter 批准、`N`/Esc 拒绝，超时（`WQ_APPROVAL_TIMEOUT`，默认 300 秒）按拒绝处理。
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ 🐺 WQ Agent   ● ready                     session: 8f3c1d2e · turn 2 │  brand bar
+├──────────────────────────────────────────────────────────────────────┤
+│ ╭ Plan ────────────────────────────────────────────────────────────╮ │
+│ │ ▰▰▰▱▱▱▱▱▱▱  1/3 done  ·  build the FastAPI app                    │ │
+│ │ ✅ scaffold   🔄 auth-router   ⬜ tests                            │ │
+│ ╰──────────────────────────────────────────────────────────────────╯ │
+│ ╭ Activity ────────────────────────────────────────────────────────╮ │
+│ │  💬 帮我搭一个 FastAPI 后台管理系统，包含用户认证                   │ │
+│ │  🧭 route · workflow [0.92] needs files                           │ │
+│ │  🔧 codeAgent · file_write → file_path=app/main.py                │ │
+│ │  ✔ codeAgent · file_write: Created app/main.py                    │ │
+│ │  🔄 handoff · planner → codeAgent: add the JWT auth router        │ │
+│ │  ✖ verifier · bash: exit 1: 2 failed                              │ │
+│ │  💾 checkpoint · running/verifier (4 files, git 9ad3b835)         │ │
+│ │  📝 Done — FastAPI app with JWT auth scaffolded in app/main.py.   │ │
+│ ╰──────────────────────────────────────────────────────────────────╯ │
+│ ╭──────────────────────────────────────────────────────────────────╮ │
+│ │ ›  ask WQ Agent…                                                 │ │  input bar
+│ ╰──────────────────────────────────────────────────────────────────╯ │
+│ Enter send   ·   Ctrl+L clear   ·   Ctrl+C quit                      │  hints
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+样式要点：深蓝灰底 + 青/紫强调色（与启动 Logo 同一套配色）；品牌栏左侧是 `🐺 WQ Agent` 加状态点（`● ready` / 转圈 `⠋ working` / `● needs approval`），右侧右对齐显示 `session · turn`；**Plan 卡片**用圆角边框 + border title，内含 `▰▰▱▱` 进度条、`done/total`、计划摘要与 `✅/🔄/⛔/⬜` 芯片，没有计划时整卡隐藏（不占空间）；**Activity 卡片**按事件类型着色（用户白色加粗、工具调用青、成功绿、失败红、交接紫、检查点暗灰、最终答复绿底加粗），每条带 `node · tool` 归因，轮次之间画一条暗色分隔线，超过 400 行自动丢弃最旧的；输入区是圆角条 + 青色 `›` 提示符（聚焦时边框变青）；底部一行快捷键提示（不再占用 Footer 空间）。
+
+**机制**（[cli/tui/app.py](src/wqagent/cli/tui/app.py)）：
+
+1. 每次回车就是**一个 session turn**：起一条后台线程跑 `stream_session_events()`（`session=` 在内存里连续传递，所以多轮对话与 `wq` 命令行走的是同一条会话）；
+2. 线程里每个事件都 `post_message(AgentEventMessage(...))` 送到 UI 线程（Textual 的 `Message` 支持跨线程投递）；
+3. UI 按类型分发：`todo_update` / `node_end`(带 todos) / `plan_snapshot` → **Plan 面板**；`tool_call` / `tool_result` / `handoff` / `checkpoint_saved` / `context_compressed` / `search_results` / `intent` → **事件流**；`final_answer` → 结果行 + 状态栏 `✔ passed`；`session_saved` → 更新 session id 与轮次；
+4. 上一轮没跑完时再提交会被挡下（提示 `still working`），`Ctrl+L` 清屏，`Ctrl+C` 退出。
+
+**审批弹窗**（[cli/tui/approval.py](src/wqagent/cli/tui/approval.py)）：
+
+```
+⚠  approval required
+tool      : BashTool
+risk      : Python package installation
+approval  : approval-1a2b3c4d
+workspace : D:\demo
+$ pip install fastapi
+[ Approve (Y) ]  [ Deny (N) ]
+Y / Enter approves · N / Esc denies · no answer within 300s = denied
+```
+
+线程同步靠 `ApprovalGate`：BashTool 在自己的线程里调用 handler → 建 gate → `post_message(ApprovalRequestedMessage)` → app 弹出 `ApprovalModal` → 用户按键后 `gate.resolve(approved)` → 工具线程从 `gate.wait()` 返回（`WQ_APPROVAL_TIMEOUT` 兜底，超时按"拒绝"，绝不会把工具线程挂死）。按钮与快捷键等价（`Y`/Enter 批准，`N`/Esc 拒绝）。
+
+Textual 缺失时 `--tui` 不会崩：打印 `the TUI needs the optional 'textual' dependency: pip install "wqagent[tui]"` 并以退出码 2 结束（普通 CLI 完全不依赖它）。
+
+## 会话（`core/session.py`）
+
+同一个工作区里的多次对话算**一个会话**，落在工作区内：
+
+```
+<workspace>/.wqagent/session/
+    session.json         机器可读记录
+    SESSION_SUMMARY.md   人读的同一段故事
+```
+
+```json
+{
+  "session_id": "uuid", "turn_index": 3,
+  "recent_turns": [
+    {"turn": 1, "role": "user", "content": "...", "timestamp": "..."},
+    {"turn": 2, "role": "assistant", "route": "workflow", "content": "...", "summary": "...", "timestamp": "..."},
+    {"turn": 3, "role": "user", "content": "...", "timestamp": "..."}
+  ],
+  "created_at": "...", "updated_at": "..."
+}
+```
+
+```python
+from wqagent.core.session import (
+    load_or_create_session, append_user_turn, append_assistant_turn,
+    save_session, build_session_context,
+)
+
+session = load_or_create_session(workspace)          # 缺文件/坏文件都安全新建
+turn = append_user_turn(session, "帮我搭个 FastAPI 后台")   # -> 1
+append_assistant_turn(session, turn=turn, route="workflow",
+                      content="Done: app/main.py", summary="built the skeleton")  # -> turn 2
+save_session(workspace, session)                     # 写 session.json + SESSION_SUMMARY.md
+print(build_session_context(workspace, session))     # 给 intent_router / chat_responder 的上下文块
+```
+
+- **轮次编号**：`append_user_turn` 自增并返回编号；`append_assistant_turn(turn=用户轮次)` 记在**下一号**（与上面示例一致），传入更大的号则按传入的记。`turn_index` 始终是已发出的最大号。
+- **上限**：单条内容 `MAX_TURN_CONTENT = 4000` 字符；磁盘上保留最近 `MAX_RECENT_TURNS = 40` 轮；**上下文块**只取最近 `CONTEXT_TURNS = 10` 轮 + 最近 `CONTEXT_FILES = 30` 个文件（按 mtime 倒序，跳过 `.wqagent/`），总长硬性 ≤ `MAX_SESSION_CONTEXT = 7000`（先丢最老的轮次，再砍文件清单，最后才截断开头并留 `...[earlier session context omitted]...`）。
+- **不抛异常**：JSON 坏了 / 字段类型不对 → 归一化成可用会话；写盘失败只写进 `last_error`（并出现在 SUMMARY 末尾），不会打断运行。
+- **接到哪里**：CLI 每次运行前 `load_or_create_session` + `append_user_turn`（并写进 `RuntimeState.session_id/session_turn`，再随 `new_graph_state` 进入图状态与 Memory 快照），运行结束后 `append_assistant_turn`（`route` 取自 `final_answer`，`summary` 取回答首句）+ `save_session`；被 Ctrl-C/异常打断时只保存用户那一轮。入口图的 `intent_router_node`/`chat_responder_node` 通过 `_session_context()` 把上面这个上下文块（以及本轮压缩摘要、上一轮 todo、最近 6 条对话）一起注入提示词——所以"继续/修一下"这类跟进能接上上文。
+
+实测（连跑两次 `wq` 后）：
+
+```
+$ wq "你好" -w .\demo          → session.json: turn_index 2, [user, assistant] (chat)
+$ wq "继续" -w .\demo          → session.json: turn_index 4, 四条记录，router 的提示词里带着上一轮
+```
+
+## 入口图：意图路由（`graph/workflow.py::build_entry_workflow`）
+
+在主工作流之前先跑一张两节点的小图，决定这句话是**聊天**还是**任务**：
+
+```
+START ──▶ intent_router ──┬─(chat)─────▶ chat_responder ──▶ END
+                          │
+                          └─(workflow)─────────────────────▶ END
+                                                            （调用方接着跑主工作流）
+```
+
+- `intent_router_node`：一次模型调用，要求返回 `{"route":"chat"|"workflow","reason":"...","confidence":0.0-1.0}`；提示词是 `INTENT_ROUTER_PROMPT`（含"`继续`/`修一下`/`运行测试` 若指向前序工作区工作 → workflow"的规则），输入是**用户输入 + session 上下文**（session id / 压缩摘要 / 上一轮计划 / 最近 6 条对话，绝不含工作区事实）。
+- **不确定就干活**：JSON 解析失败、route 不是这两个值、或 `confidence < 0.55`（`INTENT_CONFIDENCE_THRESHOLD`）→ 一律走 `workflow`；路由器自身抛异常也只降级成 workflow，不打断运行。
+- `chat_responder_node`：**不绑定任何工具**（测试断言 `model.bound == []`），用 `CHAT_RESPONDER_PROMPT` 直接回答，返回 `{chat_response, final_answer}`；提示词明确禁止声称读过文件/跑过命令/搜过网。
+- `intent_route_fn(state)`：`"chat" → "chat_responder"`，否则 `"planner"`（在入口图里就是 `END`）。
+
+```python
+from wqagent.graph import build_entry_workflow, new_graph_state
+
+app = build_entry_workflow(model=chat_model)
+result = app.invoke(new_graph_state("你好", runtime))
+result["intent_route"]      # "chat" | "workflow"
+result["intent_confidence"] # 0.0 - 1.0
+result["intent_reason"]     # 一句话理由
+```
+
+**接入方式**：`stream_agent_events(..., entry_router=True)`（默认 **off**，库行为不变）；CLI 默认打开，`--no-router` 关闭，`--resume` 时自动跳过（续跑显然是任务）。事件流多两个事件：`intent`（带 route/reason/confidence）与 `chat_response`；`final_answer` 多一个 `route` 字段：
+
+```python
+{"type": "final_answer", "content": "...", "passed": True, "attempts": 0,
+ "stopped_early": False, "route": "chat", "intent_route": "chat",
+ "intent_reason": "greeting", "intent_confidence": 0.95}
+```
+
+CLI 表现（`wq "你好"`）：
+
+```
+   🧭 chat (answer directly)
+📝 Final
+┌──────────────────────────────── chat ────────────────────────────────┐
+│ 你好！我是 WQ Agent，可以帮你写代码、跑命令、查资料。                │
+└──────────────────────────────────────────────────────────────────────┘
+route  chat (no tools, no workspace changes)
+why    greeting [0.95]
+give it a task ("...") if you wanted work done - or pass --no-router to always run the workflow
+```
+
+即使走 chat 分支，检查点与 trace 照样收尾写入（`status: passed`，`task`/`intent_route` 都在 `checkpoint.json` 里），所以"这次只是聊了两句"同样可追溯。
 
 ## 事件流与 CLI 输出
 
-[`stream_agent_events()`](src/wqagent/core/agent.py) 是 agent 的入口：它**不再自己跑裸的 ReAct 循环**，而是用 `build_workflow().stream(inputs, stream_mode=["updates", "custom"])` 驱动整张图，把两种 chunk 翻译成一条扁平事件流：
+[`stream_agent_events()`](src/wqagent/core/agent.py) 是 agent 的入口：它**不再自己跑裸的 ReAct 循环**，而是用 `build_complex_workflow().stream(inputs, stream_mode=["updates", "custom"])` 驱动整张图，把两种 chunk 翻译成一条扁平事件流：
 
 - `custom` chunk = planner 与两个专家的 ReAct 事件（带 `node` 标签）→ 原样转发；
 - `updates` chunk = 每个节点的状态更新 → 转成 `node_end` 事件；
-- 结束时汇总出一条 `final_answer`（取自 `final` 节点的文本 + verifier 的裁决）。
+- 每个事件同时喂给 `TraceRecorder` 记统计；`CheckpointManager` 在**开始时、每个节点边界、以及 `handoff`/`context_compressed` 这类里程碑事件之后、结束时**落检查点；
+- 结束时先落最终检查点与 `trace_saved`，再汇总出一条 `final_answer`（取自 `final` 节点的文本 + verifier 的裁决）。
 
 ```python
 from wqagent.core.agent import stream_agent_events
 
-for event in stream_agent_events("给 utils.py 加一个 slugify 函数并测试", workspace="./demo"):
+for event in stream_agent_events(
+    "给 utils.py 加一个 slugify 函数并测试",
+    workspace="./demo",
+    approval_mode="inline",     # 风险命令策略（None → $WQ_APPROVAL_MODE）
+    approval_handler=ask_human, # inline 模式下问谁；None 表示拒绝
+    checkpoint_mode="light",    # light / strict / off
+    trace_mode="on",            # summary（=on）/ full / off
+):
     print(event["type"], event.get("node", ""), event)
+
+# 从检查点继续（等价于 wq --resume <workspace>）：
+for event in stream_agent_events("", resume_workspace="./demo", model=chat):
+    ...
 ```
+
+签名（其余参数见下）：`stream_agent_events(task, *, workspace=None, max_attempts=None, max_loops=None, model=None, state=None, inputs=None, graph=None, approval_mode="inline", approval_handler=None, checkpoint_mode="light", resume_workspace=None, trace_mode="on", resume_event=None, on_event=None)`。
+
+- **`state=` 优先**：给了现成的 `RuntimeState`（CLI 就是这么做的）时，它与它的模式设置为准，上面那几个模式参数只在本函数**自己创建** runtime 时生效（`create_runtime()`，见 `core/state.py`）。
+- **状态词汇**：检查点的 `status` 依次是 `started`（开局）→ `running`（每次节点切换）→ 终局 `passed` / `failed`；`Ctrl-C` 或异常中断时写 `interrupted` / `failed` 并**把异常继续抛出去**（CLI 自己决定退出码），所以中断的运行也有完整检查点与 trace。
+- **事件保持扁平**（`event["type"]`），没有 `{"type": "custom_event", "event": ...}` 包装——CLI 渲染器、`_EventSummary` 与既有测试都按扁平协议消费。
+- `events.jsonl`（`strict` 检查点 / `full` trace）里 `node_end` 的 `update` 会省略 `messages`（对话在 `state.json` 里；否则每个节点都要重抄一遍对话）：事件流给调用方的仍是**完整** update。
 
 | 事件 | 字段 | 含义 | CLI 表现 |
 | --- | --- | --- | --- |
@@ -200,6 +527,8 @@ for event in stream_agent_events("给 utils.py 加一个 slugify 函数并测试
 | `search_results` | `node`, `query`, `results`, `ok` | searchAgent 一次搜索的命中 | 灰色 `↳ N result(s) for '...'` |
 | `todo_update` | `node`, `todos`, `notes` | codeAgent 同步了 todo 状态 | 灰色 `↳ plan: t1=completed` |
 | `node_end` | `node`, `update` | 某个图节点（planner/verifier/final）产出 | 📋 Planner / ✅❌ Verifier / 📝 Final 分段展示 |
+| `checkpoint_saved` | `status`, `latest_node`, `files`, `git_commit`, `resume_command` | 落了一个检查点 | 默认不打印；失败时黄字，`-v` 时灰字一行 |
+| `trace_saved` | `trace_id`, `path`, `tool_calls`, `node_visits`, … | 本次运行的追踪已写完 | 默认不打印；`-v` 时灰字统计 + 路径 |
 | `final_answer` | `content`, `passed`, `attempts`, `stopped_early` | 最终回答（**最后一个事件**） | 绿色（通过）/ 红色（未通过）面板 |
 
 `wq` 的实际输出长这样：
@@ -525,7 +854,7 @@ result = run_code_agent(state, "t2: 补上 slugify 并跑通 pytest", writer=emi
 | `file_write` | `file_path`, `content` | 创建或整文件覆盖，自动创建父目录 |
 | `file_edit` | `file_path`, `old_text`, `new_text` | 替换**唯一**匹配片段；0 个匹配或多个匹配都返回错误（含重复行号）；自动兼容 CRLF |
 | `grep` | `pattern`, `path="."`, `glob`, `head_limit=100`, `ignore_case` | 正则搜索，输出 `路径:行号: 内容`；跳过二进制/隐藏目录/`node_modules` 等；`WQ_DISABLE_RIPGREP=1` 可强制使用内置扫描器 |
-| `bash` | `command`, `timeout_seconds` | 在 workspace 根目录执行命令，返回退出码、stdout、stderr；超时杀掉整个进程树；工具描述里会写明本机 shell 名称（Windows 上是 Windows PowerShell / pwsh），提示模型使用对应语法 |
+| `bash` | `command`, `timeout_seconds` | 在 workspace 根目录执行命令，返回退出码、stdout、stderr；超时杀掉整个进程树；工具描述里会写明本机 shell 名称（Windows 上是 Windows PowerShell / pwsh），提示模型使用对应语法；**风险命令（装包 / 下载 / 起服务）要过审批**，见下节 |
 | `todo_write` | `plan_summary`, `todos`, `acceptance_criteria`, `verification_commands` | planner 用它发布/修订计划（参数经 `_coerce_todos` 归一化，坏参数只降级不抛异常） |
 | `todo_update` | `updates` | codeAgent 边做边更新待办状态（`id` + `status` 等） |
 | `verification_report` | `passed`, `reason`, `checks`, `recommended_next_instruction` | verifier 的结构化判决（判决走严格布尔解析） |
@@ -534,6 +863,252 @@ result = run_code_agent(state, "t2: 补上 slugify 并跑通 pytest", writer=emi
 | `web_search` | `query`, `max_results`, `search_depth` | **searchAgent 专用**：Tavily 联网搜索 |
 
 工具失败不会抛异常打断循环，而是返回以 `Error:` 开头的字符串（事件流里转成 `ok: false`），让模型自行修正参数后重试。
+
+## 执行追踪（`core/trace.py`）
+
+每次运行都会留下一条时间线，用于事后复盘「它到底做了什么、花了多久、哪一步失败」。
+
+| 模式 | 写什么 |
+| --- | --- |
+| `summary`（默认） | `trace.json`（计数 + 时间线首尾）、`timeline.md`（人读版） |
+| `full` | 上述全部，**外加** `events.jsonl`（每个事件一行 JSON，带 `seq`） |
+| `off` | 什么都不写，`end()` 返回 `None` |
+
+```
+<workspace>/.wqagent/traces/<trace_id>/
+    trace.json     统计概览 + timeline_head/tail
+    events.jsonl   full：原始事件日志
+    timeline.md    人类可读时间线
+```
+
+```python
+from wqagent.core.trace import TraceRecorder
+
+recorder = TraceRecorder(runtime, "write hello.py")   # trace_id 默认取 runtime.trace_id
+recorder.start(inputs, resumed=False)                 # run_start
+recorder.record_custom_event(event)                   # 统计：tool_call / failed tool_result / approval / handoff / checkpoint
+recorder.record_graph_update(node_end_event)          # node_visits[node] += 1
+trace = recorder.end(status="passed", latest_node="final", final_state=state)
+# trace["node_visits"] / tool_calls / failed_tool_calls / approval_count /
+# checkpoint_count / handoff_count / timeline_head(20) / timeline_tail(80) / timeline_omitted
+```
+
+`trace.json` 字段：`trace_id`、`task`、`status`、`latest_node`、`started_at`、`ended_at`、`duration_ms`、`node_visits`、`tool_calls`、`failed_tool_calls`、`approval_count`、`checkpoint_count`、`handoff_count`、`timeline_total/head/tail/omitted`，另附 `passed`、`attempts`、`final_answer`、`last_error`。
+
+实测（离线跑一次完整工作流）：
+```
+trace_saved: {'trace_id': 'wq-20261003-100814-0ec4', 'mode': 'full', 'status': 'passed',
+              'tool_calls': 3, 'failed_tool_calls': 0, 'checkpoint_count': 6,
+              'handoff_count': 1, 'duration_ms': 2902}
+files: ['events.jsonl', 'timeline.md', 'trace.json']
+node_visits: {'planner': 1, 'context_monitor': 2, 'verifier': 1, 'final': 1} | timeline: 30 omitted: 0
+
+# Trace wq-20261003-100814-0ec4
+**Status:** passed (latest node: final) | **Duration:** 2.90s
+**Nodes:** planner x1, context_monitor x2, verifier x1, final x1
+**Counters:** 3 tool calls (0 failed), 0 approval(s), 6 checkpoint(s), 1 handoff(s)
+| 4 | 10:08:14 | tool_call | todo_write(plan_summary=do the thing, ...) |
+| 8 | 10:08:14 | handoff | planner -> codeAgent: write hello.py |
+```
+
+- **统计口径**：`tool_call` → `tool_calls++`；`tool_result` 且 `ok=False` → `failed_tool_calls++`；命令审批过的结果（结构化 `requires_approval` 或渲染文本里的 `requires_approval: True`）→ `approval_count++`；`handoff` / `checkpoint_saved` → 各自计数；`node_end` → `node_visits[node]++`。
+- **时间线截断**：`trace.json` 只留**前 20 + 后 80** 条（`timeline_omitted` 记录省略数），这样几百步的运行也不会把概览撑爆；`timeline.md` 同样展示首尾并写明省略条数。
+- **`summary` 与 `full` 的区别只有 `events.jsonl`**：统计与时间线两种模式都有。
+- 追踪写盘失败（目录不可写）只退化成「内存里继续统计」，绝不影响运行；`off` 模式下 `start` 返回 `None`、记账全部跳过、`end()` 返回 `None`。
+- CLI：横幅显示 `trace : summary (WQ_TRACE_MODE), id wq-…`，`-v` 下每次运行结束打印一行统计与 `trace.json` 路径。
+
+## 断点保存与恢复（`core/checkpoint.py`）
+
+运行被打断（Ctrl-C、断网、模型报错、进程被杀）后，可以原地接着跑。三种模式：
+
+| 模式 | 写什么 | 何时写 |
+| --- | --- | --- |
+| `light`（默认） | `checkpoint.json`（元数据 + 状态摘要）、`RECOVERY.md`、git 快照 | 每次节点切换 + 结束（`passed`/`failed`） |
+| `strict` | 上述全部，**外加** `state.json`（含完整对话）与 `events.jsonl`（每个事件一行） | 同上；事件随到随写 |
+| `off` | 什么都不写（`--checkpoint-mode off` / `WQ_CHECKPOINT_MODE=off`） | — |
+
+```
+<workspace>/.wqagent/checkpoints/
+    checkpoint.json   元数据 + 状态摘要（resume 读它）
+    RECOVERY.md       人类可读的恢复指南（任务/状态/文件清单/git commit/恢复命令）
+    state.json        strict：完整 state
+    events.jsonl      strict：每行一个事件
+    git/              内部快照仓库（永远不碰工作区自己的 .git）
+```
+
+```python
+from wqagent.core.checkpoint import CheckpointManager
+
+manager = CheckpointManager(runtime, "write hello.py")     # 也可 CheckpointManager(runtime)
+event = manager.save(state, status="running", latest_node="verifier")
+# {"type": "checkpoint_saved", "mode", "status", "latest_node", "files",
+#  "git_commit", "git_ok", "strict", "resume_command", ...}
+
+inputs, resume_event = CheckpointManager.load_resume_inputs(runtime, max_attempts=3)
+# inputs 可直接当 stream_agent_events(inputs=...) 的输入；没有检查点时是 (None, event)
+```
+
+- **git 快照是内部的**：用 `git --git-dir=<root>/git --work-tree=<workspace>`，所以工作区**自己的仓库不受影响**（测试断言工作区没有多出 `.git`）；`info/exclude` 排除 `.wqagent/` 与 `.git/`，提交时带 `user.name/email`、`commit.gpgsign=false`、`core.autocrlf=false`、`core.hooksPath=<空目录>`、`gc.auto=0`，并清掉继承来的 `GIT_DIR` 等变量。git 缺失或失败只降级成「有检查点、无快照」，不影响运行。
+- **摘要与元数据分开**：`checkpoint.json` 是 `{元数据…, workspace_manifest, git, state: {状态摘要}}`，所以 `load_resume_inputs` 重建出来的 inputs 里**只有真正的 state 键**。（这里踩过一个真 bug：元数据曾与状态摘要平铺在一起，恢复后的运行把旧的 `status/latest_node` 带进新检查点，导致每次保存都写成同一个值；已有回归测试。）
+- **恢复语义**：先把 git 快照里的文件 `checkout` 回工作区（快照之后新增的文件保留；被覆盖的文件数写进 `resume` 事件的 warning），然后重建 inputs —— `light` 只有摘要+计划+计数器（无对话，事件里提示 "transcript was not checkpointed"），`strict` 连对话一起恢复（`AIMessage` 的 `tool_calls`、`ToolMessage` 的 `tool_call_id` 原样重建）。
+- 命令行：`wq --resume <workspace>`（`resume_command()` 生成的就是这条），恢复时打印 resume 面板（任务/状态/恢复了几个文件/消息数/警告）；运行失败或被 Ctrl-C 时提示 `resume with: wq --resume <workspace>`。
+
+## 命令审批（`core/approval.py`）
+
+工作区围栏管的是**路径**，审批管的是**有副作用的命令**。两道闸门顺序是：先过破坏性黑名单（`rm -rf /` 这类直接拒绝），再过风险分类。
+
+```python
+from wqagent.core.approval import classify_command_risk
+
+classify_command_risk("pip install requests")      # "Python package installation"
+classify_command_risk("pytest -q && npm install")  # "Node package installation"
+classify_command_risk("echo 'pip install x'")      # None —— 只是提到，没有执行
+```
+
+`RISK_PATTERNS` 覆盖：`pip install`（含 `python -m pip`）、`uv add` / `uv sync` / `uv pip install`、`npm` / `pnpm` / `yarn install|add`、`curl` / `wget`、`uvicorn`、`python -m http.server`。匹配要求出现在命令开头或 `&&` / `||` / `;` 之后，并且**大小写不敏感**（Windows shell 不区分大小写）。
+
+| 模式 | 行为 |
+| --- | --- |
+| `inline`（默认） | 构造 `ApprovalRequest(id="approval-xxxxxxxx", command, risk_reason, tool_name)` 交给运行时的 `approval_handler` 等人类决策；**没有 handler 时拒绝**（无人值守的运行不该自己装包） |
+| `auto` | 直接执行，结果里带 `requires_approval: True (auto-approved: …)` 标记 |
+| `deny` | 不执行，`ShellOutcome.ok=False`，`error` 说明风险原因 |
+
+审批策略来自 `RuntimeState.approval_mode`（`WQ_APPROVAL_MODE` 设默认，非法值回落 `inline`），CLI 用 `--approval-mode` 覆盖，`inline` 模式下的提问长这样：
+
+```
+┌──────────────── approval required ─────────────────┐
+│ pip install requests                               │
+│                                                    │
+│ risk     : Python package installation             │
+│ tool     : BashTool                                │
+│ approval : approval-1a2b3c4d                       │
+└────────────────────────────────────────────────────┘
+Run this command? [y/N]:
+```
+
+```python
+state = RuntimeState(workspace="./demo", approval_mode="auto")          # 全放行（带标记）
+state = RuntimeState(workspace="./demo", approval_handler=ask_human)    # inline：问 ask_human
+BashTool(state).run("pip install requests")
+# "$ pip install requests" / "exit_code: 0" /
+# "requires_approval: True (auto-approved: Python package installation)"
+```
+
+- **闸门放在 `BashTool.execute()`**（真正启动进程的唯一入口），所以 `run_bash()` / `run()`（模型调用的那个）和 verifier 节点跑的 `verification_commands` **都绕不过去**；`core/approval.py` 只管分类与数据结构，模式分支在 `BashTool._decide_approval()`。
+- handler 抛异常、stdin 关闭（管道/CI）都按**拒绝**处理，不会把风险命令放过去，也不会崩掉运行。
+- 被拒绝的结果是 `Error: command not run - approval required (<原因>); <为什么>…`，模型会看到并自行改走别的路（例如请求用户手动执行）。
+
+### 为什么一遇到 `pip install` 就"卡住"
+
+默认 `--approval-mode inline`：装包/下载/起服务这类命令会**先停下来问你**。这正是设计意图，但以前有两个坑，现在都修好了：
+
+1. **问题只写在 stdout 上** ✗ → 如果你把 stdout 重定向或捕获（`wq "..." | tee run.log`、IDE 的运行面板等），就只看到 stderr 的面板、看不到那句问话，而进程正阻塞在 `input()` 上——看起来就是"卡住"。现在**面板和问话都写 stderr**：
+
+   ```
+   ┌──────────────── approval required ────────────────┐
+   │ pip install fastapi uvicorn                       │
+   │ risk     : Python package installation            │
+   │ approval : approval-1a2b3c4d                      │
+   └───────────────────────────────────────────────────┘
+   the agent is paused - run this command? [y/N] (no answer within 300s counts as no)
+   ```
+
+2. **没有超时、stdin 关闭还会 `Abort` 整个运行** ✗ → 现在等 `WQ_APPROVAL_TIMEOUT`（默认 300 秒，`0` 表示一直等）就自动按"否"处理；stdin 关闭（管道/`< /dev/null`）也只是拒绝，不会把整轮运行打断。超时/拒绝的原因会写进工具结果，模型看到后会改走别的路（不再原地打转）。
+
+想让它自己装：`wq "<任务>" --approval-mode auto`（放行并给结果打 `requires_approval: True` 标记），或 `WQ_APPROVAL_MODE=auto`。想一直等：`WQ_APPROVAL_TIMEOUT=0`。
+
+另外 **`pip install` 真的可能超过 120 秒**（下载 wheel、编译依赖），此时 bash 工具会杀掉整棵进程树并在结果里说明：
+
+```
+[timed out after 120s - the process tree was terminated; if this command legitimately
+ needs longer, call it again with a larger `timeout_seconds` (up to 3600) or split it up.
+ If it may be waiting for input it cannot show, pass the tool's non-interactive flag
+ instead (pip: `--no-input`, git: `GIT_TERMINAL_PROMPT=0`)]
+```
+
+给它更多时间用 `--timeout 600`（上限 3600 秒）。
+
+### 为什么 pip 会在工作区里留下 `pip-*` 空目录
+
+pip 的临时目录（`pip-install-*`、`pip-unpack-*`、`pip-req-build-*`、`pip-ephem-wheel-cache-*`）建在 **`TEMP`/`TMP` 指向的位置**。有些终端（以及包装脚本）把 `TEMP` 设成**相对路径**（例如 `.`），于是这些目录就落在**子进程的工作目录**——也就是你的工作区；命令被超时杀掉时它们不会被清理，于是每失败一次就多几个空目录。实测对照（同一条 pip 命令、5 秒超时）：
+
+```
+TEMP 绝对路径 : workspace after: []
+TEMP = "."    : workspace after: ['pip-build-tracker-…', 'pip-ephem-wheel-cache-…',
+                                 'pip-install-…', 'pip-unpack-…']
+```
+
+现在 `BashTool._child_env()` 会把**相对的** `TEMP`/`TMP`/`TMPDIR` 换成工作区内绝对路径 `<workspace>/.wqagent/tmp`（绝对路径留给用户自己的设置），所以这类目录不再污染工作区——它们集中在 `.wqagent/tmp/` 里，且该目录不参与文件清单与 git 快照。已经产生的旧目录可以直接删掉（它们只是空的临时目录）。
+
+顺带说明：关于"卡住"这件事，心跳行现在会**点名正在运行的命令，并附上它最近的输出**，而不是让你猜：
+
+```
+... bash has been running for 95s (timeout 120s, 4096 chars of output): python -m pip install -r requirements.txt
+    | Collecting fastapi
+    | Building wheel for pydantic-core (py3-none-any)
+    Ctrl+C stops the run; if it needs longer, raise --timeout
+```
+
+（有这行就能分辨：在下载、在编译、还是根本没输出 = 在等输入。）
+
+### 命令结束时不会再多等一秒
+
+以前 bash 工具用 `communicate()` 等**管道 EOF**。若命令自己退出了、但它启动的某个子进程还继承着那对管道（pip 的构建/解包子进程很常见），EOF 就永远不来 —— 于是"依赖其实装好了，agent 却一直没收到通知"，直到超时。现在：
+
+- 等待的是**进程本身**（`Popen.wait`），命令一退出就返回；管道由两个读者线程持续读取，命令结束后只给它们 `DRAIN_GRACE_SECONDS = 2` 秒收尾。
+- 如果子进程仍占着管道，结果里会明说，而不是继续等：
+  `[the command exited, but a child process still holds its output open - whatever it printed afterwards is not in this result]`
+- 子进程的 **stdin 不再继承**（`DEVNULL`）：pip 在私有源上要密码、git 要凭据这类"隐藏提问"会**立刻失败并给出可见错误**，而不是无声地卡住整轮运行（`--no-input`、`GIT_TERMINAL_PROMPT=0` 仍然是好习惯）。
+- 输出仍按流分别保存（stdout/stderr 各带标签），超长截断；截断前的完整内容保留在内存里供状态行显示。
+- 子进程环境还补了三条：`PYTHONUNBUFFERED=1`（缓冲的子进程看起来就像卡死）、`PIP_NO_INPUT=1`、`PIP_DISABLE_PIP_VERSION_CHECK=1`（后者每次启动都要多一次网络往返；用户自己设过的值不会被覆盖）。
+
+### 装包一直超时？先量一下你的索引延迟
+
+`pip install` 会为**每个包**发多次 HTTPS 请求（simple 索引页、元数据、wheel 下载）。如果索引每次请求要 10 秒，装 FastAPI 这一套（7 个包）就是 3～5 分钟起步，而且中途任何一次连接抖动都会让 pip 重试——屏幕上却可能是 `0 chars of output`。这台机器上的实测：
+
+| 索引 | 两次请求耗时 |
+| --- | --- |
+| `pypi.org`（默认） | `11.1s (200)` → 紧接着 `SSL: UNEXPECTED_EOF_WHILE_READING` 失败 |
+| 清华 TUNA | `4.8s`、`4.7s` |
+| 阿里云 | `4.9s`、`4.7s` |
+| **中科大 USTC** | **`0.2s`、`0.1s`** |
+
+（TCP 连通性都是好的：`pypi.org:443` 连上只要 1.2 秒——慢的是 TLS/首个字节。）
+
+所以遇到"装包超时、还没有任何输出"，先换索引：
+
+```powershell
+# 只对这一次生效
+python -m pip install -i https://mirrors.ustc.edu.cn/pypi/simple "fastapi>=0.110" "uvicorn[standard]>=0.27"
+
+# 或永久写进 pip 配置（对所有命令生效）
+python -m pip config set global.index-url https://mirrors.ustc.edu.cn/pypi/simple
+```
+
+也可以用 `python -m pip download --no-input --timeout 5 --retries 0 -d . six` 单独验证索引是否可用；另外把 `--timeout` 提到 1800（上限 3600）给慢索引留出余量。
+
+现在这类情况在运行中就能看出来：命令跑了 30 秒还一个字都没输出时，心跳会直接说明
+
+```
+    | (no output at all yet - usually a stalled network request, e.g. a slow package
+      index, or a tool waiting on input it cannot show)
+```
+
+超时结果的提示里也会点出这一点（"printed nothing at all → 多半卡在网络/索引"）。
+
+### 模型卡住 / 超时时会发生什么
+
+模型请求由 `create_model()` 配置为**每次 120 秒超时、失败重试 2 次**，所以 provider 卡住时，一轮运行可能**静默 6 分钟以上**：没有事件、没有输出。以前这期间 `trace.json` 也不会落盘（追踪只在运行结束时写），看起来就像"agent 没反应 + trace 是空的"。现在：
+
+- **追踪按节点增量落盘**：每过一个节点（以及每次里程碑检查点）都会重写 `trace.json` + `timeline.md`，字段里带 `complete: true/false`。即使进程被杀，`timeline.md` 也能看到它卡在哪一步。
+- **沉默会被解释**：超过 30 秒没有任何事件，stderr 会打印一行
+  `... still in codeAgent: no events for 45s (waiting for the model? Ctrl+C stops the run)`。
+- **超时可调**：`--request-timeout 45`（或 `$WQ_REQUEST_TIMEOUT`）决定"等一次模型响应"的上限；`--show-config` 显示 `model/request: 45s per attempt`，启动横幅也写 `model : deepseek-flash (request timeout 45s)`。
+- **失败时给结论**：provider 超时会打印
+  `[the model did not answer within 120s per attempt (it is retried twice). Check the endpoint/network, or lower it with --request-timeout / $WQ_REQUEST_TIMEOUT to fail faster. The run is resumable: the checkpoint and trace up to the last node are on disk.]`
+  并把检查点与 trace 收尾为 `failed`（`status: failed`、`complete: true`），再给出 `resume with: wq --resume <workspace>`。
+
+排查顺序：先看 `timeline.md` 最后一行（卡在哪个节点）、再看 `checkpoint.json` 的 `status/latest_node`（确认是不是在等模型），然后按需调 `--request-timeout` 或加固网络。
 
 ## 工作区安全模型
 
@@ -580,7 +1155,7 @@ class MyTool:
 .\.venv\Scripts\python.exe -m pytest      # 全部用例，无需 API Key
 ```
 
-覆盖内容：路径围栏（含符号链接逃逸）、三个文件工具、grep（走内置扫描器）、bash（退出码/stderr/超时/黑名单/输出截断/shell 提示/`execute()` 结构化结果）、工具注册表与 `StructuredTool` 参数表、agent 入口的事件流（整图事件顺序与 `node` 标签、`node_end` 携带各节点更新、`handoff` 交接、失败裁决、重规划路径、`on_event`、`workspace=`/`state=`/`inputs=`/`graph=`/`max_loops`、`final_answer` 恰好一次）、ReAct 引擎（事件顺序、JSON `ToolMessage`、工具失败/未知工具/抛异常、`history`）、LangGraph 状态（27 个 channel 与 `add_messages` reducer、真实 `StateGraph` 验证消息累加、部分状态启动、无 reducer 列表的引用语义）、**三层 Memory（`RULES_LAYER` 内容与副本语义、`_short_text` 边界、`_trim_handoffs` 只留最近 6 条且截断每条指令、缺文件/同名目录/二进制/超长文件的读取降级、工作区来源、`working_memory` 各字段与预算、来源只留 title+url、state 值被写坏时的容错、`session_id`/`session_turn` 取值链、`history_summary` 状态优先于文件、压缩事件只留最近 3 条、JSON 格式化与不可序列化兜底、`memory_event`/`memory_digest` 的形状与兜底、**`TODO.md` 渲染/写/读往返、缺文件与垃圾内容、写失败降级**、**`NOTEPAD.md` 小节渲染与追加（标题不重复、旧小节保留、超限只留最新、无 durable 字段时不建文件）、字符串化列表的归一化**）**、分层 Memory 注入（planner/verifier/codeAgent 的 HumanMessage 都带 `"rules"`/`"working_memory"` JSON、`memory` 事件只发一次且带 `node`、快照写回 `memory_snapshot`、NOTEPAD.md/HISTORY_SUMMARY.md 内容随注入进入提示词、注入后原有简报与证据仍在、codeAgent 只剩一个记忆块而显式 `memory=` 仍可渲染）**、`TODO.md` 与运行时联动（planner 写计划、verifier 写完成态、codeAgent 中途 `persist` 写、同任务未完成计划被恢复、异任务/已完成计划被忽略、state 里的计划优先）、shell 提示（planner 简报里出现本机 shell 名与具体禁忌）、图节点（**主管 planner：三个工具绑定、计划/交接/收尾总结、坏参数降级、交接日志累积、searchAgent 与 codeAgent 交接的 state 副作用**、verifier 判定与命令覆盖、**上下文监测（模型自带 token 计数器、异常/缺失/返回值不可用时退回 `len // 4`、超预算判定与边界值、复用已存的 memory 快照、缺 runtime、路由的通过优先与默认去向、planner/verifier 对 `context_next_node` 的设置）**、**上下文压缩（九键 JSON 解析与围栏/废话容错、`RemoveMessage(REMOVE_ALL_MESSAGES)` 在真实 `add_messages` 上的替换语义、模型异常/无 summary/`null` 时的确定性兜底、字段截断与来源合并、压缩事件追加且不就地改 state、`HISTORY_SUMMARY.md` 内容与写盘失败降级、超长转录的头尾保留与丢弃标记、压缩后 token 数确实下降）**、**完整图（`build_complex_workflow()` 的五节点两条条件边、`COMPLEX_NODE_NAMES`/两个 route-targets 常量、节点与 `model`/`loops` 绑定、无压缩的一次通过并核对节点顺序、`limit=1` 时压缩恰好一次并写入 `HISTORY_SUMMARY.md`、`attempts>=max_attempts` 时不再重规划、失败后重规划的九步节点序列、`stream_agent_events(graph=...)` 走完整图）**、prompt 点名但节点没有的工具（`NotepadReadTool` / `web_search`）只降级成 `unknown tool` 不崩、路由、整图 plan→delegate→verify→retry 跑通并核对模型调用次数）、**坏 JSON 容错（围栏/废话/数组包裹、截断/尾逗号/单引号、类型错乱、单对象代替数组、未知 status、非对象条目、严格布尔判决、`tool_choice` 不被支持时的回退链）**、搜索专家（`WebSearchTool` 的成功/缺 key/缺包/空查询/限流/异常响应/参数夹取、`run_search_agent` 的消息构造、查询与来源去重、事件流、`max_loops` 兜底摘要、全部失败 vs 部分成功、无法解析的工具输出）、代码专家（消息四段式与 memory 分层、工具集绑定、todo 边做边更新与 `persist` 回调、坏 todo 更新只记 notes、缺 runtime、模型中断保留半成品、`max_loops` 摘要兜底、工具覆盖）、工作流（`build_workflow()` 的节点与边——**已无 actor 节点**、`model`/`loops`/`agent_model` 绑定、四个 prompt 可从 `stage2` 导入、`final_node` 的成功/失败/模型失败/空回答）、CLI 端到端（`--version` / `--list-tools` / `--show-config` / 默认 workspace 创建 / 节点与专家分段渲染 / `--max-attempts` 与 `--max-steps` / 通过与被预算截断两种退出码 / 真实 HTTP 全图往返）。
+覆盖内容：路径围栏（含符号链接逃逸）、三个文件工具、grep（走内置扫描器）、bash（退出码/stderr/超时/黑名单/输出截断/shell 提示/`execute()` 结构化结果）、工具注册表与 `StructuredTool` 参数表、agent 入口的事件流（整图事件顺序与 `node` 标签、`node_end` 携带各节点更新、`handoff` 交接、失败裁决、重规划路径、`on_event`、`workspace=`/`state=`/`inputs=`/`graph=`/`max_loops`、`final_answer` 恰好一次、**新增入口参数：`create_runtime` 的模式/`None` 走环境变量/`resume_from` 变成 workspace、`trace_mode="on"` = summary、开局 `started` 检查点排在第一个 `node_end` 之前、`handoff` 之后紧跟检查点、事件仍是扁平协议、`state=` 优先于模式参数、崩溃写 `failed`、`Ctrl-C` 写 `interrupted` 且异常继续抛出、`resume_workspace=` 恢复并继续（无检查点抛 `LookupError`）、`trace.json` 的 `resumed` 标记**）、ReAct 引擎（事件顺序、JSON `ToolMessage`、工具失败/未知工具/抛异常、`history`）、LangGraph 状态（27 个 channel 与 `add_messages` reducer、真实 `StateGraph` 验证消息累加、部分状态启动、无 reducer 列表的引用语义）、**三层 Memory（`RULES_LAYER` 内容与副本语义、`_short_text` 边界、`_trim_handoffs` 只留最近 6 条且截断每条指令、缺文件/同名目录/二进制/超长文件的读取降级、工作区来源、`working_memory` 各字段与预算、来源只留 title+url、state 值被写坏时的容错、`session_id`/`session_turn` 取值链、`history_summary` 状态优先于文件、压缩事件只留最近 3 条、JSON 格式化与不可序列化兜底、`memory_event`/`memory_digest` 的形状与兜底、**`TODO.md` 渲染/写/读往返、缺文件与垃圾内容、写失败降级**、**`NOTEPAD.md` 小节渲染与追加（标题不重复、旧小节保留、超限只留最新、无 durable 字段时不建文件）、字符串化列表的归一化**）**、分层 Memory 注入（planner/verifier/codeAgent 的 HumanMessage 都带 `"rules"`/`"working_memory"` JSON、`memory` 事件只发一次且带 `node`、快照写回 `memory_snapshot`、NOTEPAD.md/HISTORY_SUMMARY.md 内容随注入进入提示词、注入后原有简报与证据仍在、codeAgent 只剩一个记忆块而显式 `memory=` 仍可渲染）**、`TODO.md` 与运行时联动（planner 写计划、verifier 写完成态、codeAgent 中途 `persist` 写、同任务未完成计划被恢复、异任务/已完成计划被忽略、state 里的计划优先）、shell 提示（planner 简报里出现本机 shell 名与具体禁忌）、**命令审批（`RISK_PATTERNS` 十类风险与理由、链式命令 `&&`/`||`/`;` 与大小写、安全命令不误报、`approval-xxxxxxxx` id 唯一且不可变、模式归一化与 `WQ_APPROVAL_MODE`、三种模式的执行/标记/拒绝、handler 缺失或抛异常时按拒绝处理、黑名单优先于审批、verifier 的验收命令同样受管、**审批提问（面板与问话都在 stderr、stdin 关闭时降级为拒绝而不 `Abort`、显式 n 拒绝、超时按否且不挂死、`WQ_APPROVAL_TIMEOUT` 解析（0=一直等、非法值不会变成 0））**、**断点保存/恢复（三种模式各写什么、`off` 什么都不写、`light` 的元数据/摘要/清单/恢复指南、`strict` 的 state.json 与 events.jsonl、清单排除 `.wqagent/`、超限截断、git 快照不改动工作区 `.git`、空工作区也建首个提交、无 git 时降级、`message_to_dict`/`from_dict` 往返（含 tool_calls）、摘要与元数据不混、恢复工作区文件、strict 恢复对话、任务不一致的警告、损坏 checkpoint 的安全返回、**恢复后的新检查点不继承旧状态**的回归）**、CLI 的 `--checkpoint-mode`/`--resume` 端到端、**CLI 参数声明（`Literal` 可选值、大小写不敏感、非法值（含来自环境变量的）被 click 拒绝且退出码 2、`--show-config` 的 `(cli|env|default)` 来源标注）**、**Ctrl+C 中断（`_InterruptGuard` 首次按键杀命令并提示、无命令时不显示计数、第二次按键 `os._exit(130)`、killer 抛异常不外泄、有/无 watcher 两条路径、`set_wakeup_fd` 收到字节即反应、退出时恢复原 handler 与 wakeup fd、`kill_running_commands()` 杀掉真实长命令且注册表清空、等待被 KeyboardInterrupt 打断时必定杀掉子进程）****、**执行追踪（三种模式、`trace_id` 生成与复用、run_start 记录、五类计数（含从渲染文本识别审批标记）、`node_visits`、`trace.json` 字段齐全、时间线首尾 20/80 与 `timeline_omitted`、`timeline.md` 可读性、`summary` 不写 `events.jsonl`、`full` 每条事件一行且以 `run_end` 收尾、未 start 也能 end、写盘失败只降级、`off` 完全不记录、以及一次真实工作流跑完后的统计与 CLI 端到端）**、图节点（**主管 planner：三个工具绑定、计划/交接/收尾总结、坏参数降级、交接日志累积、searchAgent 与 codeAgent 交接的 state 副作用**、verifier 判定与命令覆盖、**上下文监测（模型自带 token 计数器、异常/缺失/返回值不可用时退回 `len // 4`、超预算判定与边界值、复用已存的 memory 快照、缺 runtime、路由的通过优先与默认去向、planner/verifier 对 `context_next_node` 的设置）**、**上下文压缩（九键 JSON 解析与围栏/废话容错、`RemoveMessage(REMOVE_ALL_MESSAGES)` 在真实 `add_messages` 上的替换语义、模型异常/无 summary/`null` 时的确定性兜底、字段截断与来源合并、压缩事件追加且不就地改 state、`HISTORY_SUMMARY.md` 内容与写盘失败降级、超长转录的头尾保留与丢弃标记、压缩后 token 数确实下降）**、**完整图（`build_complex_workflow()` 的五节点两条条件边、`COMPLEX_NODE_NAMES`/两个 route-targets 常量、节点与 `model`/`loops` 绑定、无压缩的一次通过并核对节点顺序、`limit=1` 时压缩恰好一次并写入 `HISTORY_SUMMARY.md`、`attempts>=max_attempts` 时不再重规划、失败后重规划的九步节点序列、`stream_agent_events(graph=...)` 走完整图）**、prompt 点名但节点没有的工具（`NotepadReadTool` / `web_search`）只降级成 `unknown tool` 不崩、路由、整图 plan→delegate→verify→retry 跑通并核对模型调用次数）、**坏 JSON 容错（围栏/废话/数组包裹、截断/尾逗号/单引号、类型错乱、单对象代替数组、未知 status、非对象条目、严格布尔判决、`tool_choice` 不被支持时的回退链）**、搜索专家（`WebSearchTool` 的成功/缺 key/缺包/空查询/限流/异常响应/参数夹取、`run_search_agent` 的消息构造、查询与来源去重、事件流、`max_loops` 兜底摘要、全部失败 vs 部分成功、无法解析的工具输出）、代码专家（消息四段式与 memory 分层、工具集绑定、todo 边做边更新与 `persist` 回调、坏 todo 更新只记 notes、缺 runtime、模型中断保留半成品、`max_loops` 摘要兜底、工具覆盖）、工作流（`build_workflow()` 的节点与边——**已无 actor 节点**、`model`/`loops`/`agent_model` 绑定、四个 prompt 可从 `stage2` 导入、`final_node` 的成功/失败/模型失败/空回答）、CLI 端到端（`--version` / `--list-tools` / `--show-config` / 默认 workspace 创建 / 节点与专家分段渲染 / `--max-attempts` 与 `--max-steps` / 通过与被预算截断两种退出码 / 真实 HTTP 全图往返）。
 
 `tests/helpers.py` 提供共用的 `ScriptedModel` 与脚本构造器（`plan_call` / `code_call` / `report_call` / `passing_script` 等）；一次完整通过的运行需要 8 次模型调用（planner 3 + codeAgent 2 + verifier 2 + final 1）。
 

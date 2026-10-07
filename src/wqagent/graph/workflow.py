@@ -24,7 +24,14 @@ management wired in::
                                     └──▶ context_monitor (a verification always
                                          passes through the monitor again)
 
-Both builders take the same options, so switching between them is a one-word
+:func:`build_entry_workflow` - the entry graph that runs *before* either of them::
+
+    START ──▶ intent_router ──┬─(chat)─────▶ chat_responder ──▶ END
+                              │
+                              └─(workflow)─────────────────────▶ END   (caller continues
+                                                                       with the main graph)
+
+Both main builders take the same options, so switching between them is a one-word
 change; every run is compiled with a checkpointer only when one is given.
 
 Usage::
@@ -45,11 +52,14 @@ from typing import Any, Callable
 from langgraph.graph import END, START, StateGraph
 
 from wqagent.graph.nodes import (
+    chat_responder_node,
     context_compressor_node,
     context_compressor_route,
     context_monitor_node,
     context_monitor_route,
     final_node,
+    intent_route_fn,
+    intent_router_node,
     planner_node,
     verifier_node,
     verifier_route,
@@ -60,14 +70,24 @@ __all__ = [
     "COMPLEX_NODE_NAMES",
     "COMPRESSOR_ROUTE_TARGETS",
     "CONTEXT_ROUTE_TARGETS",
+    "ENTRY_NODE_NAMES",
+    "ENTRY_ROUTE_TARGETS",
     "NODE_NAMES",
     "ROUTE_TARGETS",
     "build_complex_workflow",
+    "build_entry_workflow",
     "build_workflow",
 ]
 
 #: Nodes of :func:`build_workflow`, in execution order.
 NODE_NAMES: tuple[str, ...] = ("planner", "verifier", "final")
+
+#: Nodes of :func:`build_entry_workflow`, in execution order.
+ENTRY_NODE_NAMES: tuple[str, ...] = ("intent_router", "chat_responder")
+
+#: Where :func:`~wqagent.graph.nodes.intent_route_fn` may send the run. ``planner``
+#: is an ``END`` in the entry graph: the caller then runs the main workflow.
+ENTRY_ROUTE_TARGETS: dict[str, str] = {"chat_responder": "chat_responder", "planner": END}
 
 #: Nodes of :func:`build_complex_workflow`, in execution order.
 COMPLEX_NODE_NAMES: tuple[str, ...] = (
@@ -198,6 +218,53 @@ def build_complex_workflow(
     )
     graph.add_edge("verifier", "context_monitor")  # a verification also passes the monitor
     graph.add_edge("final", END)
+
+    if checkpointer is None:
+        return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
+
+
+def build_entry_workflow(
+    checkpointer: Any | None = None,
+    *,
+    model: Any | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    writer: Callable[[dict[str, Any]], None] | None = None,
+) -> Any:
+    """Build and compile the intent-routing graph::
+
+        START ──▶ intent_router ──┬─(chat)─────▶ chat_responder ──▶ END
+                                  │
+                                  └─(workflow)─────────────────────▶ END
+                                                                    (the caller then
+                                                                     runs the main
+                                                                     workflow)
+
+    It answers two questions with one cheap model call: *is this conversation or work*,
+    and - when it is conversation - *what is the answer*. The ``workflow`` branch ends
+    the graph deliberately: ``stream_agent_events`` reads ``intent_route`` from the
+    state and continues with :func:`build_complex_workflow`.
+
+    Args:
+        checkpointer: Optional LangGraph checkpointer.
+        model: Chat model for both nodes; defaults to their lazy ``create_model()``.
+        on_event: Optional sink for the ``intent`` / ``chat_response`` events.
+        writer: Optional LangGraph custom-stream writer.
+
+    Returns:
+        The compiled entry graph.
+    """
+    graph = StateGraph(WQGraphState)
+    graph.add_node(
+        "intent_router", _bind(intent_router_node, model=model, on_event=on_event, writer=writer)
+    )
+    graph.add_node(
+        "chat_responder", _bind(chat_responder_node, model=model, on_event=on_event, writer=writer)
+    )
+
+    graph.add_edge(START, "intent_router")
+    graph.add_conditional_edges("intent_router", intent_route_fn, ENTRY_ROUTE_TARGETS)
+    graph.add_edge("chat_responder", END)
 
     if checkpointer is None:
         return graph.compile()

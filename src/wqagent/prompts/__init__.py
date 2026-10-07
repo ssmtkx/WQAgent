@@ -1,5 +1,8 @@
 """Prompt templates, grouped by workflow stage.
 
+* :mod:`wqagent.prompts.entry` - the entry graph: intent routing and light chat
+  (:data:`~wqagent.prompts.entry.INTENT_ROUTER_PROMPT`,
+  :data:`~wqagent.prompts.entry.CHAT_RESPONDER_PROMPT`).
 * :mod:`wqagent.prompts.stage1` - the (pre-stage-3) actor node
   (:data:`~wqagent.prompts.stage1.ACTOR_PROMPT`).
 * :mod:`wqagent.prompts.stage2` - the final node
@@ -13,6 +16,7 @@
   (:data:`~wqagent.prompts.stage4.CONTEXT_COMPRESSION_PROMPT`).
 """
 
+from wqagent.prompts.entry import CHAT_RESPONDER_PROMPT, INTENT_ROUTER_PROMPT
 from wqagent.prompts.stage1 import ACTOR_PROMPT
 from wqagent.prompts.stage2 import FINAL_PROMPT
 from wqagent.prompts.stage3 import (
@@ -25,9 +29,11 @@ from wqagent.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 
 __all__ = [
     "ACTOR_PROMPT",
+    "CHAT_RESPONDER_PROMPT",
     "CODE_AGENT_PROMPT",
     "CONTEXT_COMPRESSION_PROMPT",
     "FINAL_PROMPT",
+    "INTENT_ROUTER_PROMPT",
     "PLANNER_PROMPT",
     "SEARCH_AGENT_PROMPT",
     "VERIFIER_PROMPT",
