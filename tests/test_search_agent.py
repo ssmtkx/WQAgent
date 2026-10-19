@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
+from helpers import ScriptedModel, graph_state, tool_call
 from wqagent.agents.search_agent import (
     DEFAULT_MAX_LOOPS,
     build_search_messages,
     run_search_agent,
 )
-from wqagent.core.state import RuntimeState
-from wqagent.graph import new_graph_state
 from wqagent.prompts.stage3 import SEARCH_AGENT_PROMPT
 from wqagent.tools.web_search_tool import MISSING_KEY_ERROR, WebSearchTool
 
@@ -39,25 +39,6 @@ PYDANTIC_RESULTS = [
         "score": 0.5,
     },
 ]
-
-
-class ScriptedModel:
-    """Replays responses; records what was bound and what it received."""
-
-    def __init__(self, responses: list[Any]) -> None:
-        self.responses = list(responses)
-        self.bound: list[list[str]] = []
-        self.seen: list[list[Any]] = []
-
-    def bind_tools(self, tools: list[Any], **kwargs: Any) -> "ScriptedModel":
-        self.bound.append([tool.name for tool in tools])
-        return self
-
-    def invoke(self, messages: list[Any]) -> Any:
-        self.seen.append(list(messages))
-        if not self.responses:
-            raise AssertionError("ScriptedModel ran out of responses")
-        return self.responses.pop(0)
 
 
 class FakeSearchTool(WebSearchTool):
@@ -107,23 +88,15 @@ class PlainTextTool:
         )
 
 
-def _tool_call(query: str, call_id: str = "c1") -> AIMessage:
-    return AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "web_search",
-                "args": {"query": query},
-                "id": call_id,
-                "type": "tool_call",
-            }
-        ],
-    )
+def _web_search_call(query: str, call_id: str = "c1") -> AIMessage:
+    """One assistant turn that calls ``web_search``."""
+    return tool_call("web_search", {"query": query}, call_id)
 
 
 @pytest.fixture()
-def state(tmp_path):
-    return new_graph_state("build a FastAPI service", RuntimeState(workspace=tmp_path / "ws"))
+def state(tmp_path: Path) -> dict[str, Any]:
+    """A graph state for the FastAPI task."""
+    return graph_state("build a FastAPI service", root=tmp_path / "ws")
 
 
 # -- messages ----------------------------------------------------------------
@@ -150,8 +123,8 @@ def test_messages_survive_a_missing_state_and_instruction() -> None:
 def test_collects_queries_sources_and_answers(state: Any) -> None:
     model = ScriptedModel(
         [
-            _tool_call("fastapi latest version", "c1"),
-            _tool_call("pydantic v2 docs", "c2"),
+            _web_search_call("fastapi latest version", "c1"),
+            _web_search_call("pydantic v2 docs", "c2"),
             AIMessage(content="FastAPI 0.115 with Pydantic v2."),
         ]
     )
@@ -191,7 +164,7 @@ def test_collects_queries_sources_and_answers(state: Any) -> None:
 
 
 def test_falls_back_to_a_digest_when_the_model_hits_max_loops(state: Any) -> None:
-    model = ScriptedModel([_tool_call(f"query {i}", f"c{i}") for i in range(5)])
+    model = ScriptedModel([_web_search_call(f"query {i}", f"c{i}") for i in range(5)])
     tool = FakeSearchTool()
 
     result = run_search_agent(state, "research", model=model, tool=tool, max_loops=2)
@@ -205,9 +178,7 @@ def test_falls_back_to_a_digest_when_the_model_hits_max_loops(state: Any) -> Non
 def test_a_model_that_answers_without_searching(state: Any) -> None:
     model = ScriptedModel([AIMessage(content="I already know this.")])
 
-    result = run_search_agent(
-        state, "easy question", model=model, tool=FakeSearchTool()
-    )
+    result = run_search_agent(state, "easy question", model=model, tool=FakeSearchTool())
 
     assert result["ok"] is True
     assert result["summary"] == "I already know this."
@@ -220,11 +191,10 @@ def test_missing_tavily_key_is_reported(state: Any, monkeypatch: Any) -> None:
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     # the developer's .env must not inject a key here (it would hit the network)
     monkeypatch.setattr("wqagent.providers.load_env", lambda *args, **kwargs: None)
-    model = ScriptedModel([_tool_call("fastapi version"), AIMessage(content="not sure")])
+    model = ScriptedModel([_web_search_call("fastapi version"), AIMessage(content="not sure")])
 
-    result = run_search_agent(
-        state, "research", model=model, tool=WebSearchTool()  # no key, no fake
-    )
+    # no key and no fake tool: the real one must report the missing key
+    result = run_search_agent(state, "research", model=model, tool=WebSearchTool())
 
     assert result["ok"] is False
     assert result["error"] == MISSING_KEY_ERROR
@@ -240,7 +210,9 @@ def test_missing_tavily_key_is_reported(state: Any, monkeypatch: Any) -> None:
 
 
 def test_search_errors_are_kept_but_a_summary_still_returns(state: Any) -> None:
-    model = ScriptedModel([_tool_call("fastapi version"), AIMessage(content="Best effort answer.")])
+    model = ScriptedModel(
+        [_web_search_call("fastapi version"), AIMessage(content="Best effort answer.")]
+    )
     tool = FakeSearchTool(ok=False, error="RuntimeError: 429 rate limit")
 
     result = run_search_agent(state, "research", model=model, tool=tool)
@@ -258,7 +230,11 @@ def test_partial_search_success_stays_ok(state: Any) -> None:
             return super().search(query, **kwargs)
 
     model = ScriptedModel(
-        [_tool_call("first", "c1"), _tool_call("second", "c2"), AIMessage(content="Partial.")]
+        [
+            _web_search_call("first", "c1"),
+            _web_search_call("second", "c2"),
+            AIMessage(content="Partial."),
+        ]
     )
 
     result = run_search_agent(state, "research", model=model, tool=FlakyTool())
@@ -268,7 +244,7 @@ def test_partial_search_success_stays_ok(state: Any) -> None:
 
 
 def test_unparsable_tool_output_is_tolerated(state: Any) -> None:
-    model = ScriptedModel([_tool_call("anything"), AIMessage(content="Hmm.")])
+    model = ScriptedModel([_web_search_call("anything"), AIMessage(content="Hmm.")])
 
     result = run_search_agent(
         state, "research", model=model, tool=PlainTextTool()  # type: ignore[arg-type]

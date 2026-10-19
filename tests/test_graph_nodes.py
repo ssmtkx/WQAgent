@@ -4,14 +4,30 @@ from __future__ import annotations
 
 import json
 import os
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
+from helpers import (
+    ScriptedModel as SharedScriptedModel,
+    answer,
+    code_call,
+    graph_state,
+    plan_call,
+    report_call,
+    runtime_for,
+    search_call,
+    todo_update_call,
+    tool_call,
+    write_call,
+)
 from wqagent.core.state import RuntimeState
+from wqagent.graph import WQGraphState
 from wqagent.graph.memory import (
     DEFAULT_CONTEXT_TOKEN_LIMIT,
     HANDOFF_TEXT_CHARS,
@@ -42,33 +58,33 @@ from wqagent.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 from wqagent.tools.bash_tool import SHELL_NAME, shell_guidance
 
 
-class ScriptedModel:
-    """Replays scripted responses; records what was bound and what it received."""
-
-    def __init__(self, responses: list[Any]) -> None:
-        self.responses = list(responses)
-        self.bound: list[tuple[list[str], Any]] = []
-        self.seen: list[list[Any]] = []
+class ScriptedModel(SharedScriptedModel):
+    """The shared replay model, plus the ``tool_choice`` each bind was given."""
 
     def bind_tools(self, tools: list[Any], **kwargs: Any) -> "ScriptedModel":
         self.bound.append(([tool.name for tool in tools], kwargs.get("tool_choice")))
         return self
 
-    def invoke(self, messages: list[Any]) -> Any:
-        self.seen.append(list(messages))
-        if not self.responses:
-            raise AssertionError("ScriptedModel ran out of scripted responses")
-        return self.responses.pop(0)
+
+def _state(root: Path, **extra: Any) -> dict[str, Any]:
+    """A fresh graph state for the default task, its workspace under *root*."""
+    return graph_state("write hello.py", root=root / "ws", **extra)
 
 
-def _tool_call(name: str, args: dict[str, Any], call_id: str = "c1") -> AIMessage:
-    return AIMessage(
-        content="", tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}]
-    )
+def _passing_verifier() -> ScriptedModel:
+    """The two turns of a verifier run that inspects, then reports a pass."""
+    return ScriptedModel([answer("inspected"), report_call(reason="fine", checks=[])])
 
 
-def _state(tmp_path: Path, **extra: Any):
-    return new_graph_state("write hello.py", RuntimeState(workspace=tmp_path / "ws"), **extra)
+def _planner_verifier_graph() -> Any:
+    """The planner -> verifier -> (planner | END) loop, compiled."""
+    graph = StateGraph(WQGraphState)
+    graph.add_node("planner", planner_node)
+    graph.add_node("verifier", verifier_node)
+    graph.add_edge(START, "planner")
+    graph.add_edge("planner", "verifier")
+    graph.add_conditional_edges("verifier", verifier_route, {"planner": "planner", "final": END})
+    return graph.compile()
 
 
 @pytest.fixture(autouse=True)
@@ -83,19 +99,16 @@ def _reset_module_model():
 def test_planner_creates_the_plan(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "write the file, then run it",
-                    "todos": [
-                        {"id": "t1", "content": "write hello.py"},
-                        {"id": "t2", "content": "run it", "note": "python hello.py"},
-                    ],
-                    "acceptance_criteria": ["hello.py prints Hello"],
-                    "verification_commands": ["python hello.py"],
-                },
+            plan_call(
+                summary="write the file, then run it",
+                todos=[
+                    {"id": "t1", "content": "write hello.py"},
+                    {"id": "t2", "content": "run it", "note": "python hello.py"},
+                ],
+                criteria=["hello.py prints Hello"],
+                commands=["python hello.py"],
             ),
-            AIMessage(content="Planned two steps; nothing to delegate yet."),
+            answer("Planned two steps; nothing to delegate yet."),
         ]
     )
 
@@ -127,20 +140,17 @@ def test_planner_revises_the_plan_after_a_failure(tmp_path: Path) -> None:
     )
     model = ScriptedModel(
         [
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "fix the NameError, then rerun",
-                    "todos": [
-                        {"id": "t1", "content": "write hello.py", "status": "completed"},
-                        {"id": "t2", "content": "run it", "status": "pending"},
-                        {"id": "t3", "content": "fix the NameError in hello.py"},
-                    ],
-                    "acceptance_criteria": ["hello.py prints Hello"],
-                    "verification_commands": ["python hello.py"],
-                },
+            plan_call(
+                summary="fix the NameError, then rerun",
+                todos=[
+                    {"id": "t1", "content": "write hello.py", "status": "completed"},
+                    {"id": "t2", "content": "run it", "status": "pending"},
+                    {"id": "t3", "content": "fix the NameError in hello.py"},
+                ],
+                criteria=["hello.py prints Hello"],
+                commands=["python hello.py"],
             ),
-            AIMessage(content="Revised the plan and delegated the fix."),
+            answer("Revised the plan and delegated the fix."),
         ]
     )
 
@@ -184,21 +194,20 @@ def test_planner_delegates_research_then_implementation(tmp_path: Path) -> None:
     search_tool = FakeSearchTool()
     model = ScriptedModel(
         [
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "research then build",
-                    "todos": [{"id": "t1", "content": "pin fastapi"}],
-                },
+            plan_call(
+                summary="research then build",
+                todos=[{"id": "t1", "content": "pin fastapi"}],
+                criteria=[],
+                commands=[],
             ),
-            _tool_call("call_search_agent", {"instruction": "which fastapi version?"}, "c2"),
+            search_call("which fastapi version?", "c2"),
             # the search agent runs on the same model
-            _tool_call("web_search", {"query": "which fastapi version?"}, "s1"),
-            AIMessage(content="FastAPI 0.115 is current."),
-            _tool_call("call_code_agent", {"instruction": "pin fastapi==0.115"}, "c3"),
-            _tool_call("file_write", {"file_path": "requirements.txt", "content": "fastapi==0.115\n"}),
-            AIMessage(content="Wrote requirements.txt."),
-            AIMessage(content="Researched the version and pinned it."),
+            tool_call("web_search", {"query": "which fastapi version?"}, "s1"),
+            answer("FastAPI 0.115 is current."),
+            code_call("pin fastapi==0.115", "c3"),
+            write_call("requirements.txt", "fastapi==0.115\n"),
+            answer("Wrote requirements.txt."),
+            answer("Researched the version and pinned it."),
         ]
     )
     events: list[dict[str, Any]] = []
@@ -247,9 +256,9 @@ def test_planner_appends_to_the_existing_handoff_log(tmp_path: Path) -> None:
     )
     model = ScriptedModel(
         [
-            _tool_call("call_code_agent", {"instruction": "do it"}, "c1"),
-            AIMessage(content="codeAgent did it."),
-            AIMessage(content="done"),
+            code_call("do it"),
+            answer("codeAgent did it."),
+            answer("done"),
         ]
     )
 
@@ -262,7 +271,7 @@ def test_planner_keeps_the_previous_todos_when_the_model_answers_nothing(
     tmp_path: Path,
 ) -> None:
     state = _state(tmp_path, todos=[make_todo("t1", "keep me")], last_error="boom")
-    model = ScriptedModel([AIMessage(content="I have no idea")])
+    model = ScriptedModel([answer("I have no idea")])
 
     update = planner_node(state, model=model)
 
@@ -277,9 +286,8 @@ def test_planner_requires_a_runtime() -> None:
 # -- actor -------------------------------------------------------------------
 def test_actor_executes_the_plan_and_records_todo_updates(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
-    state = new_graph_state(
-        "write hello.py",
-        RuntimeState(workspace=workspace),
+    state = _state(
+        tmp_path,
         plan_summary="write, then run",
         todos=[make_todo("t1", "write hello.py"), make_todo("t2", "run it")],
         acceptance_criteria=["prints Hello"],
@@ -287,12 +295,9 @@ def test_actor_executes_the_plan_and_records_todo_updates(tmp_path: Path) -> Non
     )
     model = ScriptedModel(
         [
-            _tool_call("file_write", {"file_path": "hello.py", "content": "print('Hello')\n"}),
-            _tool_call(
-                "todo_update",
-                {"updates": [{"id": "t1", "status": "completed", "note": "written"}]},
-            ),
-            AIMessage(content="Wrote hello.py and ran it."),
+            write_call(),
+            todo_update_call({"id": "t1", "status": "completed", "note": "written"}),
+            answer("Wrote hello.py and ran it."),
         ]
     )
     events: list[dict[str, Any]] = []
@@ -331,7 +336,7 @@ def test_actor_replays_the_transcript_but_returns_only_the_delta(tmp_path: Path)
         tmp_path,
         messages=[HumanMessage(content="first attempt"), AIMessage(content="did something")],
     )
-    model = ScriptedModel([AIMessage(content="done now")])
+    model = ScriptedModel([answer("done now")])
 
     update = actor_node(state, model=model)
 
@@ -343,7 +348,7 @@ def test_actor_replays_the_transcript_but_returns_only_the_delta(tmp_path: Path)
 
 
 def test_actor_reports_the_step_limit_in_the_summary(tmp_path: Path) -> None:
-    model = ScriptedModel([_tool_call("bash", {"command": "echo tick"}) for _ in range(3)])
+    model = ScriptedModel([tool_call("bash", {"command": "echo tick"}) for _ in range(3)])
 
     update = actor_node(_state(tmp_path), model=model, max_loops=3)
 
@@ -354,8 +359,8 @@ def test_actor_ignores_updates_for_unknown_todos(tmp_path: Path) -> None:
     state = _state(tmp_path, todos=[make_todo("t1", "do it")])
     model = ScriptedModel(
         [
-            _tool_call("todo_update", {"updates": [{"id": "ghost", "status": "completed"}]}),
-            AIMessage(content="done"),
+            todo_update_call({"id": "ghost", "status": "completed"}),
+            answer("done"),
         ]
     )
 
@@ -377,16 +382,11 @@ def test_verifier_passes_and_marks_the_plan_completed(tmp_path: Path) -> None:
     )
     model = ScriptedModel(
         [
-            _tool_call("file_read", {"file_path": "hello.py"}),  # read-only inspection
-            AIMessage(content="I read the file."),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": True,
-                    "reason": "the file exists and the command succeeded",
-                    "checks": [{"name": "prints Hello", "passed": True, "detail": "saw print"}],
-                    "recommended_next_instruction": "",
-                },
+            tool_call("file_read", {"file_path": "hello.py"}),  # read-only inspection
+            answer("I read the file."),
+            report_call(
+                reason="the file exists and the command succeeded",
+                checks=[{"name": "prints Hello", "passed": True, "detail": "saw print"}],
             ),
         ]
     )
@@ -416,17 +416,12 @@ def test_verifier_survives_a_tool_its_prompt_names_but_it_does_not_have(
     state = _state(tmp_path, todos=[make_todo("t1", "do it")], verification_commands=["echo ok"])
     model = ScriptedModel(
         [
-            _tool_call("NotepadReadTool", {}, "v1"),
-            _tool_call("web_search", {"query": "anything"}, "v2"),
-            AIMessage(content="no notepad and no web tool here; judging from the files"),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": True,
-                    "reason": "the file is there and the command succeeded",
-                    "checks": [{"name": "it works", "passed": True, "detail": "exit 0"}],
-                    "recommended_next_instruction": "",
-                },
+            tool_call("NotepadReadTool", {}, "v1"),
+            tool_call("web_search", {"query": "anything"}, "v2"),
+            answer("no notepad and no web tool here; judging from the files"),
+            report_call(
+                reason="the file is there and the command succeeded",
+                checks=[{"name": "it works", "passed": True, "detail": "exit 0"}],
             ),
         ]
     )
@@ -444,16 +439,8 @@ def test_verifier_overrules_a_pass_when_a_command_fails(tmp_path: Path) -> None:
     state = _state(tmp_path, todos=[make_todo("t1", "do it")], verification_commands=["exit 3"])
     model = ScriptedModel(
         [
-            AIMessage(content="looks fine to me"),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": True,
-                    "reason": "the actor said it is done",
-                    "checks": [],
-                    "recommended_next_instruction": "",
-                },
-            ),
+            answer("looks fine to me"),
+            report_call(reason="the actor said it is done", checks=[]),
         ]
     )
 
@@ -470,15 +457,12 @@ def test_verifier_records_the_next_instruction_on_failure(tmp_path: Path) -> Non
     state = _state(tmp_path, verification_commands=["echo boom; exit 1"])
     model = ScriptedModel(
         [
-            AIMessage(content="inspecting"),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": False,
-                    "reason": "the command failed",
-                    "checks": [{"name": "runs cleanly", "passed": False, "detail": "exit 1"}],
-                    "recommended_next_instruction": "fix the import error in hello.py",
-                },
+            answer("inspecting"),
+            report_call(
+                False,
+                reason="the command failed",
+                checks=[{"name": "runs cleanly", "passed": False, "detail": "exit 1"}],
+                recommended_next_instruction="fix the import error in hello.py",
             ),
         ]
     )
@@ -495,7 +479,7 @@ def test_verifier_records_the_next_instruction_on_failure(tmp_path: Path) -> Non
 
 def test_verifier_fails_safely_without_a_verdict(tmp_path: Path) -> None:
     model = ScriptedModel(
-        [AIMessage(content="not sure"), AIMessage(content="still not sure"), AIMessage(content="nope")]
+        [answer("not sure"), answer("still not sure"), answer("nope")]
     )
 
     update = verifier_node(_state(tmp_path), model=model)
@@ -504,12 +488,8 @@ def test_verifier_fails_safely_without_a_verdict(tmp_path: Path) -> None:
     assert "no verdict" in update["last_error"]
 
 
-def test_run_verification_commands_records_outcomes(tmp_path: Path) -> None:
-    runtime = RuntimeState(workspace=tmp_path / "ws")
-
-    results = run_verification_commands(
-        runtime, ["echo hi", "exit 2", "   ", "rm -rf /"]
-    )
+def test_run_verification_commands_records_outcomes(state: RuntimeState) -> None:
+    results = run_verification_commands(state, ["echo hi", "exit 2", "   ", "rm -rf /"])
 
     assert len(results) == 3  # blanks are skipped
     assert results[0]["ok"] is True and results[0]["exit_code"] == 0
@@ -544,8 +524,7 @@ class CountingModel:
 
 
 def test_context_monitor_counts_with_the_models_tokenizer(tmp_path: Path) -> None:
-    state = _state(tmp_path)
-    state["messages"] = [HumanMessage(content="do the thing")]
+    state = _state(tmp_path, messages=[HumanMessage(content="do the thing")])
     model = CountingModel(12_345)
 
     update = context_monitor_node(state, model=model)
@@ -563,8 +542,7 @@ def test_context_monitor_counts_with_the_models_tokenizer(tmp_path: Path) -> Non
 
 
 def test_context_monitor_falls_back_to_characters(tmp_path: Path) -> None:
-    state = _state(tmp_path)
-    state["messages"] = [HumanMessage(content="x" * 4_000)]
+    state = _state(tmp_path, messages=[HumanMessage(content="x" * 4_000)])
     model = CountingModel(RuntimeError("no tokenizer here"))
 
     update = context_monitor_node(state, model=model)
@@ -577,8 +555,7 @@ def test_context_monitor_falls_back_to_characters(tmp_path: Path) -> None:
 
 
 def test_context_monitor_falls_back_without_the_method(tmp_path: Path) -> None:
-    state = _state(tmp_path)
-    state["messages"] = [HumanMessage(content="y" * 800)]
+    state = _state(tmp_path, messages=[HumanMessage(content="y" * 800)])
 
     update = context_monitor_node(state, model=ScriptedModel([]))
 
@@ -586,8 +563,7 @@ def test_context_monitor_falls_back_without_the_method(tmp_path: Path) -> None:
 
 
 def test_context_monitor_handles_a_useless_count(tmp_path: Path) -> None:
-    state = _state(tmp_path)
-    state["messages"] = [HumanMessage(content="z" * 400)]
+    state = _state(tmp_path, messages=[HumanMessage(content="z" * 400)])
 
     for count in (None, -5, "not a number"):
         update = context_monitor_node(state, model=CountingModel(count))
@@ -639,8 +615,7 @@ def test_context_monitor_reuses_the_stored_snapshot(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("limit", ["abc", None, "", 0, {"nope": 1}])
 def test_context_monitor_survives_a_junk_limit(limit: Any, tmp_path: Path) -> None:
-    state = _state(tmp_path)
-    state["context_token_limit"] = limit  # type: ignore[typeddict-item]
+    state = _state(tmp_path, context_token_limit=limit)
 
     update = context_monitor_node(state, model=CountingModel(1_000))
 
@@ -720,34 +695,28 @@ def test_context_monitor_ignores_junk_compression_events(tmp_path: Path) -> None
 def test_planner_and_verifier_direct_the_context_monitor(tmp_path: Path) -> None:
     plan_model = ScriptedModel(
         [
-            _tool_call("todo_write", {"plan_summary": "p", "todos": [{"id": "t1", "content": "c"}]}),
-            AIMessage(content="planned"),
+            plan_call(
+                summary="p",
+                todos=[{"id": "t1", "content": "c"}],
+                criteria=[],
+                commands=[],
+            ),
+            answer("planned"),
         ]
     )
     assert planner_node(_state(tmp_path), model=plan_model)["context_next_node"] == "verifier"
 
     failing = ScriptedModel(
         [
-            AIMessage(content="inspected"),
-            _tool_call(
-                "verification_report",
-                {"passed": False, "reason": "nope", "checks": [], "recommended_next_instruction": "fix"},
-            ),
+            answer("inspected"),
+            report_call(False, reason="nope", checks=[], recommended_next_instruction="fix"),
         ]
     )
     failed = verifier_node(_state(tmp_path, verification_commands=["exit 1"]), model=failing)
     assert failed["passed"] is False
     assert failed["context_next_node"] == "planner"
 
-    passing = ScriptedModel(
-        [
-            AIMessage(content="inspected"),
-            _tool_call(
-                "verification_report",
-                {"passed": True, "reason": "fine", "checks": [], "recommended_next_instruction": ""},
-            ),
-        ]
-    )
+    passing = _passing_verifier()
     verified = verifier_node(_state(tmp_path, verification_commands=["echo ok"]), model=passing)
     assert verified["passed"] is True
     assert "context_next_node" not in verified  # nothing follows but the final node
@@ -806,8 +775,8 @@ def _compressible_state(tmp_path: Path, **extra: Any):
     state["messages"] = [
         HumanMessage(content="write hello.py"),
         AIMessage(content="I will write the file"),
-        _tool_call("file_write", {"file_path": "hello.py", "content": "print('Hello')\n"}),
-        ToolMessage(content="Created hello.py", tool_call_id="c1"),
+        write_call(),
+        ToolMessage(content="Created hello.py", tool_call_id="c4"),
         AIMessage(content="now run it"),
         ToolMessage(content="exit code 1: NameError", tool_call_id="c2"),
     ]
@@ -838,19 +807,12 @@ def test_context_compressor_replaces_the_transcript(tmp_path: Path) -> None:
 
 def test_context_compressor_applies_the_replace_to_a_real_graph(tmp_path: Path) -> None:
     """add_messages must drop the old transcript and keep only the summary."""
-    from functools import partial
-
-    from langgraph.graph import END, START, StateGraph
-
-    from wqagent.graph import WQGraphState
-
-    state = _compressible_state(tmp_path)
     graph = StateGraph(WQGraphState)
     graph.add_node("compress", partial(context_compressor_node, model=CompressorModel()))
     graph.add_edge(START, "compress")
     graph.add_edge("compress", END)
 
-    result = graph.compile().invoke(state, {"configurable": {}})
+    result = graph.compile().invoke(_compressible_state(tmp_path), {"configurable": {}})
 
     assert [message.type for message in result["messages"]] == ["ai"]
     assert result["messages"][0].content == COMPRESSION_PAYLOAD["summary"]
@@ -859,9 +821,8 @@ def test_context_compressor_applies_the_replace_to_a_real_graph(tmp_path: Path) 
 
 def test_context_compressor_sends_the_prompt_and_the_context(tmp_path: Path) -> None:
     state = _compressible_state(tmp_path, research_notes="found: use print()")
-
-    context_compressor_node(state, model=CompressorModel())
     model = CompressorModel()
+
     context_compressor_node(state, model=model)
 
     sent = model.seen[0]
@@ -1081,17 +1042,17 @@ def test_context_compressor_writes_the_notepad(tmp_path: Path) -> None:
 
 
 def test_context_compressor_appends_to_an_existing_notepad(tmp_path: Path) -> None:
-    runtime = RuntimeState(workspace=tmp_path / "ws")
+    workspace = tmp_path / "ws"
     state = _compressible_state(tmp_path)
-    runtime.workspace.mkdir(parents=True, exist_ok=True)
-    (runtime.workspace / "NOTEPAD.md").write_text(
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "NOTEPAD.md").write_text(
         "# Notepad\n\n## Earlier note\n\nkeep me\n", encoding="utf-8"
     )
     state["compression_events"] = [{"node": "context_compressor", "attempt": 0}]
 
     context_compressor_node(state, model=CompressorModel())
 
-    text = (runtime.workspace / "NOTEPAD.md").read_text(encoding="utf-8")
+    text = (workspace / "NOTEPAD.md").read_text(encoding="utf-8")
     assert text.count("# Notepad") == 1  # the title is not repeated
     assert "## Earlier note" in text and "keep me" in text  # nothing is lost
     assert "## Compression #2" in text  # numbered after the recorded compression
@@ -1099,9 +1060,9 @@ def test_context_compressor_appends_to_an_existing_notepad(tmp_path: Path) -> No
 
 
 def test_context_compressor_caps_the_notepad(tmp_path: Path) -> None:
-    runtime = RuntimeState(workspace=tmp_path / "ws")
-    runtime.workspace.mkdir(parents=True, exist_ok=True)
-    (runtime.workspace / "NOTEPAD.md").write_text(
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "NOTEPAD.md").write_text(
         "# Notepad\n\n" + "".join(f"## Old #{n}\n\n{'x' * 2000}\n\n" for n in range(10)),
         encoding="utf-8",
     )
@@ -1109,7 +1070,7 @@ def test_context_compressor_caps_the_notepad(tmp_path: Path) -> None:
 
     context_compressor_node(state, model=CompressorModel())
 
-    text = (runtime.workspace / "NOTEPAD.md").read_text(encoding="utf-8")
+    text = (workspace / "NOTEPAD.md").read_text(encoding="utf-8")
     assert len(text) <= NOTEPAD_FILE_CHARS + 2000  # bounded, newest sections kept
     assert "## Old #9" in text  # the newest old section survives
     assert "## Compression #1" in text
@@ -1167,7 +1128,7 @@ def test_context_compressor_needs_a_runtime() -> None:
 # -- layered memory injection ------------------------------------------------
 def test_planner_injects_the_layered_memory(tmp_path: Path) -> None:
     state = _state(tmp_path, research_notes="found: use python", todos=[make_todo("t1", "do it")])
-    model = ScriptedModel([AIMessage(content="planned")])
+    model = ScriptedModel([answer("planned")])
     events: list[dict[str, Any]] = []
 
     update = planner_node(state, model=model, on_event=events.append)
@@ -1188,15 +1149,7 @@ def test_planner_injects_the_layered_memory(tmp_path: Path) -> None:
 
 def test_verifier_injects_the_layered_memory(tmp_path: Path) -> None:
     state = _state(tmp_path, verification_commands=["echo ok"])
-    model = ScriptedModel(
-        [
-            AIMessage(content="inspected"),
-            _tool_call(
-                "verification_report",
-                {"passed": True, "reason": "fine", "checks": [], "recommended_next_instruction": ""},
-            ),
-        ]
-    )
+    model = _passing_verifier()
     events: list[dict[str, Any]] = []
 
     update = verifier_node(state, model=model, on_event=events.append)
@@ -1213,7 +1166,7 @@ def test_injected_memory_carries_the_durable_files(tmp_path: Path) -> None:
     (tmp_path / "ws").mkdir(parents=True, exist_ok=True)
     (tmp_path / "ws" / "NOTEPAD.md").write_text("durable: always use python3", encoding="utf-8")
     (tmp_path / "ws" / "HISTORY_SUMMARY.md").write_text("history: earlier attempt", encoding="utf-8")
-    model = ScriptedModel([AIMessage(content="planned")])
+    model = ScriptedModel([answer("planned")])
 
     planner_node(state, model=model)
 
@@ -1229,7 +1182,7 @@ def test_memory_event_is_written_to_the_graph_stream(tmp_path: Path) -> None:
     state = _state(tmp_path)
     streamed: list[dict[str, Any]] = []
 
-    planner_node(state, model=ScriptedModel([AIMessage(content="planned")]), writer=streamed.append)
+    planner_node(state, model=ScriptedModel([answer("planned")]), writer=streamed.append)
 
     memory_events = [event for event in streamed if event["type"] == "memory"]
     assert len(memory_events) == 1
@@ -1241,27 +1194,25 @@ def test_memory_event_is_written_to_the_graph_stream(tmp_path: Path) -> None:
 def test_planner_persists_the_plan_to_todo_md(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "write then run",
-                    "todos": [{"id": "t1", "content": "write hello.py"}],
-                    "acceptance_criteria": ["prints Hello"],
-                    "verification_commands": ["python hello.py"],
-                },
+            plan_call(
+                summary="write then run",
+                todos=[{"id": "t1", "content": "write hello.py"}],
+                criteria=["prints Hello"],
+                commands=["python hello.py"],
             ),
-            AIMessage(content="planned"),
+            answer("planned"),
         ]
     )
+    state = _state(tmp_path)
 
-    update = planner_node(_state(tmp_path), model=model)
+    update = planner_node(state, model=model)
 
     text = (tmp_path / "ws" / "TODO.md").read_text(encoding="utf-8")
     assert "**Task:** write hello.py" in text
     assert "write then run" in text
     assert "- [ ] t1: write hello.py" in text
     assert "- `python hello.py`" in text
-    plan = read_todos(RuntimeState(workspace=tmp_path / "ws"))
+    plan = read_todos(state["runtime"])
     assert plan["todos"] == update["todos"]
     assert plan["acceptance_criteria"] == ["prints Hello"]
 
@@ -1270,15 +1221,7 @@ def test_verifier_persists_completed_todos(tmp_path: Path) -> None:
     state = _state(
         tmp_path, todos=[make_todo("t1", "write hello.py")], verification_commands=["echo ok"]
     )
-    model = ScriptedModel(
-        [
-            AIMessage(content="inspected"),
-            _tool_call(
-                "verification_report",
-                {"passed": True, "reason": "fine", "checks": [], "recommended_next_instruction": ""},
-            ),
-        ]
-    )
+    model = _passing_verifier()
 
     update = verifier_node(state, model=model)
 
@@ -1290,11 +1233,11 @@ def test_code_agent_updates_todo_md_while_working(tmp_path: Path) -> None:
     """The code agent's persist hook keeps the file current mid-run."""
     model = ScriptedModel(
         [
-            _tool_call("call_code_agent", {"instruction": "write it"}, "c2"),
-            _tool_call("file_write", {"file_path": "hello.py", "content": "print(1)\n"}, "c3"),
-            _tool_call("todo_update", {"updates": [{"id": "t1", "status": "completed"}]}, "c4"),
-            AIMessage(content="wrote hello.py"),
-            AIMessage(content="done"),
+            code_call("write it", "c2"),
+            write_call("hello.py", "print(1)\n", "c3"),
+            todo_update_call({"id": "t1", "status": "completed"}, call_id="c4"),
+            answer("wrote hello.py"),
+            answer("done"),
         ]
     )
 
@@ -1304,19 +1247,18 @@ def test_code_agent_updates_todo_md_while_working(tmp_path: Path) -> None:
     assert "- [x] t1: write hello.py" in text  # written by the specialist's hook
 
 
-def test_planner_resumes_the_plan_from_todo_md(tmp_path: Path) -> None:
-    runtime = RuntimeState(workspace=tmp_path / "ws")
+def test_planner_resumes_the_plan_from_todo_md(state: RuntimeState) -> None:
     write_todos(
-        runtime,
+        state,
         [make_todo("t1", "write hello.py", status="completed"), make_todo("t2", "run it")],
         task="write hello.py",
         plan_summary="write then run",
         acceptance_criteria=["prints Hello"],
         verification_commands=["python hello.py"],
     )
-    model = ScriptedModel([AIMessage(content="continuing")])
+    model = ScriptedModel([answer("continuing")])
 
-    update = planner_node(new_graph_state("write hello.py", runtime), model=model)
+    update = planner_node(new_graph_state("write hello.py", state), model=model)
 
     prompt = model.seen[0][1].content
     assert "left an unfinished plan for this exact task in TODO.md" in prompt
@@ -1326,46 +1268,39 @@ def test_planner_resumes_the_plan_from_todo_md(tmp_path: Path) -> None:
     assert update["acceptance_criteria"] == ["prints Hello"]
 
 
-def test_planner_ignores_a_todo_md_from_another_task(tmp_path: Path) -> None:
-    runtime = RuntimeState(workspace=tmp_path / "ws")
-    write_todos(runtime, [make_todo("t9", "something else")], task="a different task")
-    model = ScriptedModel([AIMessage(content="fresh plan")])
+@pytest.mark.parametrize(
+    ("prior_task", "prior_todos"),
+    [
+        ("a different task", [make_todo("t9", "something else")]),
+        ("write hello.py", [make_todo("t1", "write hello.py", status="completed")]),
+    ],
+    ids=["another-task", "finished-plan"],
+)
+def test_planner_ignores_a_todo_md_that_is_not_a_resume_point(
+    prior_task: str, prior_todos: list[Any], state: RuntimeState
+) -> None:
+    """Neither another task's file nor a plan that is already done is resumed."""
+    write_todos(state, prior_todos, task=prior_task)
+    model = ScriptedModel([answer("fresh plan")])
 
-    update = planner_node(new_graph_state("write hello.py", runtime), model=model)
+    update = planner_node(new_graph_state("write hello.py", state), model=model)
 
     assert "unfinished plan" not in model.seen[0][1].content
     assert update["todos"] == []  # nothing was adopted
 
 
-def test_planner_ignores_a_finished_plan(tmp_path: Path) -> None:
-    """A completed TODO.md is not a resume point - it is just the last run's record."""
-    runtime = RuntimeState(workspace=tmp_path / "ws")
-    write_todos(
-        runtime,
-        [make_todo("t1", "write hello.py", status="completed")],
-        task="write hello.py",
-    )
-    model = ScriptedModel([AIMessage(content="fresh plan")])
+def test_planner_keeps_the_state_plan_over_todo_md(state: RuntimeState) -> None:
+    write_todos(state, [make_todo("t9", "stale")], task="write hello.py")
+    graph = new_graph_state("write hello.py", state, todos=[make_todo("t1", "current")])
 
-    update = planner_node(new_graph_state("write hello.py", runtime), model=model)
+    planner_node(graph, model=ScriptedModel([answer("planned")]))
 
-    assert "unfinished plan" not in model.seen[0][1].content
-    assert update["todos"] == []
-
-
-def test_planner_keeps_the_state_plan_over_todo_md(tmp_path: Path) -> None:
-    runtime = RuntimeState(workspace=tmp_path / "ws")
-    write_todos(runtime, [make_todo("t9", "stale")], task="write hello.py")
-    state = new_graph_state("write hello.py", runtime, todos=[make_todo("t1", "current")])
-
-    planner_node(state, model=ScriptedModel([AIMessage(content="planned")]))
-
-    assert read_todos(runtime)["todos"][0]["id"] == "t1"  # the state wins, the file is rewritten
+    assert read_todos(state)["todos"][0]["id"] == "t1"  # the state wins, the file is rewritten
 
 
 # -- shell guidance for verification commands --------------------------------
 def test_planner_brief_names_the_shell(tmp_path: Path) -> None:
-    model = ScriptedModel([AIMessage(content="planned")])
+    model = ScriptedModel([answer("planned")])
 
     planner_node(_state(tmp_path), model=model)
 
@@ -1381,7 +1316,7 @@ def test_planner_brief_names_the_shell(tmp_path: Path) -> None:
 # -- model plumbing ----------------------------------------------------------
 def test_get_model_is_lazy_and_cached(tmp_path: Path, monkeypatch: Any) -> None:
     created: list[str] = []
-    model = ScriptedModel([AIMessage(content="ok")])
+    model = ScriptedModel([answer("ok")])
 
     def fake_create_model(**kwargs: Any) -> ScriptedModel:
         created.append("called")
@@ -1403,77 +1338,49 @@ def test_get_model_is_lazy_and_cached(tmp_path: Path, monkeypatch: Any) -> None:
 # -- the whole loop, wired into a real graph ---------------------------------
 def test_graph_retries_after_a_failed_verification(tmp_path: Path) -> None:
     """planner -> verifier (fails) -> planner -> verifier (passes) -> END."""
-    from langgraph.graph import END, START, StateGraph
-
-    from wqagent.graph import WQGraphState
-
     workspace = tmp_path / "ws"
-    runtime = RuntimeState(workspace=workspace)
     model = ScriptedModel(
         [
             # attempt 1: plan + delegate, with a verification command that fails
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "write hello.py and run it",
-                    "todos": [{"id": "t1", "content": "write hello.py"}],
-                    "acceptance_criteria": ["hello.py runs cleanly"],
-                    "verification_commands": ["exit 1"],
-                },
+            plan_call(
+                summary="write hello.py and run it",
+                todos=[{"id": "t1", "content": "write hello.py"}],
+                criteria=["hello.py runs cleanly"],
+                commands=["exit 1"],
             ),
-            _tool_call("call_code_agent", {"instruction": "write hello.py"}, "c2"),
-            _tool_call("file_write", {"file_path": "hello.py", "content": "print('Hello')\n"}),
-            AIMessage(content="Wrote hello.py."),
-            AIMessage(content="Delegated the implementation."),
-            AIMessage(content="Inspected the file, it looks right."),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": False,
-                    "reason": "the verification command exited non-zero",
-                    "checks": [
-                        {"name": "hello.py runs cleanly", "passed": False, "detail": "exit 1"}
-                    ],
-                    "recommended_next_instruction": "re-run the program and make it exit 0",
-                },
+            code_call("write hello.py", "c2"),
+            write_call(),
+            answer("Wrote hello.py."),
+            answer("Delegated the implementation."),
+            answer("Inspected the file, it looks right."),
+            report_call(
+                False,
+                reason="the verification command exited non-zero",
+                checks=[{"name": "hello.py runs cleanly", "passed": False, "detail": "exit 1"}],
+                recommended_next_instruction="re-run the program and make it exit 0",
             ),
             # attempt 2: revised plan (a command that passes) and the missing fix
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "verify by actually running the program",
-                    "todos": [{"id": "t1", "content": "write hello.py", "status": "completed"}],
-                    "acceptance_criteria": ["hello.py runs cleanly"],
-                    "verification_commands": ["echo ok"],
-                },
+            plan_call(
+                summary="verify by actually running the program",
+                todos=[{"id": "t1", "content": "write hello.py", "status": "completed"}],
+                criteria=["hello.py runs cleanly"],
+                commands=["echo ok"],
             ),
-            _tool_call("call_code_agent", {"instruction": "make it exit 0"}, "c3"),
-            AIMessage(content="Re-ran the program, it works."),
-            AIMessage(content="Delegated the fix."),
-            AIMessage(content="Verified the file and the command output."),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": True,
-                    "reason": "the program prints Hello and the command succeeded",
-                    "checks": [{"name": "hello.py runs cleanly", "passed": True, "detail": "exit 0"}],
-                    "recommended_next_instruction": "",
-                },
+            code_call("make it exit 0", "c3"),
+            answer("Re-ran the program, it works."),
+            answer("Delegated the fix."),
+            answer("Verified the file and the command output."),
+            report_call(
+                reason="the program prints Hello and the command succeeded",
+                checks=[{"name": "hello.py runs cleanly", "passed": True, "detail": "exit 0"}],
             ),
         ]
     )
     set_model(model)
 
-    graph = StateGraph(WQGraphState)
-    graph.add_node("planner", planner_node)
-    graph.add_node("verifier", verifier_node)
-    graph.add_edge(START, "planner")
-    graph.add_edge("planner", "verifier")
-    graph.add_conditional_edges(
-        "verifier", verifier_route, {"planner": "planner", "final": END}
+    result = _planner_verifier_graph().invoke(
+        new_graph_state("write hello.py", runtime_for(workspace), max_attempts=3)
     )
-
-    result = graph.compile().invoke(new_graph_state("write hello.py", runtime, max_attempts=3))
 
     assert result["passed"] is True
     assert result["attempts"] == 2
@@ -1498,50 +1405,32 @@ def test_graph_retries_after_a_failed_verification(tmp_path: Path) -> None:
 
 def test_graph_gives_up_after_max_attempts(tmp_path: Path) -> None:
     """A verifier that always fails must not loop forever."""
-    from langgraph.graph import END, START, StateGraph
-
-    from wqagent.graph import WQGraphState
-
-    runtime = RuntimeState(workspace=tmp_path / "ws")
     responses: list[Any] = []
     for attempt in range(2):  # max_attempts=2 -> two planner rounds
         responses.extend(
             [
-                _tool_call(
-                    "todo_write",
-                    {
-                        "plan_summary": f"attempt {attempt + 1}",
-                        "todos": [{"id": "t1", "content": "do the thing"}],
-                        "acceptance_criteria": ["it works"],
-                        "verification_commands": ["exit 1"],
-                    },
+                plan_call(
+                    summary=f"attempt {attempt + 1}",
+                    todos=[{"id": "t1", "content": "do the thing"}],
+                    criteria=["it works"],
+                    commands=["exit 1"],
                 ),
-                AIMessage(content=f"planner round {attempt + 1}"),
-                AIMessage(content="inspected"),
-                _tool_call(
-                    "verification_report",
-                    {
-                        "passed": False,
-                        "reason": "still failing",
-                        "checks": [],
-                        "recommended_next_instruction": "try again",
-                    },
+                answer(f"planner round {attempt + 1}"),
+                answer("inspected"),
+                report_call(
+                    False,
+                    reason="still failing",
+                    checks=[],
+                    recommended_next_instruction="try again",
                 ),
             ]
         )
     model = ScriptedModel(responses)
     set_model(model)
 
-    graph = StateGraph(WQGraphState)
-    graph.add_node("planner", planner_node)
-    graph.add_node("verifier", verifier_node)
-    graph.add_edge(START, "planner")
-    graph.add_edge("planner", "verifier")
-    graph.add_conditional_edges(
-        "verifier", verifier_route, {"planner": "planner", "final": END}
+    result = _planner_verifier_graph().invoke(
+        new_graph_state("do the thing", runtime_for(tmp_path / "ws"), max_attempts=2)
     )
-
-    result = graph.compile().invoke(new_graph_state("do the thing", runtime, max_attempts=2))
 
     assert result["passed"] is False
     assert result["attempts"] == 2  # stopped exactly at the budget

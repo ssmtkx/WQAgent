@@ -8,80 +8,27 @@ from typing import Any
 
 import pytest
 import wqagent.cli.app as cli_module
-from langchain_core.messages import AIMessage, BaseMessage
 from typer.testing import CliRunner
 
+from helpers import (
+    ScriptedModel,
+    answer,
+    chat_script,
+    passing_script,
+    plan_call,
+    report_call,
+    route_answer,
+    tool_call,
+    workflow_script,
+)
 from wqagent import __version__
 from wqagent.cli.app import app
 from wqagent.core.state import RuntimeState
 from wqagent.providers import ProviderConfigError
 
 runner = CliRunner()
-
-
-class ScriptedModel:
-    """Fake chat model: replays scripted responses, records bind_tools() and calls."""
-
-    def __init__(self, responses: list[Any]) -> None:
-        self.responses = list(responses)
-        self.bound: list[list[str]] = []
-        self.seen: list[list[BaseMessage]] = []
-
-    def bind_tools(self, tools: list[Any], **kwargs: Any) -> "ScriptedModel":
-        self.bound.append([tool.name for tool in tools])
-        return self
-
-    def invoke(self, messages: list[BaseMessage]) -> Any:
-        self.seen.append(list(messages))
-        if not self.responses:
-            raise AssertionError("ScriptedModel ran out of responses")
-        return self.responses.pop(0)
-
-
-def _tool_call(name: str, args: dict[str, Any], call_id: str = "c1") -> AIMessage:
-    return AIMessage(
-        content="", tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}]
-    )
-
-
-def _router_answer(route: str = "workflow", confidence: float = 0.9) -> AIMessage:
-    """The entry router's answer (the CLI runs it before the workflow)."""
-    return AIMessage(
-        content='{"route":"%s","reason":"scripted","confidence":%s}' % (route, confidence)
-    )
-
-
-def _passing_script(
-    file_path: str = "hello.py", content: str = "print('hi')\n", *, router: bool = True
-) -> list[Any]:
-    """Router + the eight responses a passing planner -> codeAgent -> verifier -> final run needs."""
-    return [
-        *([_router_answer()] if router else []),
-        _tool_call(
-            "todo_write",
-            {
-                "plan_summary": f"write {file_path}, then run it",
-                "todos": [{"id": "t1", "content": f"write {file_path}"}],
-                "acceptance_criteria": [f"{file_path} runs cleanly"],
-                "verification_commands": ["echo ok"],
-            },
-        ),
-        _tool_call("call_code_agent", {"instruction": f"write {file_path}"}, "c2"),
-        _tool_call("file_write", {"file_path": file_path, "content": content}, "c3"),
-        AIMessage(content=f"Created {file_path}."),
-        AIMessage(content="Delegated the implementation."),
-        AIMessage(content="Inspected the file."),
-        _tool_call(
-            "verification_report",
-            {
-                "passed": True,
-                "reason": "the file exists and the command succeeded",
-                "checks": [{"name": f"{file_path} runs cleanly", "passed": True, "detail": "exit 0"}],
-                "recommended_next_instruction": "",
-            },
-        ),
-        AIMessage(content=f"Done: created {file_path} and verified it."),
-    ]
+HELLO_CONTENT = "print('hi')\n"
+FINAL_TEXT = "Done: created hello.py and verified it."
 
 
 def _use_scripted(monkeypatch: Any, responses: list[Any]) -> ScriptedModel:
@@ -202,14 +149,14 @@ def test_missing_api_key_is_reported(tmp_path: Path, monkeypatch: Any) -> None:
 def test_run_end_to_end_with_a_scripted_model(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
     workspace = tmp_path / "ws"
-    _use_scripted(monkeypatch, _passing_script())
+    _use_scripted(monkeypatch, workflow_script(content=HELLO_CONTENT, final_text=FINAL_TEXT))
 
     result = runner.invoke(app, ["create hello.py", "-w", str(workspace)])
 
     assert result.exit_code == 0
-    assert (workspace / "hello.py").read_text(encoding="utf-8") == "print('hi')\n"
+    assert (workspace / "hello.py").read_text(encoding="utf-8") == HELLO_CONTENT
     output = _flat(result.output)
-    assert "Done: created hello.py and verified it." in output
+    assert FINAL_TEXT in output
     # every node and the delegated specialist reported itself (labels fall back to
     # ASCII when the captured stream cannot encode the emoji)
     for marker in ("Planner", "codeAgent", "Verifier", "Final"):
@@ -217,8 +164,9 @@ def test_run_end_to_end_with_a_scripted_model(tmp_path: Path, monkeypatch: Any) 
     assert "verdict" in output and "passed" in output
 
 
-def test_renderer_prints_the_handoff_and_specialist_headers(monkeypatch: Any) -> None:
-    """The handoff line and the specialist header, rendered into a clean stream."""
+# -- the event renderer ------------------------------------------------------
+def _rendered(monkeypatch: Any, events: list[dict[str, Any]], *, emoji: bool) -> str:
+    """Render *events* into a captured console and return the raw text."""
     from io import StringIO
 
     from rich.console import Console
@@ -227,242 +175,248 @@ def test_renderer_prints_the_handoff_and_specialist_headers(monkeypatch: Any) ->
     monkeypatch.setattr(
         cli_module, "console", Console(file=stream, width=200, force_terminal=False)
     )
-    monkeypatch.setattr(cli_module, "_can_encode", lambda text: True)  # emoji path
+    monkeypatch.setattr(cli_module, "_can_encode", lambda text: emoji)
     renderer = cli_module._NodeRenderer(verbose=False)
-
-    renderer.render(
-        {"type": "handoff", "node": "planner", "from": "planner", "to": "codeAgent",
-         "instruction": "write hello.py"}
-    )
-    renderer.render(
-        {"type": "tool_call", "node": "codeAgent", "name": "file_write",
-         "args": {"file_path": "hello.py", "content": "print('hi')\n"}}
-    )
-    renderer.render(
-        {"type": "node_end", "node": "planner",
-         "update": {"plan_summary": "write it", "todos": [{"id": "t1", "content": "write it"}],
-                    "verification_commands": ["echo ok"],
-                    "agent_handoffs": [{"to_agent": "codeAgent", "instruction": "write hello.py"}],
-                    "last_actor_summary": "Delegated the implementation."}}
-    )
-
-    text = stream.getvalue()
-    assert "↪ planner → 🛠 codeAgent" in text
-    assert "   write hello.py" in text
-    assert "🛠 codeAgent" in text  # the specialist introduced itself on its first event
-    assert "📋 Planner" in text
-    assert "-> file_write hello.py" in text
-    assert "$ echo ok" in text
+    for event in events:
+        renderer.render(event)
+    return stream.getvalue()
 
 
-def test_renderer_prints_the_context_monitor(tmp_path: Path, monkeypatch: Any) -> None:
-    from io import StringIO
+_HANDOFF_EVENTS: list[dict[str, Any]] = [
+    {
+        "type": "handoff",
+        "node": "planner",
+        "from": "planner",
+        "to": "codeAgent",
+        "instruction": "write hello.py",
+    },
+    {
+        "type": "tool_call",
+        "node": "codeAgent",
+        "name": "file_write",
+        "args": {"file_path": "hello.py", "content": "print('hi')\n"},
+    },
+    {
+        "type": "node_end",
+        "node": "planner",
+        "update": {
+            "plan_summary": "write it",
+            "todos": [{"id": "t1", "content": "write it"}],
+            "verification_commands": ["echo ok"],
+            "agent_handoffs": [{"to_agent": "codeAgent", "instruction": "write hello.py"}],
+            "last_actor_summary": "Delegated the implementation.",
+        },
+    },
+]
 
-    from rich.console import Console
+_CONTEXT_MONITOR_EVENTS: list[dict[str, Any]] = [
+    {
+        "type": "node_end",
+        "node": "context_monitor",
+        "update": {
+            "context_token_count": 1200,
+            "context_token_limit": 400_000,
+            "context_should_compress": False,
+            "context_next_node": "verifier",
+        },
+    },
+    {
+        "type": "node_end",
+        "node": "context_monitor",
+        "update": {
+            "context_token_count": 401_000,
+            "context_should_compress": True,
+            "context_next_node": "planner",
+        },
+    },
+]
 
-    stream = StringIO()
-    monkeypatch.setattr(
-        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
-    )
-    monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)  # ASCII path
-    renderer = cli_module._NodeRenderer(verbose=False)
-
-    renderer.render(
-        {
-            "type": "node_end",
-            "node": "context_monitor",
-            "update": {
-                "context_token_count": 1200,
-                "context_token_limit": 400_000,
-                "context_should_compress": False,
-                "context_next_node": "verifier",
-            },
-        }
-    )
-    renderer.render(
-        {
-            "type": "node_end",
-            "node": "context_monitor",
-            "update": {
-                "context_token_count": 401_000,
-                "context_should_compress": True,
-                "context_next_node": "planner",
-            },
-        }
-    )
-
-    text = _flat(stream.getvalue())
-    assert "Context" in text
-    assert "1200/400000 tokens (ok) -> next: verifier" in text
-    assert "401000 tokens (over budget) -> next: planner" in text
-
-
-def test_renderer_prints_the_context_compressor(monkeypatch: Any) -> None:
-    from io import StringIO
-
-    from rich.console import Console
-
-    stream = StringIO()
-    monkeypatch.setattr(
-        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
-    )
-    monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)  # ASCII path
-    renderer = cli_module._NodeRenderer(verbose=False)
-
-    renderer.render(
-        {
-            "type": "context_compressed",
-            "node": "context_compressor",
-            "ok": True,
-            "error": "",
-            "tokens_before": 412_000,
-            "tokens_after": 3_100,
-            "messages_before": 24,
-            "messages_after": 1,
-            "persisted": {"ok": True, "path": "HISTORY_SUMMARY.md", "error": ""},
-            "notepad": {"ok": True, "path": "NOTEPAD.md", "error": ""},
-            "history_path": "HISTORY_SUMMARY.md",
-            "notepad_path": "NOTEPAD.md",
-        }
-    )
-    renderer.render(
-        {
-            "type": "node_end",
-            "node": "context_compressor",
-            "update": {
-                "context_summary": "compressed: hello.py written",
-                "compression_events": [
-                    {
-                        "tokens_before": 412_000,
-                        "tokens_after": 3_100,
-                        "messages_before": 24,
-                        "messages_after": 1,
-                        "token_limit": 400_000,
-                        "summary": "compressed",
-                    }
-                ],
-            },
-        }
-    )
+_CONTEXT_COMPRESSOR_EVENTS: list[dict[str, Any]] = [
+    {
+        "type": "context_compressed",
+        "node": "context_compressor",
+        "ok": True,
+        "error": "",
+        "tokens_before": 412_000,
+        "tokens_after": 3_100,
+        "messages_before": 24,
+        "messages_after": 1,
+        "persisted": {"ok": True, "path": "HISTORY_SUMMARY.md", "error": ""},
+        "notepad": {"ok": True, "path": "NOTEPAD.md", "error": ""},
+        "history_path": "HISTORY_SUMMARY.md",
+        "notepad_path": "NOTEPAD.md",
+    },
+    {
+        "type": "node_end",
+        "node": "context_compressor",
+        "update": {
+            "context_summary": "compressed: hello.py written",
+            "compression_events": [
+                {
+                    "tokens_before": 412_000,
+                    "tokens_after": 3_100,
+                    "messages_before": 24,
+                    "messages_after": 1,
+                    "token_limit": 400_000,
+                    "summary": "compressed",
+                }
+            ],
+        },
+    },
     # a fallback compression says so
-    renderer.render(
-        {
-            "type": "context_compressed",
-            "node": "context_compressor",
-            "ok": False,
-            "error": "RuntimeError: provider exploded",
-            "tokens_before": 10,
-            "tokens_after": 20,
-            "persisted": {"ok": False, "error": "OSError: read-only"},
-        }
-    )
+    {
+        "type": "context_compressed",
+        "node": "context_compressor",
+        "ok": False,
+        "error": "RuntimeError: provider exploded",
+        "tokens_before": 10,
+        "tokens_after": 20,
+        "persisted": {"ok": False, "error": "OSError: read-only"},
+    },
+]
 
-    text = _flat(stream.getvalue())
-    assert "Compressor" in text
-    # before/after comparison: both message count and tokens
-    assert "compressed 24 msgs/412000 tokens -> 1 msg/3100 tokens [HISTORY_SUMMARY.md, NOTEPAD.md]" in text
-    assert "24 msgs/412000 tokens -> 1 msg/3100 tokens (limit 400000)" in text
-    assert "compressed: hello.py written" not in text  # only in verbose mode
-    assert "compressed 10 -> 20 tokens (history not persisted)" in text
-    assert "fallback summary: RuntimeError: provider exploded" in text
+_MEMORY_EVENTS: list[dict[str, Any]] = [
+    {
+        "type": "memory",
+        "node": "planner",
+        "digest": "1 todos, 0 sources, 1 handoffs, notepad=yes, history=no",
+        "chars": 1517,
+        "memory": {"rules": {}, "working_memory": {}, "history_summary_store": {}},
+    }
+]
 
 
-def test_renderer_prints_the_injected_memory(monkeypatch: Any) -> None:
-    from io import StringIO
+@pytest.mark.parametrize(
+    ("events", "emoji", "raw", "collapsed", "absent"),
+    [
+        (
+            _HANDOFF_EVENTS,
+            True,
+            [
+                "↪ planner → 🛠 codeAgent",
+                "   write hello.py",
+                "🛠 codeAgent",  # the specialist introduced itself on its first event
+                "📋 Planner",
+                "-> file_write hello.py",
+                "$ echo ok",
+            ],
+            [],
+            [],
+        ),
+        (
+            _CONTEXT_MONITOR_EVENTS,
+            False,
+            [],
+            [
+                "Context",
+                "1200/400000 tokens (ok) -> next: verifier",
+                "401000 tokens (over budget) -> next: planner",
+            ],
+            [],
+        ),
+        (
+            _CONTEXT_COMPRESSOR_EVENTS,
+            False,
+            [],
+            [
+                "Compressor",
+                # before/after comparison: both message count and tokens
+                "compressed 24 msgs/412000 tokens -> 1 msg/3100 tokens "
+                "[HISTORY_SUMMARY.md, NOTEPAD.md]",
+                "24 msgs/412000 tokens -> 1 msg/3100 tokens (limit 400000)",
+                "compressed 10 -> 20 tokens (history not persisted)",
+                "fallback summary: RuntimeError: provider exploded",
+            ],
+            ["compressed: hello.py written"],  # only in verbose mode
+        ),
+        (
+            _MEMORY_EVENTS,
+            False,
+            [],
+            [
+                "Planner",  # the header opens on the node's first event
+                "memory[planner]: 1 todos, 0 sources, 1 handoffs, notepad=yes, "
+                "history=no (1517 chars)",
+            ],
+            [],
+        ),
+    ],
+)
+def test_renderer_prints_the_node_events(
+    monkeypatch: Any,
+    events: list[dict[str, Any]],
+    emoji: bool,
+    raw: list[str],
+    collapsed: list[str],
+    absent: list[str],
+) -> None:
+    """Every node event renders the line the operator needs to read."""
+    text = _rendered(monkeypatch, events, emoji=emoji)
 
-    from rich.console import Console
-
-    stream = StringIO()
-    monkeypatch.setattr(
-        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
-    )
-    monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)  # ASCII path
-    renderer = cli_module._NodeRenderer(verbose=False)
-
-    renderer.render(
-        {
-            "type": "memory",
-            "node": "planner",
-            "digest": "1 todos, 0 sources, 1 handoffs, notepad=yes, history=no",
-            "chars": 1517,
-            "memory": {"rules": {}, "working_memory": {}, "history_summary_store": {}},
-        }
-    )
-
-    text = _flat(stream.getvalue())
-    assert "Planner" in text  # the header opens on the node's first event
-    assert "memory[planner]: 1 todos, 0 sources, 1 handoffs, notepad=yes, history=no (1517 chars)" in text
+    for expected in raw:
+        assert expected in text, expected
+    for expected in collapsed:
+        assert expected in _flat(text), expected
+    for unexpected in absent:
+        assert unexpected not in _flat(text), unexpected
 
 
 def _risky_bash_script(command: str = "pip install nothing-here") -> list[Any]:
     """A run whose agent calls bash with a risky command."""
     return [
-        _router_answer(),
-        _tool_call(
-            "todo_write",
-            {
-                "plan_summary": "install something",
-                "todos": [{"id": "t1", "content": "install it"}],
-                "acceptance_criteria": ["it is installed"],
-                "verification_commands": ["echo ok"],
-            },
-            "r1",
+        route_answer(),
+        plan_call(
+            summary="install something",
+            todos=[{"id": "t1", "content": "install it"}],
+            criteria=["it is installed"],
         ),
-        _tool_call("call_code_agent", {"instruction": "install it"}, "r2"),
-        _tool_call("bash", {"command": command}, "r3"),
-        AIMessage(content="Ran the install."),
-        AIMessage(content="Done with the install."),
-        AIMessage(content="Inspected."),
-        _tool_call(
-            "verification_report",
-            {
-                "passed": True,
-                "reason": "fine",
-                "checks": [],
-                "recommended_next_instruction": "",
-            },
-            "r9",
-        ),
-        AIMessage(content="Done: handled the install request."),
+        tool_call("call_code_agent", {"instruction": "install it"}, "r2"),
+        tool_call("bash", {"command": command}, "r3"),
+        answer("Ran the install."),
+        answer("Done with the install."),
+        answer("Inspected."),
+        report_call(True, reason="fine", checks=[]),
+        answer("Done: handled the install request."),
     ]
 
 
-def test_cli_approval_prompt_denies_when_the_user_says_no(
-    tmp_path: Path, monkeypatch: Any
+@pytest.mark.parametrize(
+    ("command", "reply", "expected"),
+    [
+        (
+            "pip install nothing-here",
+            "n\n",
+            [
+                "approval required",
+                "Python package installation",
+                "command not run - approval required",
+                "declined at the prompt",
+            ],
+        ),
+        (
+            "npm install --dry-run",
+            "y\n",
+            ["approval required", "requires_approval: True (approved by the user",
+             "Node package installation"],
+        ),
+    ],
+)
+def test_cli_approval_prompt(
+    tmp_path: Path, monkeypatch: Any, command: str, reply: str, expected: list[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, _risky_bash_script())
+    _use_scripted(monkeypatch, _risky_bash_script(command))
 
     result = runner.invoke(
         app,
         ["install something", "-w", str(tmp_path / "ws"), "--approval-mode", "inline"],
-        input="n\n",
+        input=reply,
     )
 
     output = _flat(result.output)
-    assert "approval required" in output
-    assert "Python package installation" in output
-    assert "command not run - approval required" in output
-    assert "declined at the prompt" in output
+    for marker in expected:
+        assert marker in output, marker
     assert result.exit_code == 0  # verification still passed, so the run itself is fine
-
-
-def test_cli_approval_prompt_runs_when_the_user_says_yes(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, _risky_bash_script("npm install --dry-run"))
-
-    result = runner.invoke(
-        app,
-        ["install something", "-w", str(tmp_path / "ws"), "--approval-mode", "inline"],
-        input="y\n",
-    )
-
-    output = _flat(result.output)
-    assert "approval required" in output
-    assert "requires_approval: True (approved by the user" in output
-    assert "Node package installation" in output
 
 
 def test_cli_approval_mode_flag_and_env(tmp_path: Path, monkeypatch: Any) -> None:
@@ -546,7 +500,7 @@ def _checkpointed_workspace(tmp_path: Path) -> Path:
     runtime = RuntimeState(workspace=workspace, checkpoint_mode="light")
     state = new_graph_state("write hello.py", runtime, todos=[make_todo("t1", "write hello.py")])
     state["last_error"] = "command failed: python hello.py"
-    (workspace / "hello.py").write_text("print('hi')\n", encoding="utf-8")
+    (workspace / "hello.py").write_text(HELLO_CONTENT, encoding="utf-8")
     saved = CheckpointManager(runtime, "write hello.py").save(
         state, status="running", latest_node="verifier"
     )
@@ -558,7 +512,7 @@ def _checkpointed_workspace(tmp_path: Path) -> Path:
 
 def test_cli_run_writes_checkpoints(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, _passing_script())
+    _use_scripted(monkeypatch, workflow_script())
 
     result = runner.invoke(app, ["say hi", "-w", str(tmp_path / "ws"), "-v"])
 
@@ -573,7 +527,7 @@ def test_cli_run_writes_checkpoints(tmp_path: Path, monkeypatch: Any) -> None:
 
 def test_cli_checkpoint_mode_off_writes_nothing(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, _passing_script())
+    _use_scripted(monkeypatch, workflow_script())
 
     result = runner.invoke(
         app,
@@ -598,7 +552,7 @@ def test_cli_checkpoint_mode_off_writes_nothing(tmp_path: Path, monkeypatch: Any
 
 def test_cli_run_writes_a_trace(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, _passing_script())
+    _use_scripted(monkeypatch, workflow_script())
 
     result = runner.invoke(app, ["say hi", "-w", str(tmp_path / "ws"), "-v"])
 
@@ -619,7 +573,7 @@ def test_cli_run_writes_a_trace(tmp_path: Path, monkeypatch: Any) -> None:
 
 def test_cli_trace_mode_full_and_off(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, _passing_script())
+    _use_scripted(monkeypatch, workflow_script())
 
     full = runner.invoke(app, ["say hi", "-w", str(tmp_path / "ws"), "--trace-mode", "full"])
 
@@ -629,7 +583,7 @@ def test_cli_trace_mode_full_and_off(tmp_path: Path, monkeypatch: Any) -> None:
     lines = events[0].read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) > 5 and json.loads(lines[0])["type"] == "run_start"
 
-    _use_scripted(monkeypatch, _passing_script())
+    _use_scripted(monkeypatch, workflow_script())
     off = runner.invoke(
         app, ["say hi", "-w", str(tmp_path / "other"), "--trace-mode", "off"]
     )
@@ -639,7 +593,7 @@ def test_cli_trace_mode_full_and_off(tmp_path: Path, monkeypatch: Any) -> None:
 
 def test_cli_strict_mode_saves_state_and_events(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, _passing_script())
+    _use_scripted(monkeypatch, workflow_script())
 
     result = runner.invoke(
         app, ["say hi", "-w", str(tmp_path / "ws"), "--checkpoint-mode", "strict"]
@@ -657,7 +611,7 @@ def test_cli_resume_restores_and_continues(tmp_path: Path, monkeypatch: Any) -> 
     monkeypatch.chdir(tmp_path)
     workspace = _checkpointed_workspace(tmp_path)
     # resuming skips the entry router, so the script starts at the planner
-    _use_scripted(monkeypatch, _passing_script(router=False))
+    _use_scripted(monkeypatch, passing_script(content=HELLO_CONTENT, final_text=FINAL_TEXT))
 
     result = runner.invoke(app, ["--resume", str(workspace), "--max-attempts", "1"])
 
@@ -669,7 +623,7 @@ def test_cli_resume_restores_and_continues(tmp_path: Path, monkeypatch: Any) -> 
     assert "restored : 1 file(s)" in output
     assert "warning :" in output  # the stale file was overwritten
     # the snapshot came back and the run continued from the saved plan
-    assert (workspace / "hello.py").read_text(encoding="utf-8") == "print('hi')\n"
+    assert (workspace / "hello.py").read_text(encoding="utf-8") == HELLO_CONTENT
     assert "Done: created hello.py" in output
 
 
@@ -701,10 +655,23 @@ def test_cli_checkpoint_mode_flag_and_env(tmp_path: Path, monkeypatch: Any) -> N
 
 
 # -- stalling and timeouts ---------------------------------------------------
-def test_heartbeat_explains_a_silent_run(monkeypatch: Any) -> None:
-    """Silence must be explained: no events for a while -> say what we are waiting for."""
+@pytest.mark.parametrize(
+    ("options", "nodes", "pause", "expected"),
+    [
+        ({"interval": 0.2}, ["codeAgent"], 0.8, ["still in codeAgent", "no events for"]),
+        ({"interval": 0.5}, ["planner"] * 6, 0.1, []),
+        ({"interval": 0.1, "enabled": False}, [], 0.4, []),
+    ],
+)
+def test_heartbeat_speaks_only_while_the_run_is_quiet(
+    monkeypatch: Any,
+    options: dict[str, Any],
+    nodes: list[str],
+    pause: float,
+    expected: list[str],
+) -> None:
+    """Silence must be explained - but only when it is real, and never when disabled."""
     import time as time_module
-
     from io import StringIO
 
     from rich.console import Console
@@ -715,52 +682,18 @@ def test_heartbeat_explains_a_silent_run(monkeypatch: Any) -> None:
     )
     monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)
 
-    with cli_module._Heartbeat(interval=0.2) as heartbeat:
-        heartbeat.touch("codeAgent")
-        time_module.sleep(0.8)
+    with cli_module._Heartbeat(**options) as heartbeat:
+        for node in nodes:
+            heartbeat.touch(node)
+            time_module.sleep(pause)
 
     text = stream.getvalue()
-    assert "still in codeAgent" in text
-    assert "no events for" in text
-    assert text.count("still in") >= 1
-
-
-def test_heartbeat_stays_quiet_while_events_flow(monkeypatch: Any) -> None:
-    import time as time_module
-
-    from io import StringIO
-
-    from rich.console import Console
-
-    stream = StringIO()
-    monkeypatch.setattr(
-        cli_module, "error_console", Console(file=stream, width=200, force_terminal=False)
-    )
-
-    with cli_module._Heartbeat(interval=0.5) as heartbeat:
-        for _ in range(6):
-            heartbeat.touch("planner")
-            time_module.sleep(0.1)
-
-    assert stream.getvalue() == ""
-
-
-def test_heartbeat_can_be_disabled(monkeypatch: Any) -> None:
-    import time as time_module
-
-    from io import StringIO
-
-    from rich.console import Console
-
-    stream = StringIO()
-    monkeypatch.setattr(
-        cli_module, "error_console", Console(file=stream, width=200, force_terminal=False)
-    )
-
-    with cli_module._Heartbeat(interval=0.1, enabled=False):
-        time_module.sleep(0.4)
-
-    assert stream.getvalue() == ""
+    for marker in expected:
+        assert marker in text, marker
+    if expected:
+        assert text.count("still in") >= 1
+    else:
+        assert text == ""
 
 
 @pytest.mark.parametrize(
@@ -776,49 +709,42 @@ def test_request_timeout_from_env(monkeypatch: Any, value: Any, expected: float)
     assert cli_module.request_timeout_from_env(120.0) == expected
 
 
-def test_cli_passes_the_request_timeout_to_the_model(
-    tmp_path: Path, monkeypatch: Any
+@pytest.mark.parametrize(
+    ("env", "args", "expected", "banner"),
+    [
+        (None, ["--request-timeout", "45"], 45.0, "request timeout 45s"),
+        ("77", [], 77.0, ""),
+    ],
+)
+def test_cli_request_timeout_reaches_the_model(
+    tmp_path: Path,
+    monkeypatch: Any,
+    env: str | None,
+    args: list[str],
+    expected: float,
+    banner: str,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    if env is None:
+        monkeypatch.delenv(cli_module.REQUEST_TIMEOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(cli_module.REQUEST_TIMEOUT_ENV, env)
     seen: dict[str, Any] = {}
 
     def fake_create_model(**kwargs: Any) -> Any:
         seen.update(kwargs)
-        return ScriptedModel(_passing_script())
+        return ScriptedModel(workflow_script())
 
     monkeypatch.setattr(cli_module, "create_model", fake_create_model)
 
-    result = runner.invoke(
-        app, ["say hi", "-w", str(tmp_path / "ws"), "--request-timeout", "45"]
-    )
+    result = runner.invoke(app, ["say hi", "-w", str(tmp_path / "ws"), *args])
 
     assert result.exit_code == 0, result.output
-    assert seen["timeout"] == 45.0
-    assert "request timeout 45s" in _flat(result.output)  # the banner says so
-
-    shown = runner.invoke(
-        app, ["--show-config", "-w", str(tmp_path / "ws"), "--request-timeout", "45"]
-    )
-    assert "model/request: 45s per attempt" in _flat(shown.output)
-
-
-def test_cli_request_timeout_comes_from_the_environment(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv(cli_module.REQUEST_TIMEOUT_ENV, "77")
-    seen: dict[str, Any] = {}
-
-    def fake_create_model(**kwargs: Any) -> Any:
-        seen.update(kwargs)
-        return ScriptedModel(_passing_script())
-
-    monkeypatch.setattr(cli_module, "create_model", fake_create_model)
-
-    result = runner.invoke(app, ["say hi", "-w", str(tmp_path / "ws")])
-
-    assert result.exit_code == 0, result.output
-    assert seen["timeout"] == 77.0
+    assert seen["timeout"] == expected
+    if banner:
+        assert banner in _flat(result.output)  # the banner says so
+        shown = runner.invoke(app, ["--show-config", "-w", str(tmp_path / "ws"), *args])
+        assert "model/request: 45s per attempt" in _flat(shown.output)
 
 
 def test_failure_hint_explains_a_timed_out_provider() -> None:
@@ -847,7 +773,7 @@ def test_cli_model_timeout_keeps_the_trail(tmp_path: Path, monkeypatch: Any) -> 
                 raise TimeoutError("Request timed out.")
             return super().invoke(messages)
 
-    monkeypatch.setattr(cli_module, "create_model", lambda **kwargs: TimedOut(_passing_script()))
+    monkeypatch.setattr(cli_module, "create_model", lambda **kwargs: TimedOut(workflow_script()))
 
     result = runner.invoke(app, ["say hi", "-w", str(tmp_path / "ws")])
 
@@ -867,118 +793,109 @@ def test_cli_model_timeout_keeps_the_trail(tmp_path: Path, monkeypatch: Any) -> 
     assert payload["status"] == "failed"
 
 
-def test_heartbeat_names_the_running_command(monkeypatch: Any) -> None:
-    """Regression: silence during a long command blamed the model and hid the command."""
+def _broken_registry() -> list[dict[str, Any]]:
+    raise RuntimeError("registry exploded")
+
+
+@pytest.mark.parametrize(
+    ("registry", "node", "idle", "expected", "unexpected"),
+    [
+        # the usual reason for silence: a long shell command, not the model
+        (
+            lambda: [
+                {
+                    "command": "python -m pip install -r requirements.txt",
+                    "elapsed": 95.4,
+                    "timeout": 120.0,
+                }
+            ],
+            None,
+            35.0,
+            [
+                "bash has been running for 95s",
+                "timeout 120s",
+                "python -m pip install -r requirements.txt",
+                "raise --timeout",
+            ],
+            ["waiting for the model"],
+        ),
+        (
+            lambda: [
+                {"command": "pip install a", "elapsed": 40.0, "timeout": 120.0},
+                {"command": "pip install b", "elapsed": 12.0, "timeout": 120.0},
+            ],
+            None,
+            35.0,
+            ["(+1 more)"],
+            [],
+        ),
+        (
+            lambda: [],
+            "codeAgent",
+            45.0,
+            ["still in codeAgent", "no events for 45s", "waiting for the model"],
+            [],
+        ),
+        (_broken_registry, None, 35.0, ["still in"], []),  # a status line never breaks the run
+        (
+            lambda: [
+                {
+                    "command": 'python -m pip install --no-input "fastapi>=0.110"',
+                    "elapsed": 208.0,
+                    "timeout": 600.0,
+                    "tail": [],
+                    "bytes": 0,
+                }
+            ],
+            None,
+            35.0,
+            ["208s", "0 chars of output", "no output at all yet", "slow package index"],
+            [],
+        ),
+        (
+            lambda: [
+                {
+                    "command": "python -m pip install fastapi",
+                    "elapsed": 208.0,
+                    "timeout": 600.0,
+                    "tail": ["Collecting fastapi", "Downloading fastapi-0.110.0-py3-none-any.whl"],
+                    "bytes": 4096,
+                }
+            ],
+            None,
+            35.0,
+            ["Downloading fastapi"],
+            ["no output at all yet"],
+        ),
+    ],
+)
+def test_heartbeat_explains_what_it_is_waiting_for(
+    monkeypatch: Any,
+    registry: Any,
+    node: str | None,
+    idle: float,
+    expected: list[str],
+    unexpected: list[str],
+) -> None:
     from io import StringIO
 
     from rich.console import Console
 
-    stream = StringIO()
     monkeypatch.setattr(
-        cli_module, "error_console", Console(file=stream, width=200, force_terminal=False)
+        cli_module, "error_console", Console(file=StringIO(), width=200, force_terminal=False)
     )
     monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)
-    monkeypatch.setattr(
-        cli_module,
-        "describe_running_commands",
-        lambda: [
-            {
-                "command": "python -m pip install -r requirements.txt",
-                "elapsed": 95.4,
-                "timeout": 120.0,
-            }
-        ],
-    )
+    monkeypatch.setattr(cli_module, "describe_running_commands", registry)
     heartbeat = cli_module._Heartbeat(interval=30.0)
+    if node:
+        heartbeat.touch(node)
 
-    text = heartbeat._explain(35.0)
+    text = heartbeat._explain(idle)
 
-    assert "bash has been running for 95s" in text
-    assert "timeout 120s" in text
-    assert "python -m pip install -r requirements.txt" in text
-    assert "raise --timeout" in text
-    assert "waiting for the model" not in text
-
-
-def test_heartbeat_mentions_extra_commands(monkeypatch: Any) -> None:
-    monkeypatch.setattr(
-        cli_module,
-        "describe_running_commands",
-        lambda: [
-            {"command": "pip install a", "elapsed": 40.0, "timeout": 120.0},
-            {"command": "pip install b", "elapsed": 12.0, "timeout": 120.0},
-        ],
-    )
-
-    text = cli_module._Heartbeat(interval=30.0)._explain(35.0)
-
-    assert "(+1 more)" in text
-
-
-def test_heartbeat_falls_back_to_the_model_wording(monkeypatch: Any) -> None:
-    monkeypatch.setattr(cli_module, "describe_running_commands", lambda: [])
-    heartbeat = cli_module._Heartbeat(interval=30.0)
-    heartbeat.touch("codeAgent")
-
-    text = heartbeat._explain(45.0)
-
-    assert "still in codeAgent" in text and "no events for 45s" in text
-    assert "waiting for the model" in text
-
-
-def test_heartbeat_survives_a_broken_registry(monkeypatch: Any) -> None:
-    def boom() -> Any:
-        raise RuntimeError("registry exploded")
-
-    monkeypatch.setattr(cli_module, "describe_running_commands", boom)
-
-    text = cli_module._Heartbeat(interval=30.0)._explain(35.0)
-
-    assert "still in" in text  # a status line must never break the run
-
-
-def test_heartbeat_explains_a_command_with_no_output(monkeypatch: Any) -> None:
-    """`0 chars of output` for half a minute is itself a diagnosis, not just silence."""
-    monkeypatch.setattr(
-        cli_module,
-        "describe_running_commands",
-        lambda: [
-            {
-                "command": 'python -m pip install --no-input "fastapi>=0.110"',
-                "elapsed": 208.0,
-                "timeout": 600.0,
-                "tail": [],
-                "bytes": 0,
-            }
-        ],
-    )
-
-    text = cli_module._Heartbeat(interval=30.0)._explain(35.0)
-
-    assert "208s" in text and "0 chars of output" in text
-    assert "no output at all yet" in text
-    assert "slow package index" in text
-
-
-def test_heartbeat_skips_that_hint_while_output_flows(monkeypatch: Any) -> None:
-    monkeypatch.setattr(
-        cli_module,
-        "describe_running_commands",
-        lambda: [
-            {
-                "command": "python -m pip install fastapi",
-                "elapsed": 208.0,
-                "timeout": 600.0,
-                "tail": ["Collecting fastapi", "Downloading fastapi-0.110.0-py3-none-any.whl"],
-                "bytes": 4096,
-            }
-        ],
-    )
-
-    text = cli_module._Heartbeat(interval=30.0)._explain(35.0)
-
-    assert "no output at all yet" not in text
-    assert "Downloading fastapi" in text
+    for marker in expected:
+        assert marker in text, marker
+    for marker in unexpected:
+        assert marker not in text, marker
 
 
 def test_cli_answers_conversation_without_the_workflow(
@@ -986,7 +903,7 @@ def test_cli_answers_conversation_without_the_workflow(
 ) -> None:
     """The entry router: a greeting is answered directly, with no plan and no tools."""
     monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, [_router_answer("chat", 0.95), AIMessage(content="你好！我是 WQ Agent。")])
+    _use_scripted(monkeypatch, chat_script("你好！我是 WQ Agent。", confidence=0.95))
 
     result = runner.invoke(app, ["你好", "-w", str(tmp_path / "ws")])
 
@@ -1058,7 +975,7 @@ def test_cli_tui_needs_no_task(tmp_path: Path, monkeypatch: Any) -> None:
 def test_cli_no_router_always_runs_the_workflow(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
     # no router response in the script: with --no-router the planner gets the first one
-    _use_scripted(monkeypatch, _passing_script(router=False))
+    _use_scripted(monkeypatch, passing_script())
 
     result = runner.invoke(
         app, ["say hi", "-w", str(tmp_path / "ws"), "--no-router"]
@@ -1072,7 +989,7 @@ def test_cli_no_router_always_runs_the_workflow(tmp_path: Path, monkeypatch: Any
 
 def test_cli_shows_the_route_in_verbose_mode(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, _passing_script())
+    _use_scripted(monkeypatch, workflow_script())
 
     result = runner.invoke(app, ["say hi", "-w", str(tmp_path / "ws"), "-v"])
 
@@ -1085,7 +1002,7 @@ def test_cli_resume_skips_the_router(tmp_path: Path, monkeypatch: Any) -> None:
     """A resumed run is clearly work: no routing call is spent on it."""
     monkeypatch.chdir(tmp_path)
     workspace = _checkpointed_workspace(tmp_path)
-    model = _use_scripted(monkeypatch, _passing_script(router=False))
+    model = _use_scripted(monkeypatch, passing_script())
 
     result = runner.invoke(app, ["--resume", str(workspace), "--max-attempts", "1"])
 
@@ -1101,14 +1018,11 @@ def test_cli_records_the_session_across_runs(tmp_path: Path, monkeypatch: Any) -
     monkeypatch.chdir(tmp_path)
     workspace = tmp_path / "ws"
 
-    _use_scripted(monkeypatch, [_router_answer("chat", 0.95), AIMessage(content="你好！")])
+    _use_scripted(monkeypatch, chat_script("你好！", confidence=0.95))
     first = runner.invoke(app, ["你好", "-w", str(workspace)])
     assert first.exit_code == 0, first.output
 
-    _use_scripted(
-        monkeypatch,
-        [_router_answer("chat", 0.95), AIMessage(content="我是 WQ Agent，可以帮你干活。")],
-    )
+    _use_scripted(monkeypatch, chat_script("我是 WQ Agent，可以帮你干活。", confidence=0.95))
     second = runner.invoke(app, ["你是谁", "-w", str(workspace)])
     assert second.exit_code == 0, second.output
 
@@ -1137,12 +1051,10 @@ def test_cli_session_context_reaches_the_router(tmp_path: Path, monkeypatch: Any
     """The second run's router prompt carries the first run's exchange."""
     monkeypatch.chdir(tmp_path)
     workspace = tmp_path / "ws"
-    _use_scripted(monkeypatch, [_router_answer("chat"), AIMessage(content="hello")])
+    _use_scripted(monkeypatch, chat_script())
     runner.invoke(app, ["帮我看下项目结构", "-w", str(workspace)])
 
-    model = _use_scripted(
-        monkeypatch, [_router_answer("workflow")] + _passing_script(router=False)
-    )
+    model = _use_scripted(monkeypatch, workflow_script())
     result = runner.invoke(app, ["继续", "-w", str(workspace)])
 
     assert result.exit_code == 0, result.output
@@ -1174,26 +1086,23 @@ def test_cli_session_is_not_written_when_the_run_fails(
     assert payload["turn_index"] == 1
 
 
-def test_default_workspace_is_created(tmp_path: Path, monkeypatch: Any) -> None:
+@pytest.mark.parametrize(
+    ("from_env", "target"),
+    [(None, "workspace"), ("from-env", "from-env")],
+)
+def test_workspace_default_and_env_var(
+    tmp_path: Path, monkeypatch: Any, from_env: str | None, target: str
+) -> None:
     monkeypatch.chdir(tmp_path)
-    _use_scripted(monkeypatch, _passing_script())
+    expected = tmp_path / target
+    if from_env:
+        monkeypatch.setenv("WQ_WORKSPACE", str(expected))
+    _use_scripted(monkeypatch, workflow_script())
 
     result = runner.invoke(app, ["say hi"])
 
     assert result.exit_code == 0
-    assert (tmp_path / "workspace" / "hello.py").is_file()
-
-
-def test_workspace_env_var_is_honoured(tmp_path: Path, monkeypatch: Any) -> None:
-    monkeypatch.chdir(tmp_path)
-    target = tmp_path / "from-env"
-    monkeypatch.setenv("WQ_WORKSPACE", str(target))
-    _use_scripted(monkeypatch, _passing_script())
-
-    result = runner.invoke(app, ["say hi"])
-
-    assert result.exit_code == 0
-    assert (target / "hello.py").is_file()
+    assert (expected / "hello.py").is_file()
 
 
 def test_failed_verification_exits_with_an_error(tmp_path: Path, monkeypatch: Any) -> None:
@@ -1201,29 +1110,13 @@ def test_failed_verification_exits_with_an_error(tmp_path: Path, monkeypatch: An
     _use_scripted(
         monkeypatch,
         [
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "try the thing",
-                    "todos": [{"id": "t1", "content": "do the thing"}],
-                    "acceptance_criteria": ["it works"],
-                    "verification_commands": ["exit 1"],
-                },
-            ),
-            _tool_call("call_code_agent", {"instruction": "do the thing"}, "c2"),
-            AIMessage(content="Tried the thing."),
-            AIMessage(content="Delegated it."),
-            AIMessage(content="It still fails."),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": False,
-                    "reason": "the command exits 1",
-                    "checks": [{"name": "it works", "passed": False, "detail": "exit 1"}],
-                    "recommended_next_instruction": "fix it",
-                },
-            ),
-            AIMessage(content="Not done: `exit 1` still fails."),
+            plan_call(summary="try the thing", commands=["exit 1"]),
+            tool_call("call_code_agent", {"instruction": "do the thing"}, "c2"),
+            answer("Tried the thing."),
+            answer("Delegated it."),
+            answer("It still fails."),
+            report_call(False, reason="the command exits 1"),
+            answer("Not done: `exit 1` still fails."),
         ],
     )
 
@@ -1242,36 +1135,24 @@ def test_failed_verification_exits_with_an_error(tmp_path: Path, monkeypatch: An
 def test_planner_step_limit_is_reported(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.chdir(tmp_path)
     script: list[Any] = [
-        _router_answer(),
+        route_answer(),
         *[
-            _tool_call(
-                "todo_write",
-                {
-                    "plan_summary": "loop forever",
-                    "todos": [{"id": "t1", "content": "keep going"}],
-                    "acceptance_criteria": ["never"],
-                    "verification_commands": ["echo ok"],
-                },
-                f"c{i}",
+            plan_call(
+                summary="loop forever",
+                todos=[{"id": "t1", "content": "keep going"}],
+                criteria=["never"],
             )
-            for i in range(3)
+            for _ in range(3)
         ],
+        answer("Inspected."),
+        report_call(
+            False,
+            reason="nothing was produced",
+            checks=[],
+            recommended_next_instruction="actually do the work",
+        ),
+        answer("Not done."),
     ]
-    script.extend(
-        [
-            AIMessage(content="Inspected."),
-            _tool_call(
-                "verification_report",
-                {
-                    "passed": False,
-                    "reason": "nothing was produced",
-                    "checks": [],
-                    "recommended_next_instruction": "actually do the work",
-                },
-            ),
-            AIMessage(content="Not done."),
-        ]
-    )
     _use_scripted(monkeypatch, script)
 
     result = runner.invoke(

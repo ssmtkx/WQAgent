@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from helpers import ScriptedModel, answer, runtime_for, workspace_dir
 from wqagent.core.session import (
     CONTEXT_FILES,
     CONTEXT_TURNS,
@@ -29,16 +31,9 @@ from wqagent.core.session import (
     summary_path,
     workspace_files,
 )
-
-
-def _workspace(tmp_path: Path, *files: str) -> Path:
-    root = tmp_path / "ws"
-    root.mkdir(parents=True, exist_ok=True)
-    for name in files:
-        path = root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"# {name}\n", encoding="utf-8")
-    return root
+from wqagent.core.state import create_runtime
+from wqagent.graph.nodes import intent_router_node
+from wqagent.graph.state import new_graph_state
 
 
 # -- constants and shape -----------------------------------------------------
@@ -51,7 +46,7 @@ def test_constants() -> None:
 
 
 def test_paths(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
 
     assert session_dir(workspace) == workspace / ".wqagent" / "session"
     assert session_path(workspace).name == SESSION_FILE
@@ -59,12 +54,9 @@ def test_paths(tmp_path: Path) -> None:
 
 
 def test_paths_accept_a_runtime_state(tmp_path: Path) -> None:
-    from wqagent.core.state import RuntimeState
+    workspace = workspace_dir(tmp_path)
 
-    workspace = _workspace(tmp_path)
-    runtime = RuntimeState(workspace=workspace)
-
-    assert session_path(runtime) == session_path(workspace)
+    assert session_path(runtime_for(workspace)) == session_path(workspace)
 
 
 def test_new_session_shape() -> None:
@@ -76,41 +68,14 @@ def test_new_session_shape() -> None:
 
 
 # -- load / create -----------------------------------------------------------
-def test_load_or_create_creates_a_new_session(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
-
-    session = load_or_create_session(workspace)
-
-    assert session["turn_index"] == 0 and session["recent_turns"] == []
-    assert session["session_id"]
-    assert not session_path(workspace).exists()  # nothing is written until save
-
-
-def test_load_or_create_reads_an_existing_session(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
-    save_session(workspace, {**new_session(), "session_id": "fixed", "turn_index": 7})
-
-    session = load_or_create_session(workspace)
-
-    assert session["session_id"] == "fixed"
-    assert session["turn_index"] == 7
-
-
-@pytest.mark.parametrize("payload", ["{not json", "[]", "null", '"text"'])
-def test_load_or_create_survives_a_broken_file(tmp_path: Path, payload: str) -> None:
-    workspace = _workspace(tmp_path)
-    session_path(workspace).parent.mkdir(parents=True, exist_ok=True)
-    session_path(workspace).write_text(payload, encoding="utf-8")
-
-    session = load_or_create_session(workspace)
-
-    assert session["turn_index"] == 0 and session["session_id"]
-
-
-def test_load_or_create_repairs_missing_and_broken_fields(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
-    session_path(workspace).parent.mkdir(parents=True, exist_ok=True)
-    session_path(workspace).write_text(
+#: One case per way a session file can be unusable: absent, unreadable or damaged.
+DAMAGED_SESSION_FILES = [
+    pytest.param(None, 0, [], id="missing-file"),
+    pytest.param("{not json", 0, [], id="unparsable-json"),
+    pytest.param("[]", 0, [], id="json-list"),
+    pytest.param("null", 0, [], id="json-null"),
+    pytest.param('"text"', 0, [], id="json-string"),
+    pytest.param(
         json.dumps(
             {
                 "recent_turns": [
@@ -121,18 +86,46 @@ def test_load_or_create_repairs_missing_and_broken_fields(tmp_path: Path) -> Non
                 "turn_index": "junk",
             }
         ),
-        encoding="utf-8",
-    )
+        3,
+        [2, 3],
+        id="wrong-types-and-junk-index",
+    ),
+]
+
+
+@pytest.mark.parametrize(("payload", "turn_index", "turns"), DAMAGED_SESSION_FILES)
+def test_load_or_create_repairs_a_missing_or_damaged_session(
+    tmp_path: Path, payload: str | None, turn_index: int, turns: list[int]
+) -> None:
+    """Every unusable file falls back to a fresh in-memory session."""
+    workspace = workspace_dir(tmp_path)
+    if payload is not None:
+        session_path(workspace).parent.mkdir(parents=True, exist_ok=True)
+        session_path(workspace).write_text(payload, encoding="utf-8")
 
     session = load_or_create_session(workspace)
 
-    assert [turn["turn"] for turn in session["recent_turns"]] == [2, 3]
-    assert session["recent_turns"][1]["route"] == "workflow"  # defaulted
-    assert session["turn_index"] == 3  # derived from the turns when the index is junk
+    assert session["session_id"]  # usable either way
+    assert session["turn_index"] == turn_index
+    assert [turn["turn"] for turn in session["recent_turns"]] == turns
+    if turns:  # the readable turns survived, the rest was repaired
+        assert session["recent_turns"][1]["route"] == "workflow"  # defaulted
+    elif payload is None:  # nothing is written until save
+        assert session["recent_turns"] == [] and not session_path(workspace).exists()
+
+
+def test_load_or_create_reads_an_existing_session(tmp_path: Path) -> None:
+    workspace = workspace_dir(tmp_path)
+    save_session(workspace, {**new_session(), "session_id": "fixed", "turn_index": 7})
+
+    session = load_or_create_session(workspace)
+
+    assert session["session_id"] == "fixed"
+    assert session["turn_index"] == 7
 
 
 # -- appending turns ---------------------------------------------------------
-def test_append_user_turn_numbers_turns_and_clips_content(tmp_path: Path) -> None:
+def test_append_user_turn_numbers_turns_and_clips_content() -> None:
     session = new_session()
 
     first = append_user_turn(session, "hello")
@@ -145,7 +138,7 @@ def test_append_user_turn_numbers_turns_and_clips_content(tmp_path: Path) -> Non
     assert session["recent_turns"][0]["timestamp"]
 
 
-def test_append_assistant_turn_uses_the_next_turn_number(tmp_path: Path) -> None:
+def test_append_assistant_turn_uses_the_next_turn_number() -> None:
     session = new_session()
     turn = append_user_turn(session, "写个 hello.py")
 
@@ -165,7 +158,7 @@ def test_append_assistant_turn_uses_the_next_turn_number(tmp_path: Path) -> None
     assert append_user_turn(session, "继续") == 3
 
 
-def test_append_assistant_turn_honours_an_explicit_gap(tmp_path: Path) -> None:
+def test_append_assistant_turn_honours_an_explicit_gap() -> None:
     session = new_session()
     append_user_turn(session, "one")
 
@@ -175,7 +168,7 @@ def test_append_assistant_turn_honours_an_explicit_gap(tmp_path: Path) -> None:
     assert session["turn_index"] == 9
 
 
-def test_append_assistant_turn_defaults_route_and_summary(tmp_path: Path) -> None:
+def test_append_assistant_turn_defaults_route_and_summary() -> None:
     session = new_session()
     turn = append_user_turn(session, "hi")
 
@@ -187,7 +180,7 @@ def test_append_assistant_turn_defaults_route_and_summary(tmp_path: Path) -> Non
     assert len(entry["content"]) <= MAX_TURN_CONTENT
 
 
-def test_recent_turns_are_capped(tmp_path: Path) -> None:
+def test_recent_turns_are_capped() -> None:
     session = new_session()
     for index in range(MAX_RECENT_TURNS + 5):
         append_user_turn(session, f"turn {index}")
@@ -198,7 +191,7 @@ def test_recent_turns_are_capped(tmp_path: Path) -> None:
 
 # -- saving ------------------------------------------------------------------
 def test_save_session_writes_both_files(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
     session = load_or_create_session(workspace)
     turn = append_user_turn(session, "帮我搭个 FastAPI 后台")
     append_assistant_turn(session, turn=turn, route="workflow", content="Done: app/main.py", summary="skeleton")
@@ -227,7 +220,7 @@ def test_render_session_summary_handles_an_empty_session() -> None:
 
 
 def test_save_session_reports_a_write_failure(tmp_path: Path, monkeypatch: Any) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
     session = new_session()
 
     def boom(self: Path, *args: Any, **kwargs: Any) -> int:
@@ -243,9 +236,7 @@ def test_save_session_reports_a_write_failure(tmp_path: Path, monkeypatch: Any) 
 
 # -- workspace files ---------------------------------------------------------
 def test_workspace_files_newest_first_and_without_the_agent_directory(tmp_path: Path) -> None:
-    import os
-
-    workspace = _workspace(tmp_path, "old.py", "src/new.py")
+    workspace = workspace_dir(tmp_path, "old.py", "src/new.py")
     (workspace / ".wqagent" / "traces").mkdir(parents=True, exist_ok=True)
     (workspace / ".wqagent" / "traces" / "trace.json").write_text("{}", encoding="utf-8")
     stamp = (workspace / "old.py").stat().st_mtime - 600  # make it clearly the oldest
@@ -259,7 +250,7 @@ def test_workspace_files_newest_first_and_without_the_agent_directory(tmp_path: 
 
 
 def test_workspace_files_is_capped(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path, *[f"f{index:03d}.txt" for index in range(CONTEXT_FILES + 10)])
+    workspace = workspace_dir(tmp_path, *[f"f{index:03d}.txt" for index in range(CONTEXT_FILES + 10)])
 
     assert len(workspace_files(workspace)) == CONTEXT_FILES
 
@@ -270,7 +261,7 @@ def test_workspace_files_of_a_missing_directory(tmp_path: Path) -> None:
 
 # -- the context block -------------------------------------------------------
 def test_build_session_context_has_id_turn_files_and_turns(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path, "app/main.py", "requirements.txt")
+    workspace = workspace_dir(tmp_path, "app/main.py", "requirements.txt")
     session = load_or_create_session(workspace)
     turn = append_user_turn(session, "继续加个登录接口")
     append_assistant_turn(session, turn=turn, route="workflow", content="added", summary="login endpoint")
@@ -288,7 +279,7 @@ def test_build_session_context_has_id_turn_files_and_turns(tmp_path: Path) -> No
 
 
 def test_build_session_context_loads_the_session_itself(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
     session = load_or_create_session(workspace)
     append_user_turn(session, "earlier question")
     save_session(workspace, session)
@@ -299,7 +290,7 @@ def test_build_session_context_loads_the_session_itself(tmp_path: Path) -> None:
 
 
 def test_build_session_context_shows_at_most_ten_turns(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
     session = new_session()
     for index in range(CONTEXT_TURNS + 5):
         append_user_turn(session, f"question {index:03d}")
@@ -311,7 +302,7 @@ def test_build_session_context_shows_at_most_ten_turns(tmp_path: Path) -> None:
 
 
 def test_build_session_context_stays_within_the_budget(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path, *[f"file{index:03d}.py" for index in range(60)])
+    workspace = workspace_dir(tmp_path, *[f"file{index:03d}.py" for index in range(60)])
     session = new_session()
     for index in range(CONTEXT_TURNS + 6):
         turn = append_user_turn(session, f"a very long user message number {index} " + "x" * 3000)
@@ -327,7 +318,7 @@ def test_build_session_context_stays_within_the_budget(tmp_path: Path) -> None:
 
 
 def test_build_session_context_of_an_empty_workspace(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
 
     text = build_session_context(workspace)
 
@@ -339,22 +330,15 @@ def test_build_session_context_of_an_empty_workspace(tmp_path: Path) -> None:
 # -- wiring ------------------------------------------------------------------
 def test_entry_nodes_see_the_session_context(tmp_path: Path) -> None:
     """The router's prompt carries what happened in previous turns."""
-    from helpers import ScriptedModel, answer
-
-    from wqagent.core.state import RuntimeState
-    from wqagent.graph.nodes import intent_router_node
-    from wqagent.graph.state import new_graph_state
-
-    workspace = _workspace(tmp_path, "app/main.py")
+    workspace = workspace_dir(tmp_path, "app/main.py")
     session = load_or_create_session(workspace)
     turn = append_user_turn(session, "帮我搭个 FastAPI 后台")
     append_assistant_turn(session, turn=turn, route="workflow", content="done", summary="skeleton")
     save_session(workspace, session)
-    runtime = RuntimeState(workspace=workspace, session_id=session["session_id"], session_turn=3)
-    state = new_graph_state("继续", runtime)
+    runtime = runtime_for(workspace, session_id=session["session_id"], session_turn=3)
     model = ScriptedModel([answer('{"route":"workflow","reason":"continuation","confidence":0.9}')])
 
-    intent_router_node(state, model=model)
+    intent_router_node(new_graph_state("继续", runtime), model=model)
 
     instruction = model.seen[-1][1].content
     assert session["session_id"] in instruction
@@ -365,9 +349,7 @@ def test_entry_nodes_see_the_session_context(tmp_path: Path) -> None:
 
 
 def test_create_runtime_carries_the_session(tmp_path: Path) -> None:
-    from wqagent.core.state import create_runtime
-
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
     session = load_or_create_session(workspace)
     append_user_turn(session, "first")
 
@@ -378,11 +360,7 @@ def test_create_runtime_carries_the_session(tmp_path: Path) -> None:
 
 
 def test_new_graph_state_carries_the_session(tmp_path: Path) -> None:
-    from wqagent.core.state import RuntimeState
-    from wqagent.graph.state import new_graph_state
-
-    workspace = _workspace(tmp_path)
-    runtime = RuntimeState(workspace=workspace, session_id="abc", session_turn=4)
+    runtime = runtime_for(workspace_dir(tmp_path), session_id="abc", session_turn=4)
 
     state = new_graph_state("task", runtime)
 

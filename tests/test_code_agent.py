@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage
 
+from helpers import ScriptedModel, graph_state, todo_update_call, tool_call
 from wqagent.agents.code_agent import (
     DEFAULT_MAX_LOOPS,
     MemorySnapshot,
@@ -15,35 +16,9 @@ from wqagent.agents.code_agent import (
     build_memory_snapshot,
     run_code_agent,
 )
-from wqagent.core.state import RuntimeState
-from wqagent.graph import new_graph_state
 from wqagent.graph.memory import build_layered_memory
 from wqagent.graph.state import make_todo
 from wqagent.prompts.stage3 import CODE_AGENT_PROMPT
-
-
-def _layered(state: Any) -> dict[str, Any]:
-    """The layered memory the runtime injects for the code agent."""
-    return dict(build_layered_memory(state, node="codeAgent"))
-
-
-class ScriptedModel:
-    """Replays responses; records what was bound and what it received."""
-
-    def __init__(self, responses: list[Any]) -> None:
-        self.responses = list(responses)
-        self.bound: list[list[str]] = []
-        self.seen: list[list[Any]] = []
-
-    def bind_tools(self, tools: list[Any], **kwargs: Any) -> "ScriptedModel":
-        self.bound.append([tool.name for tool in tools])
-        return self
-
-    def invoke(self, messages: list[Any]) -> Any:
-        self.seen.append(list(messages))
-        if not self.responses:
-            raise AssertionError("ScriptedModel ran out of responses")
-        return self.responses.pop(0)
 
 
 class FailingModel(ScriptedModel):
@@ -55,22 +30,12 @@ class FailingModel(ScriptedModel):
         return super().invoke(messages)
 
 
-def _tool_call(name: str, args: dict[str, Any], call_id: str = "c1") -> AIMessage:
-    return AIMessage(
-        content="",
-        tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}],
-    )
-
-
-def _todo_call(*updates: dict[str, Any], call_id: str = "c2") -> AIMessage:
-    return _tool_call("todo_update", {"updates": list(updates)}, call_id)
-
-
 @pytest.fixture()
-def state(tmp_path: Path):
-    return new_graph_state(
+def state(tmp_path: Path) -> dict[str, Any]:
+    """A graph state whose plan has two todos."""
+    return graph_state(
         "add a slugify helper",
-        RuntimeState(workspace=tmp_path / "ws"),
+        root=tmp_path / "ws",
         plan_summary="write utils.py, then test it",
         todos=[make_todo("t1", "write utils.py"), make_todo("t2", "run pytest")],
     )
@@ -81,8 +46,9 @@ def test_messages_are_task_instruction_and_layered_memory(state: Any) -> None:
     """The layered memory replaced the auto-built session block (no duplication)."""
     state["research_notes"] = "slugify examples: https://example.com/slugify"
     state["last_error"] = "pytest failed"
+    layered = dict(build_layered_memory(state, node="codeAgent"))  # what the runtime injects
 
-    messages = build_code_messages(state, "t2: run the tests", layered=_layered(state))
+    messages = build_code_messages(state, "t2: run the tests", layered=layered)
 
     assert messages[0].content == CODE_AGENT_PROMPT
     human = messages[1].content
@@ -141,13 +107,13 @@ def test_runs_tools_updates_todos_and_summarises(state: Any) -> None:
     workspace = state["runtime"].workspace
     model = ScriptedModel(
         [
-            _todo_call({"id": "t1", "status": "in_progress"}),
-            _tool_call(
+            todo_update_call({"id": "t1", "status": "in_progress"}),
+            tool_call(
                 "file_write",
                 {"file_path": "utils.py", "content": "def slugify(s):\n    return s\n"},
                 "c3",
             ),
-            _todo_call({"id": "t1", "status": "completed", "note": "written"}, call_id="c4"),
+            todo_update_call({"id": "t1", "status": "completed", "note": "written"}, call_id="c4"),
             AIMessage(content="Added utils.slugify and checked it imports."),
         ]
     )
@@ -207,7 +173,9 @@ def test_runs_tools_updates_todos_and_summarises(state: Any) -> None:
 def test_bad_todo_updates_are_reported_not_fatal(state: Any) -> None:
     model = ScriptedModel(
         [
-            _todo_call({"id": "ghost", "status": "completed"}, {"id": "t1", "status": "nope"}),
+            todo_update_call(
+                {"id": "ghost", "status": "completed"}, {"id": "t1", "status": "nope"}
+            ),
             AIMessage(content="Tried to update the plan."),
         ]
     )
@@ -238,7 +206,7 @@ def test_model_failure_keeps_partial_progress(state: Any) -> None:
     workspace = state["runtime"].workspace
     model = FailingModel(
         [
-            _tool_call("file_write", {"file_path": "half.py", "content": "print(1)\n"}),
+            tool_call("file_write", {"file_path": "half.py", "content": "print(1)\n"}),
         ]
     )
 
@@ -256,9 +224,7 @@ def test_model_failure_keeps_partial_progress(state: Any) -> None:
 
 
 def test_max_loops_falls_back_to_a_digest(state: Any) -> None:
-    model = ScriptedModel(
-        [_tool_call("bash", {"command": "pytest -q"}, f"c{i}") for i in range(5)]
-    )
+    model = ScriptedModel([tool_call("bash", {"command": "pytest -q"}, f"c{i}") for i in range(5)])
 
     result = run_code_agent(state, "run the tests", model=model, max_loops=2)
 

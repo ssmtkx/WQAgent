@@ -27,6 +27,8 @@ data-gym-cache/
 
 # agent scratch space (default workspace)
 workspace/
+demo/
+demo1/
 
 # checkpoints an agent run writes into its workspace
 .wqagent/
@@ -39,3 +41,10 @@ debug.log
 .vscode/
 .DS_Store
 Thumbs.db
+
+# workbuddy generation
+.workbuddy/
+
+
+# coding agent learn plan
+coding-agent-learning-plan.md

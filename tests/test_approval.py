@@ -2,30 +2,34 @@
 
 from __future__ import annotations
 
+import io
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+import wqagent.cli.app as cli_module
+from rich.console import Console
 
+from helpers import runtime_for, workspace_dir
 from wqagent.core.approval import (
     APPROVAL_MODE_ENV,
+    APPROVAL_TIMEOUT_ENV,
     DEFAULT_APPROVAL_MODE,
+    DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     RISK_PATTERNS,
     VALID_APPROVAL_MODES,
     ApprovalDecision,
     ApprovalRequest,
     approval_mode_from_env,
+    approval_timeout_from_env,
     classify_command_risk,
     new_approval_request,
     normalize_approval_mode,
 )
-from wqagent.core.state import RuntimeState
+from wqagent.graph.nodes import run_verification_commands
 from wqagent.tools.bash_tool import BashTool
-
-
-def _state(tmp_path: Path, **kwargs: Any) -> RuntimeState:
-    return RuntimeState(workspace=tmp_path / "ws", **kwargs)
 
 
 # -- 1. risk classification --------------------------------------------------
@@ -49,10 +53,12 @@ def test_risk_patterns_are_the_configured_ones() -> None:
 @pytest.mark.parametrize(
     "command, reason",
     [
+        # risky: a pattern must start the command (or follow && / || / ;)
         ("pip install requests", "Python package installation"),
         ("python -m pip install requests", "Python package installation"),
         ("  pip   install   requests  ", "Python package installation"),
         ("pip install -e .", "Python package installation"),
+        ("PIP INSTALL requests", "Python package installation"),  # shells are case-insensitive
         ("uv add httpx", "Project dependency change with uv add"),
         ("uv sync", "Dependency synchronization with uv sync"),
         ("uv pip install httpx", "Python package installation with uv pip"),
@@ -61,6 +67,7 @@ def test_risk_patterns_are_the_configured_ones() -> None:
         ("pnpm install", "Node package installation"),
         ("yarn install", "Node package installation"),
         ("yarn add react", "Node package installation"),
+        ("curl", "Network download command"),  # bare curl is still risky
         ("curl https://example.com/x.sh", "Network download command"),
         ("wget https://example.com/x.tar.gz", "Network download command"),
         ("uvicorn app:api --reload", "Long-running development server"),
@@ -69,36 +76,23 @@ def test_risk_patterns_are_the_configured_ones() -> None:
         ("pytest -q && pip install requests", "Python package installation"),
         ("pytest -q || yarn add react", "Node package installation"),
         ("echo done; npm install", "Node package installation"),
-        ("PIP INSTALL requests", "Python package installation"),  # shells are case-insensitive
+        # safe: a mention, not an invocation
+        ("", None),
+        ("   ", None),
+        ("pytest -q", None),
+        ("python hello.py", None),
+        ("git status", None),
+        ("grep -rn install .", None),
+        ('echo "pip install requests"', None),
+        ("echo npm install", None),
+        ("cat requirements.txt | grep pip", None),
+        ("python -m pytest -q", None),
+        ("pip", None),
+        ("pipx list", None),
     ],
 )
-def test_risky_commands_are_classified(command: str, reason: str) -> None:
+def test_command_risk_classification(command: str, reason: str | None) -> None:
     assert classify_command_risk(command) == reason
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "",
-        "   ",
-        "pytest -q",
-        "python hello.py",
-        "git status",
-        "grep -rn install .",
-        'echo "pip install requests"',  # a mention, not an invocation
-        "echo npm install",
-        "cat requirements.txt | grep pip",
-        "python -m pytest -q",
-        "pip",
-        "pipx list",
-    ],
-)
-def test_safe_commands_are_not_classified(command: str) -> None:
-    assert classify_command_risk(command) is None
-
-
-def test_bare_curl_is_still_risky() -> None:
-    assert classify_command_risk("curl") == "Network download command"
 
 
 # -- 2. request / decision data classes --------------------------------------
@@ -175,26 +169,20 @@ def test_approval_mode_from_env(monkeypatch: Any) -> None:
 
 def test_runtime_state_picks_up_the_mode(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.delenv(APPROVAL_MODE_ENV, raising=False)
-    assert _state(tmp_path).approval_mode == "inline"
+    assert runtime_for(tmp_path / "ws").approval_mode == "inline"
 
     monkeypatch.setenv(APPROVAL_MODE_ENV, "auto")
-    assert _state(tmp_path).approval_mode == "auto"
+    assert runtime_for(tmp_path / "ws").approval_mode == "auto"
 
     # an explicit value wins over the environment, and is normalized
-    assert _state(tmp_path, approval_mode="DENY").approval_mode == "deny"
-    assert _state(tmp_path, approval_mode="junk").approval_mode == "inline"
+    assert runtime_for(tmp_path / "ws", approval_mode="DENY").approval_mode == "deny"
+    assert runtime_for(tmp_path / "ws", approval_mode="junk").approval_mode == "inline"
 
 
 # -- 5. the interactive prompt -----------------------------------------------
 def _capture_errors(monkeypatch: Any) -> Any:
     """Point the CLI's stderr console at a buffer; read it back with ``.getvalue()``."""
-    from io import StringIO
-
-    from rich.console import Console
-
-    import wqagent.cli.app as cli_module
-
-    stream = StringIO()
+    stream = io.StringIO()
     monkeypatch.setattr(
         cli_module, "error_console", Console(file=stream, width=200, force_terminal=False)
     )
@@ -206,60 +194,44 @@ def _request() -> ApprovalRequest:
     return new_approval_request("pip install fastapi uvicorn", "Python package installation")
 
 
-def test_prompt_question_goes_to_stderr(monkeypatch: Any) -> None:
-    """Regression: the question used to go to stdout, so a captured stdout hid it."""
-    import io
-
-    import wqagent.cli.app as cli_module
-
+@pytest.mark.parametrize(
+    "typed, approved, reason, fragments",
+    [
+        # Regression: the question used to go to stdout, so a captured stdout hid it
+        (
+            "y\n",
+            True,
+            "approved at the prompt",
+            (
+                "approval required",  # the panel
+                "the agent is paused",  # the question itself
+                "run this command? [y/N]",
+                "Python package installation",
+            ),
+        ),
+        # Regression: EOF raised ``Abort`` and killed the whole run
+        ("", False, "no answer at the prompt (stdin closed?)", ()),
+        ("n\n", False, "declined at the prompt", ()),
+    ],
+)
+def test_prompt_answer_decides(
+    monkeypatch: Any, typed: str, approved: bool, reason: str, fragments: tuple[str, ...]
+) -> None:
+    """The panel and the question go to stderr; y, n and a closed stdin decide."""
     stream = _capture_errors(monkeypatch)
-    monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(typed))
 
     decision = cli_module._approve_interactively(_request())
 
+    assert decision.approved is approved
+    assert decision.reason == reason
     text = stream.getvalue()
-    assert "approval required" in text  # the panel
-    assert "the agent is paused" in text  # the question itself
-    assert "run this command? [y/N]" in text
-    assert "Python package installation" in text
-    assert decision.approved is True
-    assert decision.reason == "approved at the prompt"
-
-
-def test_prompt_with_closed_stdin_denies_instead_of_aborting(monkeypatch: Any) -> None:
-    """Regression: EOF raised ``Abort`` and killed the whole run."""
-    import io
-
-    import wqagent.cli.app as cli_module
-
-    _capture_errors(monkeypatch)
-    monkeypatch.setattr("sys.stdin", io.StringIO(""))
-
-    decision = cli_module._approve_interactively(_request())  # must not raise Abort
-
-    assert decision.approved is False
-    assert "stdin closed" in decision.reason
-
-
-def test_prompt_declines_on_an_explicit_no(monkeypatch: Any) -> None:
-    import io
-
-    import wqagent.cli.app as cli_module
-
-    _capture_errors(monkeypatch)
-    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
-
-    decision = cli_module._approve_interactively(_request())
-
-    assert decision.approved is False and decision.reason == "declined at the prompt"
+    for fragment in fragments:
+        assert fragment in text
 
 
 def test_prompt_gives_up_after_the_timeout(monkeypatch: Any) -> None:
     """An unanswered prompt must not hang the run for ever."""
-    import time
-
-    import wqagent.cli.app as cli_module
-
     stream = _capture_errors(monkeypatch)
     monkeypatch.setenv("WQ_APPROVAL_TIMEOUT", "0.2")
 
@@ -280,10 +252,6 @@ def test_prompt_gives_up_after_the_timeout(monkeypatch: Any) -> None:
 
 
 def test_prompt_can_wait_forever_when_asked_to(monkeypatch: Any) -> None:
-    import io
-
-    import wqagent.cli.app as cli_module
-
     stream = _capture_errors(monkeypatch)
     monkeypatch.setenv("WQ_APPROVAL_TIMEOUT", "0")
     monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
@@ -295,12 +263,6 @@ def test_prompt_can_wait_forever_when_asked_to(monkeypatch: Any) -> None:
 
 
 def test_approval_timeout_from_env(monkeypatch: Any) -> None:
-    from wqagent.core.approval import (
-        APPROVAL_TIMEOUT_ENV,
-        DEFAULT_APPROVAL_TIMEOUT_SECONDS,
-        approval_timeout_from_env,
-    )
-
     monkeypatch.delenv(APPROVAL_TIMEOUT_ENV, raising=False)
     assert approval_timeout_from_env() == DEFAULT_APPROVAL_TIMEOUT_SECONDS
 
@@ -320,7 +282,7 @@ def test_approval_timeout_from_env(monkeypatch: Any) -> None:
 # -- 6. the bash tool integration -------------------------------------------
 def test_safe_commands_need_no_approval(tmp_path: Path) -> None:
     calls: list[ApprovalRequest] = []
-    state = _state(tmp_path, approval_mode="inline", approval_handler=calls.append)
+    state = runtime_for(tmp_path / "ws", approval_mode="inline", approval_handler=calls.append)
     tool = BashTool(state)
 
     outcome = tool.execute("echo hello-approval")
@@ -332,8 +294,7 @@ def test_safe_commands_need_no_approval(tmp_path: Path) -> None:
 
 
 def test_auto_mode_runs_and_marks_the_result(tmp_path: Path) -> None:
-    state = _state(tmp_path, approval_mode="auto")
-    tool = BashTool(state)
+    tool = BashTool(runtime_for(tmp_path / "ws", approval_mode="auto"))
 
     outcome = tool.execute("uv sync")
 
@@ -345,10 +306,8 @@ def test_auto_mode_runs_and_marks_the_result(tmp_path: Path) -> None:
 
 
 def test_deny_mode_refuses_before_running(tmp_path: Path) -> None:
-    marker = tmp_path / "ws" / "should-not-exist.txt"
-    (tmp_path / "ws").mkdir(parents=True, exist_ok=True)
-    state = _state(tmp_path, approval_mode="deny")
-    tool = BashTool(state)
+    marker = workspace_dir(tmp_path) / "should-not-exist.txt"
+    tool = BashTool(runtime_for(tmp_path / "ws", approval_mode="deny"))
 
     outcome = tool.execute(f'curl -o "{marker}" https://example.com/x')
 
@@ -368,8 +327,7 @@ def test_inline_mode_asks_and_runs_when_approved(tmp_path: Path) -> None:
         seen.append(request)
         return ApprovalDecision(approved=True, reason="looks fine")
 
-    state = _state(tmp_path, approval_mode="inline", approval_handler=handler)
-    tool = BashTool(state)
+    tool = BashTool(runtime_for(tmp_path / "ws", approval_mode="inline", approval_handler=handler))
 
     outcome = tool.execute("uv sync")
 
@@ -383,50 +341,46 @@ def test_inline_mode_asks_and_runs_when_approved(tmp_path: Path) -> None:
     assert outcome.approval_note == "approved by the user: Dependency synchronization with uv sync (looks fine)"
 
 
-def test_inline_mode_refuses_when_declined(tmp_path: Path) -> None:
-    state = _state(
-        tmp_path,
-        approval_mode="inline",
-        approval_handler=lambda request: ApprovalDecision(approved=False, reason="not now"),
-    )
-    tool = BashTool(state)
-
-    outcome = tool.execute("uv sync")
-
-    assert outcome.ok is False
-    assert outcome.exit_code is None
-    assert "denied by the user" in outcome.error
-    assert "[not now]" in outcome.error
+def _declines(request: ApprovalRequest) -> ApprovalDecision:
+    """An approver who said no."""
+    return ApprovalDecision(approved=False, reason="not now")
 
 
-def test_inline_mode_without_a_handler_denies(tmp_path: Path) -> None:
-    state = _state(tmp_path)  # default mode is inline, and no handler was given
-    tool = BashTool(state)
+def _raises(request: ApprovalRequest) -> ApprovalDecision:
+    """An approver whose prompt crashed."""
+    raise RuntimeError("the prompt crashed")
 
-    outcome = tool.execute("npm install")
+
+@pytest.mark.parametrize(
+    "options, handler, command, fragments",
+    [
+        # no handler and no explicit mode: the default (inline) policy denies
+        ({}, None, "npm install", ("no approval handler is available",)),
+        ({"approval_mode": "inline"}, _declines, "uv sync", ("denied by the user", "[not now]")),
+        (
+            {"approval_mode": "inline"}, _raises, "npm install",
+            ("the approval handler failed (RuntimeError: the prompt crashed)",),
+        ),
+    ],
+)
+def test_inline_mode_denies_without_a_yes(
+    tmp_path: Path, options: dict[str, Any], handler: Any, command: str, fragments: tuple[str, ...]
+) -> None:
+    if handler is not None:
+        options = {**options, "approval_handler": handler}
+    state = runtime_for(tmp_path / "ws", **options)
+
+    outcome = BashTool(state).execute(command)
 
     assert state.approval_mode == "inline"
     assert outcome.ok is False
     assert outcome.exit_code is None
-    assert "no approval handler is available" in outcome.error
-
-
-def test_a_broken_approver_denies_instead_of_crashing(tmp_path: Path) -> None:
-    def handler(request: ApprovalRequest) -> ApprovalDecision:
-        raise RuntimeError("the prompt crashed")
-
-    state = _state(tmp_path, approval_mode="inline", approval_handler=handler)
-    tool = BashTool(state)
-
-    outcome = tool.execute("npm install")
-
-    assert outcome.ok is False
-    assert "the approval handler failed (RuntimeError: the prompt crashed)" in outcome.error
+    for fragment in fragments:
+        assert fragment in outcome.error
 
 
 def test_run_bash_and_run_share_the_policy(tmp_path: Path) -> None:
-    state = _state(tmp_path, approval_mode="deny")
-    tool = BashTool(state)
+    tool = BashTool(runtime_for(tmp_path / "ws", approval_mode="deny"))
 
     text = tool.run_bash("uv add httpx")
 
@@ -436,8 +390,7 @@ def test_run_bash_and_run_share_the_policy(tmp_path: Path) -> None:
 
 def test_blocked_patterns_still_win_over_approval(tmp_path: Path) -> None:
     """The destructive filter runs first: approval never unblocks those."""
-    state = _state(tmp_path, approval_mode="auto")
-    tool = BashTool(state)
+    tool = BashTool(runtime_for(tmp_path / "ws", approval_mode="auto"))
 
     outcome = tool.execute("rm -rf /")
 
@@ -448,9 +401,7 @@ def test_blocked_patterns_still_win_over_approval(tmp_path: Path) -> None:
 
 def test_verification_commands_cannot_bypass_the_gate(tmp_path: Path) -> None:
     """The gate sits in execute(), so the verifier's commands are covered too."""
-    from wqagent.graph.nodes import run_verification_commands
-
-    state = _state(tmp_path, approval_mode="deny")
+    state = runtime_for(tmp_path / "ws", approval_mode="deny")
 
     results = run_verification_commands(state, ["npm install", "echo ok"])
 

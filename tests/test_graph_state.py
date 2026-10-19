@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import typing
 from pathlib import Path
+from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -22,6 +23,8 @@ from wqagent.graph import (
     todo_progress,
 )
 from wqagent.graph.memory import DEFAULT_CONTEXT_TOKEN_LIMIT
+
+from helpers import graph_state
 
 EXPECTED_KEYS = {
     "task",
@@ -124,41 +127,48 @@ def test_todo_progress() -> None:
     assert todo_progress([]) == "0/0 todos completed"
 
 
-def test_new_graph_state_defaults(tmp_path: Path) -> None:
-    runtime = RuntimeState(workspace=tmp_path / "ws")
-    state = new_graph_state("fix the bug", runtime)
+@pytest.mark.parametrize(
+    "key, expected",
+    [
+        ("todos", []),
+        ("acceptance_criteria", []),
+        ("verification_commands", []),
+        ("verification_results", []),
+        ("passed", False),
+        ("attempts", 0),
+        ("max_attempts", DEFAULT_MAX_ATTEMPTS),
+        ("final_answer", ""),
+        # the layered-memory / context-compression fields start empty (see graph/memory.py)
+        ("context_summary", ""),
+        ("history_summary", ""),
+        ("context_token_count", 0),
+        ("context_token_limit", DEFAULT_CONTEXT_TOKEN_LIMIT),
+        ("context_should_compress", False),
+        ("context_next_node", ""),
+        ("compression_events", []),
+        ("memory_snapshot", {}),
+    ],
+    ids=lambda key: key,
+)
+def test_new_graph_state_defaults(key: str, expected: Any, state: Any) -> None:
+    fresh = new_graph_state("fix the bug", state)
 
-    assert state["task"] == "fix the bug"
-    assert state["runtime"] is runtime
-    assert state["messages"] == []
-    assert state["todos"] == [] and state["acceptance_criteria"] == []
-    assert state["verification_commands"] == [] and state["verification_results"] == []
-    assert state["passed"] is False
-    assert state["attempts"] == 0
-    assert state["max_attempts"] == DEFAULT_MAX_ATTEMPTS
-    assert state["final_answer"] == ""
-    # the layered-memory / context-compression fields start empty (see graph/memory.py)
-    assert state["context_summary"] == "" and state["history_summary"] == ""
-    assert state["context_token_count"] == 0
-    assert state["context_token_limit"] == DEFAULT_CONTEXT_TOKEN_LIMIT
-    assert state["context_should_compress"] is False
-    assert state["context_next_node"] == ""
-    assert state["compression_events"] == []
-    assert state["memory_snapshot"] == {}
+    assert (fresh["task"], fresh["messages"], fresh[key]) == ("fix the bug", [], expected)
+    assert fresh["runtime"] is state
+    assert state.workspace.is_dir()  # the runtime points at a real workspace
 
 
-def test_new_graph_state_overrides(tmp_path: Path) -> None:
-    runtime = RuntimeState(workspace=tmp_path / "ws")
-    state = new_graph_state(
+def test_new_graph_state_overrides(state: Any) -> None:
+    fresh = new_graph_state(
         "fix the bug",
-        runtime,
+        state,
         max_attempts=0,  # clamped to at least 1
         acceptance_criteria=["pytest passes"],
         verification_commands=["pytest -q"],
     )
-    assert state["max_attempts"] == 1
-    assert state["acceptance_criteria"] == ["pytest passes"]
-    assert state["verification_commands"] == ["pytest -q"]
+    assert fresh["max_attempts"] == 1
+    assert fresh["acceptance_criteria"] == ["pytest passes"]
+    assert fresh["verification_commands"] == ["pytest -q"]
 
 
 def test_new_graph_state_rejects_a_bad_runtime(tmp_path: Path) -> None:
@@ -171,26 +181,18 @@ def _build_graph() -> typing.Any:
     """plan -> act -> verify, each node appending to `messages`."""
 
     def plan(state: WQGraphState) -> WQGraphState:
-        return {
-            "plan_summary": "two steps",
-            "todos": [make_todo("t1", "write code"), make_todo("t2", "run tests")],
-            "messages": [HumanMessage(content="plan")],
-        }
+        todos = [make_todo("t1", "write code"), make_todo("t2", "run tests")]
+        return {"plan_summary": "two steps", "todos": todos, "messages": [HumanMessage(content="plan")]}
 
     def act(state: WQGraphState) -> WQGraphState:
         assert state["plan_summary"] == "two steps"  # previous keys are still there
         return {"messages": [AIMessage(content="acted")], "attempts": state.get("attempts", 0) + 1}
 
     def verify(state: WQGraphState) -> WQGraphState:
-        return {
-            "messages": [AIMessage(content="verified")],
-            "verification_results": [
-                VerificationResult(
-                    command="pytest -q", ok=True, exit_code=0, stdout="ok", stderr=""
-                )
-            ],
-            "passed": True,
-        }
+        results = [VerificationResult(command="pytest -q", ok=True, exit_code=0,
+                                     stdout="ok", stderr="")]
+        return {"messages": [AIMessage(content="verified")], "verification_results": results,
+                "passed": True}
 
     graph = StateGraph(WQGraphState)
     graph.add_node("plan", plan)
@@ -203,11 +205,8 @@ def _build_graph() -> typing.Any:
     return graph.compile()
 
 
-def test_graph_merges_messages_across_nodes(tmp_path: Path) -> None:
-    runtime = RuntimeState(workspace=tmp_path / "ws")
-    state = new_graph_state("do the thing", runtime)
-
-    result = _build_graph().invoke(state)
+def test_graph_merges_messages_across_nodes(state: Any) -> None:
+    result = _build_graph().invoke(graph_state("do the thing", root=state.workspace))
 
     # messages from three different nodes accumulated in order
     assert [message.content for message in result["messages"]] == ["plan", "acted", "verified"]
@@ -220,10 +219,10 @@ def test_graph_merges_messages_across_nodes(tmp_path: Path) -> None:
     assert result["task"] == "do the thing"
     assert result["final_answer"] == ""
     assert isinstance(result["runtime"], RuntimeState)
-    assert result["runtime"].workspace == runtime.workspace
+    assert result["runtime"].workspace == state.workspace
 
 
-def test_graph_accepts_a_partial_state(tmp_path: Path) -> None:
+def test_graph_accepts_a_partial_state(state: Any) -> None:
     """total=False means the graph can start from just the keys you have."""
 
     def act(state: WQGraphState) -> WQGraphState:
@@ -233,15 +232,14 @@ def test_graph_accepts_a_partial_state(tmp_path: Path) -> None:
     graph.add_node("act", act)
     graph.add_edge(START, "act")
     graph.add_edge("act", END)
-    app = graph.compile()
 
-    result = app.invoke({"messages": []})
+    result = graph.compile().invoke(graph_state("do it", root=state.workspace))
 
     assert result["passed"] is True
     assert [message.content for message in result["messages"]] == ["hello"]
 
 
-def test_todo_list_survives_a_node_update(tmp_path: Path) -> None:
+def test_todo_list_survives_a_node_update() -> None:
     """`todos` has no reducer, so a node replaces the whole list - and can read it."""
     seen: list[list[dict[str, object]]] = []
 
@@ -269,11 +267,10 @@ def test_todo_list_survives_a_node_update(tmp_path: Path) -> None:
 
 
 def test_no_reducer_channels_are_passed_by_reference() -> None:
-    """Documents the semantics: only `messages` is merged/copied by a reducer.
+    """Only `messages` is merged/copied by a reducer; other channels share the object.
 
-    Channels without a reducer hand the *same* object to the next node, so a node
-    that mutates a list in place would leak that change even without returning it.
-    Nodes should build and return a new list instead.
+    A node that mutates a list in place leaks that change downstream even without
+    returning it, so nodes should build and return a new list instead.
     """
     observed: list[str] = []
 

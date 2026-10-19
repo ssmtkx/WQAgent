@@ -7,11 +7,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage
 
-from helpers import ScriptedModel, answer, passing_script
+from helpers import (
+    ScriptedModel,
+    chat_script,
+    passing_script,
+    workflow_script,
+    workspace_dir,
+)
 from wqagent.core.agent import _summary_line, stream_session_events
 from wqagent.core.session import (
+    append_assistant_turn,
     append_user_turn,
     load_or_create_session,
     new_session,
@@ -20,29 +26,20 @@ from wqagent.core.session import (
     summary_path,
 )
 from wqagent.core.state import create_runtime
-from wqagent.graph.memory import SESSION_CHARS
+from wqagent.graph.memory import SESSION_CHARS, build_layered_memory, read_session
+
+CHAT_REPLY = "你好！我是 WQ Agent。"
 
 
-def _workspace(tmp_path: Path, *files: str) -> Path:
-    root = tmp_path / "ws"
-    root.mkdir(parents=True, exist_ok=True)
-    for name in files:
-        path = root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"# {name}\n", encoding="utf-8")
-    return root
-
-
-def _route(route: str, confidence: float = 0.9) -> AIMessage:
-    return answer(f'{{"route":"{route}","reason":"scripted","confidence":{confidence}}}')
-
-
-def _chat_script(text: str = "你好！我是 WQ Agent。") -> list[Any]:
-    return [_route("chat", 0.95), answer(text)]
-
-
-def _workflow_script() -> list[Any]:
-    return [_route("workflow")] + passing_script()
+def _run(
+    text: str, workspace: Path, model: Any, *, trace_mode: str = "off", **options: Any
+) -> list[dict[str, Any]]:
+    """One session turn streamed in *workspace* (tracing off unless asked for)."""
+    return list(
+        stream_session_events(
+            text, session_workspace=workspace, model=model, trace_mode=trace_mode, **options
+        )
+    )
 
 
 def _turns(workspace: Path) -> list[dict[str, Any]]:
@@ -52,22 +49,15 @@ def _turns(workspace: Path) -> list[dict[str, Any]]:
 
 # -- one turn ----------------------------------------------------------------
 def test_chat_turn_records_both_sides(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path, "app/main.py")
+    workspace = workspace_dir(tmp_path, "app/main.py")
 
-    events = list(
-        stream_session_events(
-            "你好",
-            session_workspace=workspace,
-            model=ScriptedModel(_chat_script()),
-            trace_mode="off",
-        )
-    )
+    events = _run("你好", workspace, ScriptedModel(chat_script(CHAT_REPLY)))
 
     kinds = [event["type"] for event in events]
     assert kinds[-1] == "session_saved"
     assert "intent" in kinds and "chat_response" in kinds
     final = next(event for event in events if event["type"] == "final_answer")
-    assert final["route"] == "chat" and final["content"] == "你好！我是 WQ Agent。"
+    assert final["route"] == "chat" and final["content"] == CHAT_REPLY
     # no workflow node ran
     assert [event["node"] for event in events if event["type"] == "node_end"] == [
         "intent_router",
@@ -85,19 +75,14 @@ def test_chat_turn_records_both_sides(tmp_path: Path) -> None:
     assert [(turn["turn"], turn["role"]) for turn in turns] == [(1, "user"), (2, "assistant")]
     assert turns[0]["content"] == "你好"
     assert turns[1]["route"] == "chat"
-    assert turns[1]["summary"] == "你好！我是 WQ Agent。"
+    assert turns[1]["summary"] == CHAT_REPLY
     assert summary_path(workspace).is_file()
 
 
 def test_workflow_turn_runs_the_pipeline(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
-    model = ScriptedModel(_workflow_script())
+    workspace = workspace_dir(tmp_path)
 
-    events = list(
-        stream_session_events(
-            "写个 hello.py", session_workspace=workspace, model=model, trace_mode="off"
-        )
-    )
+    events = _run("写个 hello.py", workspace, ScriptedModel(workflow_script()))
 
     nodes = [event["node"] for event in events if event["type"] == "node_end"]
     assert nodes == ["intent_router", "planner", "context_monitor", "verifier", "context_monitor", "final"]
@@ -109,21 +94,10 @@ def test_workflow_turn_runs_the_pipeline(tmp_path: Path) -> None:
 
 
 def test_turns_continue_across_calls(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
 
-    first = list(
-        stream_session_events(
-            "你好", session_workspace=workspace, model=ScriptedModel(_chat_script()), trace_mode="off"
-        )
-    )
-    second = list(
-        stream_session_events(
-            "写个 hello.py",
-            session_workspace=workspace,
-            model=ScriptedModel(_workflow_script()),
-            trace_mode="off",
-        )
-    )
+    first = _run("你好", workspace, ScriptedModel(chat_script()))
+    second = _run("写个 hello.py", workspace, ScriptedModel(workflow_script()))
 
     assert first[-1]["session_id"] == second[-1]["session_id"]  # same session
     assert (first[-1]["turn"], first[-1]["reply_turn"]) == (1, 2)
@@ -139,14 +113,10 @@ def test_turns_continue_across_calls(tmp_path: Path) -> None:
 
 # -- the context reaches both sides -----------------------------------------
 def test_context_reaches_the_entry_router(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path, "app/main.py")
+    workspace = workspace_dir(tmp_path, "app/main.py")
+    model = ScriptedModel(chat_script())
 
-    model = ScriptedModel(_chat_script())
-    list(
-        stream_session_events(
-            "帮我看下项目结构", session_workspace=workspace, model=model, trace_mode="off"
-        )
-    )
+    _run("帮我看下项目结构", workspace, model)
 
     instruction = model.seen[0][1].content  # the router's own call
     assert "帮我看下项目结构" in instruction  # this very turn
@@ -156,21 +126,15 @@ def test_context_reaches_the_entry_router(tmp_path: Path) -> None:
 
 def test_context_reaches_the_workflow_nodes(tmp_path: Path) -> None:
     """The memory layer carries the session, so the planner knows earlier turns."""
-    workspace = _workspace(tmp_path, "app/main.py")
+    workspace = workspace_dir(tmp_path, "app/main.py")
     # a first turn, recorded as if it had happened earlier
     session = load_or_create_session(workspace)
     turn = append_user_turn(session, "帮我搭个 FastAPI 后台")
-    from wqagent.core.session import append_assistant_turn
-
     append_assistant_turn(session, turn=turn, route="workflow", content="done", summary="skeleton")
     save_session(workspace, session)
 
-    model = ScriptedModel(_workflow_script())
-    list(
-        stream_session_events(
-            "再帮我加个登录接口", session_workspace=workspace, model=model, trace_mode="off"
-        )
-    )
+    model = ScriptedModel(workflow_script())
+    _run("再帮我加个登录接口", workspace, model)
 
     # the planner's prompt for this turn carries the session block from the memory
     planner_calls = [
@@ -187,38 +151,22 @@ def test_context_reaches_the_workflow_nodes(tmp_path: Path) -> None:
 
 
 def test_seed_message_is_a_system_message(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
     captured: dict[str, Any] = {}
 
     def on_event(kind: str, payload: dict[str, Any]) -> None:
         captured.setdefault(kind, payload)
 
-    list(
-        stream_session_events(
-            "写个 hello.py",
-            session_workspace=workspace,
-            model=ScriptedModel(_workflow_script()),
-            trace_mode="off",
-            on_event=on_event,
-        )
-    )
+    _run("写个 hello.py", workspace, ScriptedModel(workflow_script()), on_event=on_event)
 
     assert "intent" in captured and "final_answer" in captured
 
 
 # -- options -----------------------------------------------------------------
 def test_save_false_keeps_everything_in_memory(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
 
-    events = list(
-        stream_session_events(
-            "你好",
-            session_workspace=workspace,
-            model=ScriptedModel(_chat_script()),
-            trace_mode="off",
-            save=False,
-        )
-    )
+    events = _run("你好", workspace, ScriptedModel(chat_script()), save=False)
 
     assert events[-1]["saved"] is False
     assert events[-1]["turn"] == 1 and events[-1]["reply_turn"] == 2
@@ -226,39 +174,23 @@ def test_save_false_keeps_everything_in_memory(tmp_path: Path) -> None:
 
 
 def test_session_can_be_handed_over(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
     session = new_session()
     append_user_turn(session, "earlier turn")
 
-    events = list(
-        stream_session_events(
-            "你好",
-            session_workspace=workspace,
-            session=session,
-            model=ScriptedModel(_chat_script()),
-            trace_mode="off",
-        )
-    )
+    events = _run("你好", workspace, ScriptedModel(chat_script()), session=session)
 
     assert events[-1]["session_id"] == session["session_id"]
     assert events[-1]["turn"] == 2  # continues the handed-over session
     assert session["turn_index"] == 3
-    assert "earlier turn" in json.loads(session_path(workspace).read_text(encoding="utf-8"))["recent_turns"][0]["content"]
+    assert "earlier turn" in _turns(workspace)[0]["content"]
 
 
 def test_entry_router_can_be_skipped(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
     model = ScriptedModel(passing_script())  # no router response: the planner goes first
 
-    events = list(
-        stream_session_events(
-            "写个 hello.py",
-            session_workspace=workspace,
-            model=model,
-            entry_router=False,
-            trace_mode="off",
-        )
-    )
+    events = _run("写个 hello.py", workspace, model, entry_router=False)
 
     nodes = [event["node"] for event in events if event["type"] == "node_end"]
     assert nodes[0] == "planner" and "intent_router" not in nodes
@@ -268,25 +200,18 @@ def test_entry_router_can_be_skipped(tmp_path: Path) -> None:
 
 def test_workspace_is_required() -> None:
     with pytest.raises(ValueError, match="session_workspace="):
-        list(stream_session_events("你好", model=ScriptedModel(_chat_script())))
+        list(stream_session_events("你好", model=ScriptedModel(chat_script())))
 
 
 def test_a_failed_turn_keeps_the_user_message(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
 
     class Boom(ScriptedModel):
         def invoke(self, messages: Any) -> Any:
             raise RuntimeError("provider exploded")
 
     with pytest.raises(RuntimeError):
-        list(
-            stream_session_events(
-                "do something",
-                session_workspace=workspace,
-                model=Boom([]),
-                trace_mode="off",
-            )
-        )
+        _run("do something", workspace, Boom([]))
 
     turns = _turns(workspace)
     assert [(turn["turn"], turn["role"]) for turn in turns] == [(1, "user")]
@@ -294,16 +219,9 @@ def test_a_failed_turn_keeps_the_user_message(tmp_path: Path) -> None:
 
 
 def test_checkpoint_and_trace_still_written(tmp_path: Path) -> None:
-    workspace = _workspace(tmp_path)
+    workspace = workspace_dir(tmp_path)
 
-    list(
-        stream_session_events(
-            "写个 hello.py",
-            session_workspace=workspace,
-            model=ScriptedModel(_workflow_script()),
-            trace_mode="full",
-        )
-    )
+    _run("写个 hello.py", workspace, ScriptedModel(workflow_script()), trace_mode="full")
 
     assert (workspace / ".wqagent" / "checkpoints" / "checkpoint.json").is_file()
     traces = list((workspace / ".wqagent" / "traces").iterdir())
@@ -324,10 +242,7 @@ def test_summary_line() -> None:
 
 def test_memory_carries_the_session(tmp_path: Path) -> None:
     """Every node gets the session through the layered memory's third layer."""
-    from wqagent.core.session import append_assistant_turn
-    from wqagent.graph.memory import build_layered_memory, read_session
-
-    workspace = _workspace(tmp_path, "app/main.py")
+    workspace = workspace_dir(tmp_path, "app/main.py")
     session = load_or_create_session(workspace)
     turn = append_user_turn(session, "帮我搭个 FastAPI 后台")
     append_assistant_turn(session, turn=turn, route="workflow", content="done", summary="skeleton")
@@ -347,10 +262,6 @@ def test_memory_carries_the_session(tmp_path: Path) -> None:
 
 
 def test_read_session_of_an_empty_workspace(tmp_path: Path) -> None:
-    from wqagent.graph.memory import read_session
-
-    workspace = _workspace(tmp_path)
-
-    record = read_session(create_runtime(workspace))
+    record = read_session(create_runtime(workspace_dir(tmp_path)))
 
     assert record["exists"] is False and record["content"] == "" and record["error"] == ""

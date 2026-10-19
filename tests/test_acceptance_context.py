@@ -24,14 +24,13 @@ import wqagent.cli.app as cli_module
 from helpers import (
     ScriptedModel,
     answer,
+    graph_state,
     passing_script,
     plan_call,
     report_call,
 )
 
 from wqagent.core.agent import stream_agent_events
-from wqagent.core.state import RuntimeState
-from wqagent.graph import build_complex_workflow, new_graph_state
 from wqagent.graph.memory import (
     CONTEXT_TOKEN_LIMIT_ENV,
     DEFAULT_CONTEXT_TOKEN_LIMIT,
@@ -77,11 +76,56 @@ def _final_state(events: list[dict[str, Any]]) -> dict[str, Any]:
     return state
 
 
+def _state(tmp_path: Path, task: str = "write hello.py") -> dict[str, Any]:
+    """A fresh graph state in this test's workspace."""
+    return graph_state(task, root=tmp_path / "ws")
+
+
+def _compression_model(final: str = "Done.") -> ScriptedModel:
+    """Plan, compress (scripted JSON), inspect, verify, finish."""
+    return ScriptedModel(
+        [
+            plan_call(),
+            answer("Planned it."),
+            AIMessage(content=json.dumps(COMPRESSION_PAYLOAD)),
+            answer("Inspected."),
+            report_call(True),
+            answer(final),
+        ]
+    )
+
+
+def _run_compression(
+    tmp_path: Path,
+    monkeypatch: Any,
+    *,
+    final: str = "Done.",
+    messages: int = 1,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run the 2000-token-budget scenario and return ``(events, state)``."""
+    monkeypatch.setenv(CONTEXT_TOKEN_LIMIT_ENV, "2000")
+    state = _state(tmp_path)
+    state["messages"] = [HumanMessage(content=_big_context())]
+    if messages > 1:
+        state["messages"] += [AIMessage(content="still working"), HumanMessage(content="and more")]
+    return _run(state, _compression_model(final)), state
+
+
+def _capture_cli(monkeypatch: Any) -> StringIO:
+    """Point the CLI renderer at a string buffer (no terminal, no colour)."""
+    stream = StringIO()
+    monkeypatch.setattr(
+        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
+    )
+    monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)
+    return stream
+
+
 # -- 1. WQ_CONTEXT_TOKEN_LIMIT=2000 triggers compression, the task continues ---
 def test_env_var_sets_the_context_budget(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setenv(CONTEXT_TOKEN_LIMIT_ENV, "2000")
 
-    state = new_graph_state("do it", RuntimeState(workspace=tmp_path / "ws"))
+    state = _state(tmp_path, "do it")
 
     assert state["context_token_limit"] == 2000
 
@@ -90,32 +134,16 @@ def test_env_var_sets_the_context_budget(tmp_path: Path, monkeypatch: Any) -> No
 def test_env_var_junk_keeps_the_default(raw: str, tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setenv(CONTEXT_TOKEN_LIMIT_ENV, raw)
 
-    state = new_graph_state("do it", RuntimeState(workspace=tmp_path / "ws"))
+    state = _state(tmp_path, "do it")
 
     assert state["context_token_limit"] == DEFAULT_CONTEXT_TOKEN_LIMIT
 
 
 def test_compression_triggers_and_the_task_continues(tmp_path: Path, monkeypatch: Any) -> None:
     """AC1: with a 2000-token budget the run compresses, then keeps working."""
-    monkeypatch.setenv(CONTEXT_TOKEN_LIMIT_ENV, "2000")
-    model = ScriptedModel(
-        [
-            plan_call(),
-            answer("Planned it."),
-            AIMessage(content=json.dumps(COMPRESSION_PAYLOAD)),
-            answer("Inspected after compression."),
-            report_call(True),
-            answer("Done after compressing the context."),
-        ]
+    events, state = _run_compression(
+        tmp_path, monkeypatch, final="Done after compressing the context.", messages=3
     )
-    state = new_graph_state("write hello.py", RuntimeState(workspace=tmp_path / "ws"))
-    state["messages"] = [
-        HumanMessage(content=_big_context()),
-        AIMessage(content="working on it"),
-        HumanMessage(content="more transcript"),
-    ]
-
-    events = _run(state, model)
     order = [event["node"] for event in events if event["type"] == "node_end"]
     update = {
         event["node"]: event["update"] for event in events if event["type"] == "node_end"
@@ -152,7 +180,7 @@ def test_compression_does_not_trigger_on_a_small_context(tmp_path: Path, monkeyp
     monkeypatch.delenv(CONTEXT_TOKEN_LIMIT_ENV, raising=False)
     model = ScriptedModel(passing_script())
 
-    events = _run(new_graph_state("write hello.py", RuntimeState(workspace=tmp_path / "ws")), model)
+    events = _run(_state(tmp_path), model)
 
     order = [event["node"] for event in events if event["type"] == "node_end"]
     assert "context_compressor" not in order
@@ -161,22 +189,8 @@ def test_compression_does_not_trigger_on_a_small_context(tmp_path: Path, monkeyp
 
 # -- 2. HISTORY_SUMMARY.md lands on disk and is readable ---------------------
 def test_history_summary_is_written_and_readable(tmp_path: Path, monkeypatch: Any) -> None:
-    monkeypatch.setenv(CONTEXT_TOKEN_LIMIT_ENV, "2000")
     workspace = tmp_path / "ws"
-    model = ScriptedModel(
-        [
-            plan_call(),
-            answer("Planned it."),
-            AIMessage(content=json.dumps(COMPRESSION_PAYLOAD)),
-            answer("Inspected."),
-            report_call(True),
-            answer("Done."),
-        ]
-    )
-    state = new_graph_state("write hello.py", RuntimeState(workspace=workspace))
-    state["messages"] = [HumanMessage(content=_big_context())]
-
-    events = _run(state, model)
+    events, state = _run_compression(tmp_path, monkeypatch)
 
     path = workspace / "HISTORY_SUMMARY.md"
     assert path.is_file()
@@ -218,21 +232,7 @@ def test_history_summary_is_written_and_readable(tmp_path: Path, monkeypatch: An
 
 # -- 3. the memory is injected everywhere and the CLI shows it ---------------
 def test_every_node_gets_the_layered_memory(tmp_path: Path, monkeypatch: Any) -> None:
-    monkeypatch.setenv(CONTEXT_TOKEN_LIMIT_ENV, "2000")
-    model = ScriptedModel(
-        [
-            plan_call(),
-            answer("Planned it."),
-            AIMessage(content=json.dumps(COMPRESSION_PAYLOAD)),
-            answer("Inspected."),
-            report_call(True),
-            answer("Done."),
-        ]
-    )
-    state = new_graph_state("write hello.py", RuntimeState(workspace=tmp_path / "ws"))
-    state["messages"] = [HumanMessage(content=_big_context())]
-
-    events = _run(state, model)
+    events, _ = _run_compression(tmp_path, monkeypatch)
 
     injected = [event["node"] for event in events if event["type"] == "memory"]
     assert set(injected) == {
@@ -256,7 +256,7 @@ def test_every_model_call_sees_the_memory(tmp_path: Path, monkeypatch: Any) -> N
     monkeypatch.delenv(CONTEXT_TOKEN_LIMIT_ENV, raising=False)
     model = ScriptedModel(passing_script())
 
-    events = _run(new_graph_state("write hello.py", RuntimeState(workspace=tmp_path / "ws")), model)
+    events = _run(_state(tmp_path), model)
 
     # the planner's brief, the verifier's evidence and the final facts all include it
     planner_prompt = model.seen[0][1].content
@@ -274,11 +274,7 @@ def test_every_model_call_sees_the_memory(tmp_path: Path, monkeypatch: Any) -> N
 
 def test_cli_shows_the_memory_snapshot(tmp_path: Path, monkeypatch: Any) -> None:
     """AC3: the terminal shows the snapshot (digest always, full JSON in -v)."""
-    stream = StringIO()
-    monkeypatch.setattr(
-        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
-    )
-    monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)
+    stream = _capture_cli(monkeypatch)
     event = {
         "type": "memory",
         "node": "planner",
@@ -306,25 +302,7 @@ def test_cli_shows_the_memory_snapshot(tmp_path: Path, monkeypatch: Any) -> None
 
 # -- 4. before/after comparison of tokens and messages -----------------------
 def test_compression_event_compares_tokens_and_messages(tmp_path: Path, monkeypatch: Any) -> None:
-    monkeypatch.setenv(CONTEXT_TOKEN_LIMIT_ENV, "2000")
-    model = ScriptedModel(
-        [
-            plan_call(),
-            answer("Planned it."),
-            AIMessage(content=json.dumps(COMPRESSION_PAYLOAD)),
-            answer("Inspected."),
-            report_call(True),
-            answer("Done."),
-        ]
-    )
-    state = new_graph_state("write hello.py", RuntimeState(workspace=tmp_path / "ws"))
-    state["messages"] = [
-        HumanMessage(content=_big_context()),
-        AIMessage(content="still working"),
-        HumanMessage(content="and more"),
-    ]
-
-    events = _run(state, model)
+    events, _ = _run_compression(tmp_path, monkeypatch, messages=3)
     event = next(item for item in events if item["type"] == "context_compressed")
 
     assert event["messages_before"] == 3
@@ -346,11 +324,7 @@ def test_compression_event_compares_tokens_and_messages(tmp_path: Path, monkeypa
 
 
 def test_cli_renders_the_before_after_comparison(tmp_path: Path, monkeypatch: Any) -> None:
-    stream = StringIO()
-    monkeypatch.setattr(
-        cli_module, "console", Console(file=stream, width=200, force_terminal=False)
-    )
-    monkeypatch.setattr(cli_module, "_can_encode", lambda text: False)
+    stream = _capture_cli(monkeypatch)
     renderer = cli_module._NodeRenderer(verbose=False)
 
     renderer.render(

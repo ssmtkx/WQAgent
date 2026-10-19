@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -13,59 +14,38 @@ from helpers import (
     ScriptedModel,
     answer,
     code_call,
+    graph_state,
     passing_script,
     plan_call,
     report_call,
 )
 
-from wqagent.core.state import RuntimeState
 from wqagent.graph import (
     COMPLEX_NODE_NAMES,
     COMPRESSOR_ROUTE_TARGETS,
     CONTEXT_ROUTE_TARGETS,
     NODE_NAMES,
     ROUTE_TARGETS,
-    WQGraphState,
     build_complex_workflow,
     build_workflow,
     final_node,
     format_final_answer,
-    new_graph_state,
     set_model,
 )
+from wqagent.graph import nodes as node_module
 from wqagent.graph.state import make_todo
 from wqagent.prompts import stage1, stage2, stage3
-from wqagent.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 
 #: A compression payload the compressor model can answer with.
 COMPRESSION_PAYLOAD: dict[str, Any] = {
-    "summary": "compressed",
-    "active_goal": "finish hello.py",
-    "completed_work": "wrote hello.py",
-    "open_todos": ["t1: rerun"],
-    "important_files": ["hello.py"],
-    "tool_findings": ["python 3.12"],
-    "sources": ["https://docs.test/python"],
-    "next_steps": ["run it"],
-    "risks": "none",
+    "summary": "compressed", "active_goal": "finish hello.py", "completed_work": "wrote hello.py",
+    "open_todos": ["t1: rerun"], "important_files": ["hello.py"], "tool_findings": ["python 3.12"],
+    "sources": ["https://docs.test/python"], "next_steps": ["run it"], "risks": "none",
 }
 
-
-class ScriptedModel:
-    """Replays scripted responses; records what it was asked."""
-
-    def __init__(self, responses: list[Any]) -> None:
-        self.responses = list(responses)
-        self.seen: list[list[Any]] = []
-
-    def bind_tools(self, tools: list[Any], **kwargs: Any) -> "ScriptedModel":
-        return self
-
-    def invoke(self, messages: list[Any]) -> Any:
-        self.seen.append(list(messages))
-        if not self.responses:
-            raise AssertionError("ScriptedModel ran out of scripted responses")
-        return self.responses.pop(0)
+#: Sentinel objects the workflow builders must bind into their nodes verbatim.
+SENTINEL = object()
+AGENT_MODEL = object()
 
 
 class BrokenModel:
@@ -78,12 +58,6 @@ class BrokenModel:
         raise RuntimeError("model offline")
 
 
-def _tool_call(name: str, args: dict[str, Any]) -> AIMessage:
-    return AIMessage(
-        content="", tool_calls=[{"name": name, "args": args, "id": "c1", "type": "tool_call"}]
-    )
-
-
 @pytest.fixture(autouse=True)
 def _reset_module_model():
     set_model(None)
@@ -91,10 +65,14 @@ def _reset_module_model():
     set_model(None)
 
 
+def _finished_state(tmp_path: Path, **extra: Any) -> dict[str, Any]:
+    """A graph state in a throwaway workspace, for the ``final_node`` tests."""
+    return graph_state(root=tmp_path / "ws", **extra)
+
+
 # -- graph shape -------------------------------------------------------------
 def test_workflow_has_the_expected_nodes_and_edges() -> None:
-    app = build_workflow()
-    drawing = app.get_graph()
+    drawing = build_workflow().get_graph()
 
     node_ids = set(drawing.nodes)
     for name in NODE_NAMES:
@@ -115,8 +93,6 @@ def test_workflow_has_the_expected_nodes_and_edges() -> None:
 
 
 def test_every_node_is_the_function_from_nodes_module() -> None:
-    from wqagent.graph import nodes as node_module
-
     drawing = build_workflow().get_graph()
 
     for name in NODE_NAMES:
@@ -125,37 +101,42 @@ def test_every_node_is_the_function_from_nodes_module() -> None:
         assert wired is getattr(node_module, f"{name}_node"), name
 
 
-def test_build_workflow_binds_model_and_loop_budgets() -> None:
-    from functools import partial
+@pytest.mark.parametrize(
+    "build, options, expected",
+    [
+        pytest.param(
+            build_workflow,
+            {"planner_loops": 3, "agent_model": AGENT_MODEL},
+            {"planner": {"model": SENTINEL, "max_loops": 3, "agent_model": AGENT_MODEL},
+             "verifier": {"model": SENTINEL}},
+            id="workflow",
+        ),
+        pytest.param(
+            build_complex_workflow,
+            {"planner_loops": 5, "verifier_loops": 2},
+            {"planner": {"model": SENTINEL, "max_loops": 5},
+             "verifier": {"model": SENTINEL, "max_loops": 2},
+             "context_monitor": {"model": SENTINEL},
+             "context_compressor": {"model": SENTINEL},
+             "final": {"model": SENTINEL}},
+            id="complex",
+        ),
+    ],
+)
+def test_builders_bind_model_and_loop_budgets(
+    build: Any, options: dict[str, Any], expected: dict[str, dict[str, Any]]
+) -> None:
+    """Every node is a ``partial`` of its ``nodes`` function with the bound keywords."""
+    drawing = build(model=SENTINEL, **options).get_graph()
 
-    from wqagent.graph import nodes as node_module
-
-    sentinel = object()
-    specialist = object()
-    drawing = build_workflow(
-        model=sentinel, planner_loops=3, agent_model=specialist
-    ).get_graph()
-
-    planner = getattr(drawing.nodes["planner"].data, "func", drawing.nodes["planner"].data)
-    assert isinstance(planner, partial)
-    assert planner.func is node_module.planner_node
-    assert planner.keywords == {
-        "model": sentinel,
-        "max_loops": 3,
-        "agent_model": specialist,
-    }
-
-    verifier = getattr(drawing.nodes["verifier"].data, "func", drawing.nodes["verifier"].data)
-    assert isinstance(verifier, partial)
-    assert verifier.keywords == {"model": sentinel}
+    for name, keywords in expected.items():
+        wired = getattr(drawing.nodes[name].data, "func", drawing.nodes[name].data)
+        assert isinstance(wired, partial)
+        assert wired.func is getattr(node_module, f"{name}_node")
+        assert wired.keywords == keywords
 
 
 # -- final_node --------------------------------------------------------------
-def _finished_state(tmp_path: Path, **extra: Any):
-    state = new_graph_state("write hello.py", RuntimeState(workspace=tmp_path / "ws"), **extra)
-    return state
-
-
 def test_final_node_reports_success(tmp_path: Path) -> None:
     state = _finished_state(
         tmp_path,
@@ -168,57 +149,54 @@ def test_final_node_reports_success(tmp_path: Path) -> None:
         ],
         verification_checks=[{"name": "prints Hello", "passed": True, "detail": "stdout was Hello"}],
         last_actor_summary="Wrote hello.py and ran it.",
+        passed=True,
+        attempts=1,
     )
-    state["passed"] = True
-    state["attempts"] = 1
 
-    update = final_node(state, summarize=False)
-    answer = update["final_answer"]
+    text = final_node(state, summarize=False)["final_answer"]
 
-    assert "**Status:** completed" in answer
-    assert "attempts: 1/3" in answer
-    assert "write, then run" in answer
-    assert "[x] t1: write hello.py — verified" in answer
-    assert "PASS — prints Hello (stdout was Hello)" in answer
-    assert "`python hello.py` -> exit code 0 (ok)" in answer
-    assert "Wrote hello.py and ran it." in answer
-    assert "not completed" not in answer
+    assert "**Status:** completed" in text
+    assert "attempts: 1/3" in text
+    assert "write, then run" in text
+    assert "[x] t1: write hello.py — verified" in text
+    assert "PASS — prints Hello (stdout was Hello)" in text
+    assert "`python hello.py` -> exit code 0 (ok)" in text
+    assert "Wrote hello.py and ran it." in text
+    assert "not completed" not in text
 
 
 def test_final_node_reports_failure_with_the_remaining_work(tmp_path: Path) -> None:
     state = _finished_state(
         tmp_path,
         plan_summary="write, then run",
-        todos=[
-            make_todo("t1", "write hello.py", status="completed"),
-            make_todo("t2", "run it", status="pending"),
-        ],
+        todos=[make_todo("t1", "write hello.py", status="completed"), make_todo("t2", "run it")],
         acceptance_criteria=["prints Hello"],
         verification_commands=["python hello.py"],
         verification_results=[
-            {"command": "python hello.py", "ok": False, "exit_code": 1, "stdout": "", "stderr": "NameError"}
+            {"command": "python hello.py", "ok": False, "exit_code": 1,
+             "stdout": "", "stderr": "NameError"}
         ],
         last_error="command failed: python hello.py (exit code 1)",
+        passed=False,
+        attempts=3,
+        max_attempts=3,
     )
-    state["passed"] = False
-    state["attempts"] = 3
-    state["max_attempts"] = 3
 
-    answer = final_node(state, summarize=False)["final_answer"]
+    text = final_node(state, summarize=False)["final_answer"]
 
-    assert "**Status:** not completed" in answer
-    assert "attempts: 3/3" in answer
-    assert "**Why it is not done:**" in answer
-    assert "command failed: python hello.py (exit code 1)" in answer
-    assert "**Remaining work:**" in answer
-    assert "- t2: run it" in answer
-    assert "- t1:" not in answer.split("**Remaining work:**")[1]
+    assert "**Status:** not completed" in text
+    assert "attempts: 3/3" in text
+    assert "**Why it is not done:**" in text
+    assert "command failed: python hello.py (exit code 1)" in text
+    assert "**Remaining work:**" in text
+    assert "- t2: run it" in text
+    assert "- t1:" not in text.split("**Remaining work:**")[1]
 
 
 def test_format_final_answer_never_returns_empty() -> None:
-    answer = format_final_answer({})
-    assert "**Task:** (no task recorded)" in answer
-    assert "**Status:** not completed" in answer
+    text = format_final_answer({})
+    assert "**Task:** (no task recorded)" in text
+    assert "**Status:** not completed" in text
 
 
 def test_final_node_uses_the_model_summary(tmp_path: Path) -> None:
@@ -234,23 +212,25 @@ def test_final_node_uses_the_model_summary(tmp_path: Path) -> None:
     assert "**Status:**" in sent[1].content  # the report is handed over as facts
 
 
-def test_final_node_falls_back_when_the_model_fails(tmp_path: Path) -> None:
-    state = _finished_state(tmp_path, todos=[make_todo("t1", "do it", status="completed")])
-    state["passed"] = True
+@pytest.mark.parametrize(
+    "model, passed",
+    [
+        pytest.param(lambda: BrokenModel(), True, id="model-fails"),
+        pytest.param(lambda: ScriptedModel([AIMessage(content="   ")]), False, id="empty-answer"),
+    ],
+)
+def test_final_node_falls_back_to_the_rendered_report(
+    model: Any, passed: bool, tmp_path: Path
+) -> None:
+    """An unusable model answer must never lose the report."""
+    state = _finished_state(
+        tmp_path, todos=[make_todo("t1", "do it", status="completed")], passed=passed
+    )
 
-    update = final_node(state, model=BrokenModel())
+    update = final_node(state, model=model())
 
     assert update["final_answer"] == format_final_answer(state)
-    assert "**Status:** completed" in update["final_answer"]
-
-
-def test_final_node_ignores_an_empty_model_answer(tmp_path: Path) -> None:
-    state = _finished_state(tmp_path)
-    model = ScriptedModel([AIMessage(content="   ")])
-
-    update = final_node(state, model=model)
-
-    assert update["final_answer"] == format_final_answer(state)
+    assert ("**Status:** completed" in update["final_answer"]) is passed
 
 
 # -- prompts -----------------------------------------------------------------
@@ -290,9 +270,7 @@ def test_workflow_passes_on_the_first_attempt(tmp_path: Path) -> None:
     model = ScriptedModel(passing_script(final_text="Done: hello.py prints Hello."))
     set_model(model)
 
-    result = build_workflow().invoke(
-        new_graph_state("write hello.py", RuntimeState(workspace=workspace))
-    )
+    result = build_workflow().invoke(graph_state(root=workspace))
 
     assert result["passed"] is True
     assert result["attempts"] == 1
@@ -333,7 +311,7 @@ def test_workflow_writes_a_failure_answer_when_the_budget_runs_out(tmp_path: Pat
     set_model(model)
 
     result = build_workflow().invoke(
-        new_graph_state("fix the failing test", RuntimeState(workspace=workspace), max_attempts=1)
+        graph_state("fix the failing test", root=workspace, max_attempts=1)
     )
 
     assert result["passed"] is False
@@ -348,9 +326,7 @@ def test_workflow_writes_a_failure_answer_when_the_budget_runs_out(tmp_path: Pat
 # -- the complex workflow (with context management) --------------------------
 def _complex_run(tmp_path: Path, model: Any, *, max_attempts: int = 3, **extra: Any):
     """Run the complex graph once; return (final state, node order)."""
-    state = new_graph_state(
-        "write hello.py", RuntimeState(workspace=tmp_path / "ws"), max_attempts=max_attempts, **extra
-    )
+    state = graph_state(root=tmp_path / "ws", max_attempts=max_attempts, **extra)
     app = build_complex_workflow(model=model)
     order: list[str] = []
     result: dict[str, Any] = dict(state)
@@ -369,11 +345,7 @@ def test_complex_workflow_has_the_expected_nodes_and_edges() -> None:
     for name in COMPLEX_NODE_NAMES:
         assert name in node_ids, name
     assert set(COMPLEX_NODE_NAMES) == {
-        "planner",
-        "context_monitor",
-        "context_compressor",
-        "verifier",
-        "final",
+        "planner", "context_monitor", "context_compressor", "verifier", "final"
     }
 
     edges = {(edge.source, edge.target) for edge in drawing.edges}
@@ -389,28 +361,6 @@ def test_complex_workflow_has_the_expected_nodes_and_edges() -> None:
     assert monitor_targets == set(CONTEXT_ROUTE_TARGETS.values())
     compressor_targets = {target for source, target in edges if source == "context_compressor"}
     assert compressor_targets == set(COMPRESSOR_ROUTE_TARGETS.values())
-
-
-def test_complex_workflow_binds_model_and_loop_budgets() -> None:
-    from functools import partial
-
-    from wqagent.graph import nodes as node_module
-
-    sentinel = object()
-    drawing = build_complex_workflow(
-        model=sentinel, planner_loops=5, verifier_loops=2
-    ).get_graph()
-
-    planner = getattr(drawing.nodes["planner"].data, "func", drawing.nodes["planner"].data)
-    assert isinstance(planner, partial)
-    assert planner.keywords == {"model": sentinel, "max_loops": 5}
-    verifier = getattr(drawing.nodes["verifier"].data, "func", drawing.nodes["verifier"].data)
-    assert verifier.keywords == {"model": sentinel, "max_loops": 2}
-    for name in ("context_monitor", "context_compressor", "final"):
-        wired = getattr(drawing.nodes[name].data, "func", drawing.nodes[name].data)
-        assert isinstance(wired, partial)
-        assert wired.func is getattr(node_module, f"{name}_node")
-        assert wired.keywords == {"model": sentinel}
 
 
 def test_complex_workflow_passes_without_compressing(tmp_path: Path) -> None:
@@ -446,12 +396,7 @@ def test_complex_workflow_compresses_an_over_budget_context(tmp_path: Path) -> N
     result, order = _complex_run(tmp_path, model, context_token_limit=1)
 
     assert order == [
-        "planner",
-        "context_monitor",
-        "context_compressor",
-        "verifier",
-        "context_monitor",
-        "final",
+        "planner", "context_monitor", "context_compressor", "verifier", "context_monitor", "final"
     ]
     assert result["passed"] is True
     assert result["context_summary"] == summary
@@ -462,9 +407,8 @@ def test_complex_workflow_compresses_an_over_budget_context(tmp_path: Path) -> N
     assert result["messages"][0].content == summary
     # ...and the compressor was asked exactly once (limit=1 is unreachable)
     assert len(model.seen) == 6
-    assert (tmp_path / "ws" / "HISTORY_SUMMARY.md").read_text(encoding="utf-8").startswith(
-        "# History summary"
-    )
+    history = (tmp_path / "ws" / "HISTORY_SUMMARY.md").read_text(encoding="utf-8")
+    assert history.startswith("# History summary")
 
 
 def test_complex_workflow_stops_at_the_attempt_budget(tmp_path: Path) -> None:
@@ -508,15 +452,8 @@ def test_complex_workflow_replans_after_a_failed_verification(tmp_path: Path) ->
     assert result["passed"] is True
     assert result["attempts"] == 2
     assert order == [
-        "planner",
-        "context_monitor",
-        "verifier",
-        "context_monitor",
-        "planner",
-        "context_monitor",
-        "verifier",
-        "context_monitor",
-        "final",
+        "planner", "context_monitor", "verifier", "context_monitor",
+        "planner", "context_monitor", "verifier", "context_monitor", "final",
     ]
     assert len(model.seen) == 9
 
@@ -526,14 +463,16 @@ def test_workflow_answers_even_without_a_working_model(tmp_path: Path) -> None:
     set_model(BrokenModel())
 
     # only the final node is exercised here - the other nodes need a model
-    state = new_graph_state("do something", RuntimeState(workspace=tmp_path / "ws"))
-    state["todos"] = [make_todo("t1", "do it")]
-    state["passed"] = False
-    state["attempts"] = 1
-    state["last_error"] = "boom"
+    state = graph_state(
+        "do something",
+        root=tmp_path / "ws",
+        todos=[make_todo("t1", "do it")],
+        attempts=1,
+        last_error="boom",
+    )
 
-    answer = final_node(state)["final_answer"]
+    text = final_node(state)["final_answer"]
 
-    assert "**Status:** not completed" in answer
-    assert "boom" in answer
-    json.dumps(answer)  # plain text, nothing exotic
+    assert "**Status:** not completed" in text
+    assert "boom" in text
+    json.dumps(text)  # plain text, nothing exotic

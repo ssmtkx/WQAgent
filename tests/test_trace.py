@@ -8,7 +8,8 @@ from typing import Any
 
 import pytest
 
-from wqagent.core.state import RuntimeState
+from helpers import ScriptedModel, passing_script, runtime_for
+from wqagent.core.agent import stream_agent_events
 from wqagent.core.trace import (
     DEFAULT_TRACE_MODE,
     TIMELINE_HEAD,
@@ -21,22 +22,19 @@ from wqagent.core.trace import (
     normalize_trace_mode,
     trace_mode_from_env,
 )
-
-
-def _runtime(tmp_path: Path, **kwargs: Any) -> RuntimeState:
-    return RuntimeState(workspace=tmp_path / "ws", **kwargs)
+from wqagent.graph.state import new_graph_state
 
 
 def _inputs(**extra: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {
+    """A minimal graph-state payload, with *extra* merged in."""
+    return {
         "task": "write hello.py",
         "attempts": 0,
         "max_attempts": 3,
         "todos": [{"id": "t1", "content": "write"}],
         "messages": [],
+        **extra,
     }
-    payload.update(extra)
-    return payload
 
 
 # -- modes and ids -----------------------------------------------------------
@@ -84,19 +82,19 @@ def test_new_trace_id_is_readable_and_unique() -> None:
 
 def test_runtime_state_generates_a_trace_id(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.delenv(TRACE_MODE_ENV, raising=False)
-    first = _runtime(tmp_path)
-    second = _runtime(tmp_path)
+    first = runtime_for(tmp_path / "ws")
+    second = runtime_for(tmp_path / "ws")
 
     assert first.trace_mode == "summary"
     assert first.trace_id.startswith("wq-")
     assert first.trace_id != second.trace_id
-    assert _runtime(tmp_path, trace_id="fixed-id").trace_id == "fixed-id"
-    assert _runtime(tmp_path, trace_mode="off").trace_mode == "off"
-    assert _runtime(tmp_path, trace_mode="junk").trace_mode == "summary"
+    assert runtime_for(tmp_path / "ws", trace_id="fixed-id").trace_id == "fixed-id"
+    assert runtime_for(tmp_path / "ws", trace_mode="off").trace_mode == "off"
+    assert runtime_for(tmp_path / "ws", trace_mode="junk").trace_mode == "summary"
 
 
 def test_recorder_paths_and_enabled(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path, trace_mode="full", trace_id="wq-test")
+    runtime = runtime_for(tmp_path / "ws", trace_mode="full", trace_id="wq-test")
     recorder = TraceRecorder(runtime, "write hello.py")
 
     assert recorder.workspace == runtime.workspace
@@ -106,24 +104,27 @@ def test_recorder_paths_and_enabled(tmp_path: Path) -> None:
     assert recorder.events_path == recorder.root / "events.jsonl"
     assert recorder.timeline_path == recorder.root / "timeline.md"
 
-    off = TraceRecorder(_runtime(tmp_path, trace_mode="off"), "t")
+    off = TraceRecorder(runtime_for(tmp_path / "ws", trace_mode="off"), "t")
     assert off.enabled is False and off.full is False
     assert off.start(_inputs()) is None
     assert off.end(status="passed", latest_node="final") is None
 
 
 def test_recorder_uses_the_runtime_default_id(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path)
-    recorder = TraceRecorder(runtime, "write hello.py")
+    runtime = runtime_for(tmp_path / "ws")
 
-    assert recorder.trace_id == runtime.trace_id
+    assert TraceRecorder(runtime, "write hello.py").trace_id == runtime.trace_id
 
 
 # -- start / counters --------------------------------------------------------
 def test_start_records_run_start(tmp_path: Path) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path, trace_mode="full", trace_id="wq-a"), "write hello.py")
+    recorder = TraceRecorder(
+        runtime_for(tmp_path / "ws", trace_mode="full", trace_id="wq-a"), "write hello.py"
+    )
 
-    event = recorder.start(_inputs(attempts=1), resumed=True, resume_event={"status": "running", "restored_files": 2})
+    event = recorder.start(
+        _inputs(attempts=1), resumed=True, resume_event={"status": "running", "restored_files": 2}
+    )
 
     assert event is not None
     assert event["type"] == "run_start"
@@ -136,7 +137,7 @@ def test_start_records_run_start(tmp_path: Path) -> None:
 
 
 def test_counters_follow_the_event_stream(tmp_path: Path) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path, trace_mode="full"), "task")
+    recorder = TraceRecorder(runtime_for(tmp_path / "ws", trace_mode="full"), "task")
     recorder.start(_inputs())
 
     recorder.record_custom_event({"type": "tool_call", "name": "bash"})
@@ -150,7 +151,10 @@ def test_counters_follow_the_event_stream(tmp_path: Path) -> None:
         {
             "type": "tool_result",
             "name": "bash",
-            "result": {"ok": True, "result": "$ pip install x\nexit_code: 0\nrequires_approval: True (auto-approved)"},
+            "result": {
+                "ok": True,
+                "result": "$ pip install x\nexit_code: 0\nrequires_approval: True (auto-approved)",
+            },
         }
     )
     recorder.record_custom_event({"type": "handoff", "from": "planner", "to": "codeAgent"})
@@ -168,7 +172,7 @@ def test_counters_follow_the_event_stream(tmp_path: Path) -> None:
 
 
 def test_approval_count_from_a_structured_flag(tmp_path: Path) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path), "task")
+    recorder = TraceRecorder(runtime_for(tmp_path / "ws"), "task")
 
     recorder.record_custom_event(
         {"type": "tool_result", "name": "bash", "result": {"ok": True, "requires_approval": True}}
@@ -178,7 +182,7 @@ def test_approval_count_from_a_structured_flag(tmp_path: Path) -> None:
 
 
 def test_recording_ignored_when_off(tmp_path: Path) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path, trace_mode="off"), "task")
+    recorder = TraceRecorder(runtime_for(tmp_path / "ws", trace_mode="off"), "task")
 
     recorder.record_custom_event({"type": "tool_call", "name": "bash"})
     recorder.record_graph_update({"type": "node_end", "node": "planner"})
@@ -190,7 +194,7 @@ def test_recording_ignored_when_off(tmp_path: Path) -> None:
 # -- end: trace.json / timeline.md ------------------------------------------
 def test_end_writes_trace_json_and_timeline(tmp_path: Path) -> None:
     recorder = TraceRecorder(
-        _runtime(tmp_path, trace_mode="full", trace_id="wq-b"), "write hello.py"
+        runtime_for(tmp_path / "ws", trace_mode="full", trace_id="wq-b"), "write hello.py"
     )
     recorder.start(_inputs())
     recorder.record_custom_event({"type": "tool_call", "name": "file_write", "args": {"file_path": "hello.py"}})
@@ -204,20 +208,9 @@ def test_end_writes_trace_json_and_timeline(tmp_path: Path) -> None:
 
     assert payload is not None
     for key in (
-        "trace_id",
-        "task",
-        "status",
-        "started_at",
-        "ended_at",
-        "duration_ms",
-        "node_visits",
-        "tool_calls",
-        "failed_tool_calls",
-        "approval_count",
-        "checkpoint_count",
-        "handoff_count",
-        "timeline_head",
-        "timeline_tail",
+        "trace_id", "task", "status", "started_at", "ended_at", "duration_ms",
+        "node_visits", "tool_calls", "failed_tool_calls", "approval_count",
+        "checkpoint_count", "handoff_count", "timeline_head", "timeline_tail",
         "timeline_omitted",
     ):
         assert key in payload, key
@@ -244,7 +237,7 @@ def test_end_writes_trace_json_and_timeline(tmp_path: Path) -> None:
 
 
 def test_timeline_head_tail_and_omitted(tmp_path: Path) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path), "task")
+    recorder = TraceRecorder(runtime_for(tmp_path / "ws"), "task")
     recorder.start(_inputs())
     for index in range(200):
         recorder.record_custom_event({"type": "tool_call", "name": f"tool{index}"})
@@ -270,7 +263,7 @@ def test_timeline_head_tail_and_omitted(tmp_path: Path) -> None:
 
 
 def test_summary_mode_logs_no_events_file(tmp_path: Path) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path, trace_mode="summary"), "task")
+    recorder = TraceRecorder(runtime_for(tmp_path / "ws", trace_mode="summary"), "task")
     recorder.start(_inputs())
     recorder.record_custom_event({"type": "tool_call", "name": "bash"})
 
@@ -283,7 +276,7 @@ def test_summary_mode_logs_no_events_file(tmp_path: Path) -> None:
 
 
 def test_full_mode_logs_every_event(tmp_path: Path) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path, trace_mode="full"), "task")
+    recorder = TraceRecorder(runtime_for(tmp_path / "ws", trace_mode="full"), "task")
     recorder.start(_inputs())
     recorder.record_custom_event({"type": "tool_call", "name": "bash", "args": {"command": "ls"}})
     recorder.record_graph_update({"type": "node_end", "node": "planner", "update": {"a": 1}})
@@ -298,7 +291,7 @@ def test_full_mode_logs_every_event(tmp_path: Path) -> None:
 
 
 def test_end_without_start_still_works(tmp_path: Path) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path), "task")
+    recorder = TraceRecorder(runtime_for(tmp_path / "ws"), "task")
 
     payload = recorder.end(status="failed", latest_node="final")
 
@@ -308,7 +301,7 @@ def test_end_without_start_still_works(tmp_path: Path) -> None:
 
 
 def test_unwritable_trace_directory_degrades(tmp_path: Path, monkeypatch: Any) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path), "task")
+    recorder = TraceRecorder(runtime_for(tmp_path / "ws"), "task")
     monkeypatch.setattr(
         Path, "mkdir", lambda self, *args, **kwargs: (_ for _ in ()).throw(OSError("denied"))
     )
@@ -322,7 +315,7 @@ def test_unwritable_trace_directory_degrades(tmp_path: Path, monkeypatch: Any) -
 
 
 def test_timeline_summaries_are_readable(tmp_path: Path) -> None:
-    recorder = TraceRecorder(_runtime(tmp_path), "task")
+    recorder = TraceRecorder(runtime_for(tmp_path / "ws"), "task")
     recorder.record_custom_event({"type": "tool_call", "name": "bash", "args": {"command": "pytest -q"}})
     recorder.record_custom_event(
         {"type": "tool_result", "name": "bash", "result": {"ok": False, "error": "exit 1"}}
@@ -332,12 +325,9 @@ def test_timeline_summaries_are_readable(tmp_path: Path) -> None:
     recorder.record_custom_event(
         {
             "type": "context_compressed",
-            "messages_before": 13,
-            "tokens_before": 2394,
-            "messages_after": 1,
-            "tokens_after": 405,
-            "persisted": {"ok": True},
-            "history_path": "HISTORY_SUMMARY.md",
+            "messages_before": 13, "tokens_before": 2394,
+            "messages_after": 1, "tokens_after": 405,
+            "persisted": {"ok": True}, "history_path": "HISTORY_SUMMARY.md",
         }
     )
     recorder.record_custom_event({"type": "checkpoint_saved", "status": "running", "latest_node": "planner", "files": 2, "git_ok": False})
@@ -357,12 +347,7 @@ def test_timeline_summaries_are_readable(tmp_path: Path) -> None:
 
 # -- integration -------------------------------------------------------------
 def test_a_real_run_writes_a_trace(tmp_path: Path) -> None:
-    from helpers import ScriptedModel, passing_script
-
-    from wqagent.core.agent import stream_agent_events
-    from wqagent.graph.state import new_graph_state
-
-    runtime = _runtime(tmp_path, trace_id="wq-run")
+    runtime = runtime_for(tmp_path / "ws", trace_id="wq-run")
     state = new_graph_state("write hello.py", runtime)
 
     events = list(

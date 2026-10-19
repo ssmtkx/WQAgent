@@ -1,12 +1,14 @@
-"""Shared test doubles and scripted responses.
+"""Shared test doubles, scripted responses and fixtures.
 
 Since stage 3 the planner supervises two specialist agents through tools, so a
 full run needs a longer script than before (planner -> codeAgent -> planner ->
-verifier -> final). These builders keep the test files readable.
+verifier -> final). These builders keep the test files readable - import them
+instead of growing yet another local copy of ``ScriptedModel`` or ``tool_call``.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage
@@ -14,13 +16,19 @@ from langchain_core.messages import AIMessage
 __all__ = [
     "ScriptedModel",
     "answer",
+    "chat_script",
     "code_call",
+    "graph_state",
     "passing_script",
     "plan_call",
     "report_call",
+    "route_answer",
+    "runtime_for",
     "search_call",
     "todo_update_call",
     "tool_call",
+    "workflow_script",
+    "workspace_dir",
     "write_call",
 ]
 
@@ -135,3 +143,48 @@ def passing_script(
         report_call(True),
         answer(final_text or f"Done: {file_path} written and verified."),
     ]
+
+
+# -- entry router and whole-run scripts --------------------------------------
+def route_answer(
+    route: str = "workflow", *, reason: str = "scripted", confidence: float = 0.9
+) -> AIMessage:
+    """The entry router's answer (it runs before the workflow unless disabled)."""
+    return answer(f'{{"route":"{route}","reason":"{reason}","confidence":{confidence}}}')
+
+
+def chat_script(text: str = "hello", *, confidence: float = 0.95) -> list[Any]:
+    """Router says *chat*, then the direct reply - two responses, no tools."""
+    return [route_answer("chat", confidence=confidence), answer(text)]
+
+
+def workflow_script(*, router: bool = True, **passing: Any) -> list[Any]:
+    """Router (optional) plus the responses of a passing workflow run."""
+    return [*([route_answer()] if router else []), *passing_script(**passing)]
+
+
+# -- workspaces and state ----------------------------------------------------
+def workspace_dir(tmp_path: Path, *files: str, name: str = "ws") -> Path:
+    """A workspace under *tmp_path* containing the named files (parents are made)."""
+    root = tmp_path / name
+    root.mkdir(parents=True, exist_ok=True)
+    for item in files:
+        path = root / item
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {item}\n", encoding="utf-8")
+    return root
+
+
+def runtime_for(root: Path | str, **options: Any) -> Any:
+    """A :class:`RuntimeState` bound to *root* (``timeout_seconds=20`` by default)."""
+    from wqagent.core.state import RuntimeState
+
+    options.setdefault("timeout_seconds", 20)
+    return RuntimeState(workspace=Path(root), **options)
+
+
+def graph_state(task: str = "write hello.py", *, root: Path | str, **extra: Any) -> dict[str, Any]:
+    """A fresh graph state for *task* in *root* (``new_graph_state`` + a runtime)."""
+    from wqagent.graph.state import new_graph_state
+
+    return new_graph_state(task, runtime_for(root), **extra)

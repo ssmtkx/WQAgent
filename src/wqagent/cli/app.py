@@ -1167,7 +1167,7 @@ def run_task(
             help=(
                 "Open the interactive Textual UI (plan panel, event stream, approvals "
                 'in a modal) instead of the plain CLI; no TASK is needed - type your '
-                'turns inside the UI. Needs: pip install "wqagent[tui]".'
+                'turns inside the UI. Needs: pip install "wqagent\\[tui]".'
             ),
         ),
     ] = False,

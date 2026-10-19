@@ -1,9 +1,4 @@
-"""Tests for the Textual TUI (``cli/tui``): the approval gate, modal and app wiring.
-
-The TUI is exercised headlessly through Textual's own pilot, with a *scripted* runner so
-no model is ever called. Textual is an optional dependency: everything here is skipped
-when it is not installed.
-"""
+"""Tests for the Textual TUI (``cli/tui``): the approval gate, modal and app wiring."""
 
 from __future__ import annotations
 
@@ -11,6 +6,7 @@ import asyncio
 import concurrent.futures
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +47,48 @@ def _text(widget: Any) -> str:
 
 def _stream(app: WQAgentTuiApp) -> str:
     return "\n".join(_text(widget) for widget in app.query("#stream Static"))
+
+
+def _run(
+    scenario: Callable[[WQAgentTuiApp, Any], Awaitable[None]],
+    *,
+    runner: Any = None,
+    **options: Any,
+) -> None:
+    """The boilerplate every TUI test shares: one app, one headless pilot, one event loop."""
+
+    async def main() -> None:
+        app = WQAgentTuiApp(runner=runner, **options)
+        async with app.run_test() as pilot:
+            await scenario(app, pilot)
+
+    asyncio.run(main())
+
+
+async def _settle(app: WQAgentTuiApp, pilot: Any, limit: int = 60) -> None:
+    """Pause until the worker thread has finished the turn."""
+    for _ in range(limit):
+        await pilot.pause()
+        if not app._busy:
+            return
+
+
+async def _answer_approval(app: WQAgentTuiApp, pilot: Any, key: str) -> Any:
+    """Ask for approval on a worker thread, answer the modal with *key*, return the decision."""
+    handler = TuiApprovalHandler(app, timeout=10)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(handler, _request())
+        for _ in range(60):  # wait for the modal to appear
+            await pilot.pause()
+            if isinstance(app.screen, ApprovalModal):
+                break
+        assert isinstance(app.screen, ApprovalModal)
+        assert not future.done(), "the tool thread must be blocked while asking"
+
+        await pilot.press(key)
+        decision = future.result(timeout=10)
+        await pilot.pause()
+    return decision
 
 
 # -- the gate ----------------------------------------------------------------
@@ -125,152 +163,103 @@ def test_handler_without_an_app_denies() -> None:
 
 # -- the modal ---------------------------------------------------------------
 def test_modal_shows_the_request_and_approves_with_y() -> None:
-    async def scenario() -> None:
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
         gate = ApprovalGate(_request(), timeout=5)
-        app = WQAgentTuiApp(workspace=".", runner=_scripted([]))
-        async with app.run_test() as pilot:
-            results: list[Any] = []
-            app.push_screen(ApprovalModal(gate, workspace="D:/demo"), results.append)
-            await pilot.pause()
-            assert "pip install fastapi" in _text(app.screen.query_one("#approval-command"))
-            rows = [_text(widget) for widget in app.screen.query(".approval-row")]
-            assert any("BashTool" in row for row in rows)  # the tool name
-            assert any("Python package installation" in row for row in rows)  # the risk
-            assert any("D:/demo" in row for row in rows)  # the workspace
+        results: list[Any] = []
+        app.push_screen(ApprovalModal(gate, workspace="D:/demo"), results.append)
+        await pilot.pause()
+        assert "pip install fastapi" in _text(app.screen.query_one("#approval-command"))
+        rows = [_text(widget) for widget in app.screen.query(".approval-row")]
+        assert any("BashTool" in row for row in rows)  # the tool name
+        assert any("Python package installation" in row for row in rows)  # the risk
+        assert any("D:/demo" in row for row in rows)  # the workspace
 
-            await pilot.press("y")
-            await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
 
-            assert results == [True]
+        assert results == [True]
 
-    asyncio.run(scenario())
+    _run(scenario, workspace=".", runner=_scripted([]))
 
 
-def test_modal_denies_with_n_and_escape_and_enter_approves() -> None:
-    async def scenario() -> None:
-        for key, expected in (("n", False), ("escape", False), ("enter", True)):
-            gate = ApprovalGate(_request(), timeout=5)
-            app = WQAgentTuiApp(workspace=".", runner=_scripted([]))
-            async with app.run_test() as pilot:
-                results: list[Any] = []
-                app.push_screen(ApprovalModal(gate), results.append)
-                await pilot.pause()
-                await pilot.press(key)
-                await pilot.pause()
-                assert results == [expected], key
+@pytest.mark.parametrize(
+    ("interaction", "target", "expected"),
+    [
+        ("press", "y", True),
+        ("press", "n", False),
+        ("press", "escape", False),
+        ("press", "enter", True),
+        ("click", "#approval-approve", True),
+        ("click", "#approval-deny", False),
+    ],
+)
+def test_modal_answers_by_key_and_by_button(interaction: str, target: str, expected: bool) -> None:
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        gate = ApprovalGate(_request(), timeout=5)
+        results: list[Any] = []
+        app.push_screen(ApprovalModal(gate), results.append)
+        await pilot.pause()
 
-    asyncio.run(scenario())
+        await (pilot.press(target) if interaction == "press" else pilot.click(target))
+        await pilot.pause()
 
+        assert results == [expected], target
 
-def test_modal_buttons_work() -> None:
-    async def scenario() -> None:
-        for selector, expected in (("#approval-approve", True), ("#approval-deny", False)):
-            gate = ApprovalGate(_request(), timeout=5)
-            app = WQAgentTuiApp(workspace=".", runner=_scripted([]))
-            async with app.run_test() as pilot:
-                results: list[Any] = []
-                app.push_screen(ApprovalModal(gate), results.append)
-                await pilot.pause()
-                await pilot.click(selector)
-                await pilot.pause()
-                assert results == [expected], selector
-
-    asyncio.run(scenario())
+    _run(scenario, workspace=".", runner=_scripted([]))
 
 
 # -- the app -----------------------------------------------------------------
 def test_app_renders_the_layout(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        app = WQAgentTuiApp(workspace=tmp_path / "ws", runner=_scripted([]))
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            assert app.query_one("#status", Static)
-            assert app.query_one("#plan", Static)
-            assert app.query_one("#stream")
-            assert app.query_one("#prompt", Input)
-            assert "new" in _text(app.query_one("#status", Static))  # no session yet
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        await pilot.pause()
+        assert app.query_one("#status", Static)
+        assert app.query_one("#plan", Static)
+        assert app.query_one("#stream")
+        assert app.query_one("#prompt", Input)
+        assert "new" in _text(app.query_one("#status", Static))  # no session yet
 
-    asyncio.run(scenario())
+    _run(scenario, workspace=tmp_path / "ws", runner=_scripted([]))
 
 
 def test_app_turn_updates_stream_plan_and_status(tmp_path: Path) -> None:
     events = [
-        {
-            "type": "intent",
-            "intent_route": "workflow",
-            "intent_confidence": 0.9,
-            "intent_reason": "needs files",
-        },
-        {
-            "type": "tool_call",
-            "node": "codeAgent",
-            "name": "file_write",
-            "args": {"file_path": "app.py"},
-        },
-        {
-            "type": "tool_result",
-            "node": "codeAgent",
-            "name": "file_write",
-            "result": {"ok": True, "result": "Created app.py"},
-        },
+        {"type": "intent", "intent_route": "workflow", "intent_confidence": 0.9,
+         "intent_reason": "needs files"},
+        {"type": "tool_call", "node": "codeAgent", "name": "file_write",
+         "args": {"file_path": "app.py"}},
+        {"type": "tool_result", "node": "codeAgent", "name": "file_write",
+         "result": {"ok": True, "result": "Created app.py"}},
         {"type": "handoff", "from": "planner", "to": "codeAgent", "instruction": "write app.py"},
-        {
-            "type": "checkpoint_saved",
-            "status": "running",
-            "latest_node": "planner",
-            "files": 2,
-            "git_commit": "abcdef1234",
-        },
-        {
-            "type": "todo_update",
-            "node": "planner",
-            "todos": [
-                {"id": "t1", "status": "completed"},
-                {"id": "t2", "status": "in_progress"},
-            ],
-        },
-        {
-            "type": "final_answer",
-            "content": "Done: app.py created.",
-            "passed": True,
-            "route": "workflow",
-        },
-        {
-            "type": "session_saved",
-            "session_id": "8f3c1d2e4b5a",
-            "turn": 1,
-            "reply_turn": 2,
-            "turn_index": 2,
-            "route": "workflow",
-            "saved": True,
-        },
+        {"type": "checkpoint_saved", "status": "running", "latest_node": "planner", "files": 2,
+         "git_commit": "abcdef1234"},
+        {"type": "todo_update", "node": "planner",
+         "todos": [{"id": "t1", "status": "completed"}, {"id": "t2", "status": "in_progress"}]},
+        {"type": "final_answer", "content": "Done: app.py created.", "passed": True,
+         "route": "workflow"},
+        {"type": "session_saved", "session_id": "8f3c1d2e4b5a", "turn": 1, "reply_turn": 2,
+         "turn_index": 2, "route": "workflow", "saved": True},
     ]
 
-    async def scenario() -> None:
-        app = WQAgentTuiApp(workspace=tmp_path / "ws", runner=_scripted(events))
-        async with app.run_test() as pilot:
-            app.query_one("#prompt", Input).value = "build the app"
-            await pilot.press("enter")
-            for _ in range(60):
-                await pilot.pause()
-                if not app._busy:
-                    break
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        app.query_one("#prompt", Input).value = "build the app"
+        await pilot.press("enter")
+        await _settle(app, pilot)
 
-            stream = _stream(app)
-            assert "build the app" in stream  # the user's turn
-            assert "file_write" in stream and "app.py" in stream  # the tool call
-            assert "Created app.py" in stream  # the tool result
-            assert "handoff: planner" in stream and "codeAgent" in stream
-            assert "checkpoint running/planner" in stream
-            assert "Done: app.py created." in stream  # the final answer
+        stream = _stream(app)
+        assert "build the app" in stream  # the user's turn
+        assert "file_write" in stream and "app.py" in stream  # the tool call
+        assert "Created app.py" in stream  # the tool result
+        assert "handoff · planner" in stream and "codeAgent" in stream
+        assert "checkpoint · running/planner" in stream
+        assert "Done: app.py created." in stream  # the final answer
 
-            plan = _text(app.query_one("#plan", Static))
-            assert "t1" in plan and "t2" in plan
-            assert app.turn == 2 and app.session_id == "8f3c1d2e4b5a"
-            status = _text(app.query_one("#status", Static))
-            assert "8f3c1d2e" in status and "turn 2" in status
+        plan = _text(app.query_one("#plan", Static))
+        assert "t1" in plan and "t2" in plan
+        assert app.turn == 2 and app.session_id == "8f3c1d2e4b5a"
+        status = _text(app.query_one("#status", Static))
+        assert "8f3c1d2e" in status and "turn 2" in status
 
-    asyncio.run(scenario())
+    _run(scenario, workspace=tmp_path / "ws", runner=_scripted(events))
 
 
 def test_app_reports_a_failing_turn(tmp_path: Path) -> None:
@@ -278,19 +267,14 @@ def test_app_reports_a_failing_turn(tmp_path: Path) -> None:
         raise RuntimeError("provider exploded")
         yield {}  # pragma: no cover - makes this a generator
 
-    async def scenario() -> None:
-        app = WQAgentTuiApp(workspace=tmp_path / "ws", runner=runner)
-        async with app.run_test() as pilot:
-            app.query_one("#prompt", Input).value = "do it"
-            await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause()
-                if not app._busy:
-                    break
-            stream = _stream(app)
-            assert "turn failed" in stream and "provider exploded" in stream
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        app.query_one("#prompt", Input).value = "do it"
+        await pilot.press("enter")
+        await _settle(app, pilot, limit=30)
+        stream = _stream(app)
+        assert "turn failed" in stream and "provider exploded" in stream
 
-    asyncio.run(scenario())
+    _run(scenario, workspace=tmp_path / "ws", runner=runner)
 
 
 def test_app_ignores_a_second_turn_while_busy(tmp_path: Path) -> None:
@@ -300,94 +284,56 @@ def test_app_ignores_a_second_turn_while_busy(tmp_path: Path) -> None:
         yield {"type": "intent", "intent_route": "workflow"}
         release.wait(timeout=10)
 
-    async def scenario() -> None:
-        app = WQAgentTuiApp(workspace=tmp_path / "ws", runner=runner)
-        async with app.run_test() as pilot:
-            prompt = app.query_one("#prompt", Input)
-            prompt.value = "first"
-            await pilot.press("enter")
-            await pilot.pause()
-            prompt.value = "second"
-            await pilot.press("enter")
-            await pilot.pause()
-            assert "still working" in _stream(app)
-            release.set()
-            for _ in range(30):
-                await pilot.pause()
-                if not app._busy:
-                    break
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = "first"
+        await pilot.press("enter")
+        await pilot.pause()
+        prompt.value = "second"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "still working" in _stream(app)
+        release.set()
+        await _settle(app, pilot, limit=30)
 
-    asyncio.run(scenario())
+    _run(scenario, workspace=tmp_path / "ws", runner=runner)
 
 
 def test_app_approval_flow_approves(tmp_path: Path) -> None:
     """The tool thread waits on the gate; pressing Y in the modal releases it."""
 
-    async def scenario() -> None:
-        app = WQAgentTuiApp(workspace=tmp_path / "ws", runner=_scripted([]))
-        async with app.run_test() as pilot:
-            handler = TuiApprovalHandler(app, timeout=10)
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                future = pool.submit(handler, _request("pip install fastapi"))
-                for _ in range(60):  # wait for the modal to appear
-                    await pilot.pause()
-                    if isinstance(app.screen, ApprovalModal):
-                        break
-                assert isinstance(app.screen, ApprovalModal)
-                assert not future.done(), "the tool thread must be blocked while asking"
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        decision = await _answer_approval(app, pilot, "y")
 
-                await pilot.press("y")
-                decision = future.result(timeout=10)
-                await pilot.pause()
-            finally:
-                pool.shutdown(wait=False)
+        assert decision.approved is True
+        stream = _stream(app)
+        assert "approval required" in stream and "pip install fastapi" in stream
+        assert "approved" in stream
 
-            assert decision.approved is True
-            stream = _stream(app)
-            assert "approval required" in stream and "pip install fastapi" in stream
-            assert "approved" in stream
-
-    asyncio.run(scenario())
+    _run(scenario, workspace=tmp_path / "ws", runner=_scripted([]))
 
 
 def test_app_approval_flow_denies_with_escape(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        app = WQAgentTuiApp(workspace=tmp_path / "ws", runner=_scripted([]))
-        async with app.run_test() as pilot:
-            handler = TuiApprovalHandler(app, timeout=10)
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                future = pool.submit(handler, _request())
-                for _ in range(60):
-                    await pilot.pause()
-                    if isinstance(app.screen, ApprovalModal):
-                        break
-                await pilot.press("escape")
-                decision = future.result(timeout=10)
-                await pilot.pause()
-            finally:
-                pool.shutdown(wait=False)
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        decision = await _answer_approval(app, pilot, "escape")
 
-            assert decision.approved is False
-            assert "denied" in decision.reason
-            assert "denied" in _stream(app)
+        assert decision.approved is False
+        assert "denied" in decision.reason
+        assert "denied" in _stream(app)
 
-    asyncio.run(scenario())
+    _run(scenario, workspace=tmp_path / "ws", runner=_scripted([]))
 
 
 def test_app_clear_stream(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        app = WQAgentTuiApp(workspace=tmp_path / "ws", runner=_scripted([]))
-        async with app.run_test() as pilot:
-            app._append("hello", "event-meta")
-            await pilot.pause()
-            assert app.query("#stream Static")
-            app.action_clear_stream()
-            await pilot.pause()
-            assert len(app.query("#stream Static")) == 0
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        app._append("hello", "event-meta")
+        await pilot.pause()
+        assert app.query("#stream Static")
+        app.action_clear_stream()
+        await pilot.pause()
+        assert len(app.query("#stream Static")) == 0
 
-    asyncio.run(scenario())
+    _run(scenario, workspace=tmp_path / "ws", runner=_scripted([]))
 
 
 # -- the default runner ------------------------------------------------------
@@ -399,33 +345,24 @@ def test_default_runner_uses_stream_session_events(tmp_path: Path, monkeypatch: 
         captured["task"] = task
         captured.update(kwargs)
         yield {"type": "final_answer", "content": "ok", "passed": True, "route": "chat"}
-        yield {
-            "type": "session_saved",
-            "session_id": "abc",
-            "turn": 1,
-            "reply_turn": 2,
-            "saved": True,
-        }
+        yield {"type": "session_saved", "session_id": "abc", "turn": 1, "reply_turn": 2,
+               "saved": True}
 
     monkeypatch.setattr("wqagent.core.agent.stream_session_events", fake_stream)
 
-    async def scenario() -> None:
-        app = WQAgentTuiApp(
-            workspace=tmp_path / "ws",
-            model="fake-model",
-            approval_mode="auto",
-            trace_mode="off",
-            entry_router=False,
-        )
-        async with app.run_test() as pilot:
-            app.query_one("#prompt", Input).value = "你好"
-            await pilot.press("enter")
-            for _ in range(40):
-                await pilot.pause()
-                if not app._busy:
-                    break
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        app.query_one("#prompt", Input).value = "你好"
+        await pilot.press("enter")
+        await _settle(app, pilot, limit=40)
 
-    asyncio.run(scenario())
+    _run(
+        scenario,
+        workspace=tmp_path / "ws",
+        model="fake-model",
+        approval_mode="auto",
+        trace_mode="off",
+        entry_router=False,
+    )
 
     assert captured["task"] == "你好"
     assert captured["session_workspace"] == str(tmp_path / "ws")

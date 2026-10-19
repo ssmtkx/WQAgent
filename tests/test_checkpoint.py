@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 
+from helpers import answer, runtime_for, tool_call
 from wqagent.core.checkpoint import (
     CHECKPOINT_DIR,
     CHECKPOINT_MODE_ENV,
@@ -24,26 +25,30 @@ from wqagent.core.checkpoint import (
     resume_command,
     state_to_payload,
 )
-from wqagent.core.state import RuntimeState
 from wqagent.graph.state import make_todo, new_graph_state
 
 
-def _runtime(tmp_path: Path, **kwargs: Any) -> RuntimeState:
-    return RuntimeState(workspace=tmp_path / "ws", **kwargs)
-
-
 def _state(tmp_path: Path, task: str = "write hello.py", **extra: Any) -> dict[str, Any]:
-    runtime = RuntimeState(workspace=tmp_path / "ws", checkpoint_mode=extra.pop("mode", "light"))
+    """A graph state in ``tmp_path/ws`` carrying a four-message transcript."""
+    runtime = runtime_for(tmp_path / "ws", checkpoint_mode=extra.pop("mode", "light"))
     state = new_graph_state(
         task, runtime, todos=[make_todo("t1", "write hello.py", status="completed")], **extra
     )
     state["messages"] = [
         HumanMessage(content="write hello.py"),
-        AIMessage(content="", tool_calls=[{"name": "file_write", "args": {"file_path": "hello.py"}, "id": "c1", "type": "tool_call"}]),
+        tool_call("file_write", {"file_path": "hello.py"}, "c1"),
         ToolMessage(content="Created hello.py", tool_call_id="c1", name="file_write"),
-        AIMessage(content="done"),
+        answer("done"),
     ]
     return state
+
+
+def _save_or_skip(manager: CheckpointManager, state: dict[str, Any], **options: Any) -> dict[str, Any]:
+    """Save *state*, skipping when git gave no snapshot for the restore tests."""
+    saved = manager.save(state, **options)
+    if not saved["git_ok"]:
+        pytest.skip("git unavailable")  # pragma: no cover
+    return saved
 
 
 # -- modes -------------------------------------------------------------------
@@ -81,16 +86,16 @@ def test_checkpoint_mode_from_env(monkeypatch: Any) -> None:
 
 def test_runtime_state_picks_up_the_mode(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.delenv(CHECKPOINT_MODE_ENV, raising=False)
-    assert _runtime(tmp_path).checkpoint_mode == "light"
+    assert runtime_for(tmp_path / "ws").checkpoint_mode == "light"
 
     monkeypatch.setenv(CHECKPOINT_MODE_ENV, "strict")
-    assert _runtime(tmp_path).checkpoint_mode == "strict"
-    assert _runtime(tmp_path, checkpoint_mode="off").checkpoint_mode == "off"
-    assert _runtime(tmp_path, checkpoint_mode="junk").checkpoint_mode == "light"
+    assert runtime_for(tmp_path / "ws").checkpoint_mode == "strict"
+    assert runtime_for(tmp_path / "ws", checkpoint_mode="off").checkpoint_mode == "off"
+    assert runtime_for(tmp_path / "ws", checkpoint_mode="junk").checkpoint_mode == "light"
 
 
 def test_manager_paths_and_enabled(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path, checkpoint_mode="light")
+    runtime = runtime_for(tmp_path / "ws", checkpoint_mode="light")
     manager = CheckpointManager(runtime, "write hello.py")
 
     assert manager.workspace == runtime.workspace
@@ -102,7 +107,7 @@ def test_manager_paths_and_enabled(tmp_path: Path) -> None:
     assert manager.state_path == manager.root / "state.json"
     assert manager.events_path == manager.root / "events.jsonl"
 
-    off = CheckpointManager(_runtime(tmp_path, checkpoint_mode="off"))
+    off = CheckpointManager(runtime_for(tmp_path / "ws", checkpoint_mode="off"))
     assert off.enabled is False
 
 
@@ -241,9 +246,7 @@ def test_git_failure_degrades_to_a_checkpoint_without_snapshot(
 ) -> None:
     state = _state(tmp_path)
     manager = CheckpointManager(state["runtime"], "write hello.py")
-    monkeypatch.setattr(
-        manager, "_ensure_git", lambda: (False, "git is not installed")
-    )
+    monkeypatch.setattr(manager, "_ensure_git", lambda: (False, "git is not installed"))
 
     event = manager.save(state, status="running", latest_node="planner")
 
@@ -267,43 +270,23 @@ def test_build_recovery_markdown_from_a_sparse_payload() -> None:
 
 def test_build_recovery_markdown_includes_everything(tmp_path: Path) -> None:
     payload = {
-        "task": "ship it",
-        "status": "failed",
-        "latest_node": "verifier",
-        "saved_at": "2026-01-01T00:00:00+00:00",
-        "mode": "strict",
-        "workspace": str(tmp_path),
-        "attempts": 2,
-        "max_attempts": 3,
-        "resume_command": resume_command(tmp_path),
+        "task": "ship it", "status": "failed", "latest_node": "verifier", "mode": "strict",
+        "saved_at": "2026-01-01T00:00:00+00:00", "workspace": str(tmp_path),
+        "attempts": 2, "max_attempts": 3, "resume_command": resume_command(tmp_path),
         "plan_summary": "write then verify",
         "todos": [{"id": "t1", "content": "write", "status": "in_progress"}],
-        "last_error": "exit code 1",
-        "context_summary": "compressed",
+        "last_error": "exit code 1", "context_summary": "compressed",
         "workspace_manifest": {"count": 1, "truncated": False, "files": [{"path": "a.py", "size": 3}]},
         "git": {"ok": True, "commit": "abc123", "files": 1},
-        "state_file": "state.json",
-        "events_file": "events.jsonl",
+        "state_file": "state.json", "events_file": "events.jsonl",
     }
-
     text = build_recovery_markdown(payload)
 
     for expected in (
-        "**Task:** ship it",
-        "**Status:** failed (latest node: verifier)",
-        "**Attempts:** 2/3",
-        "## Plan",
-        "write then verify",
-        "- [~] t1: write",
-        "## Last error",
-        "exit code 1",
-        "## Compressed context",
-        "## Workspace files",
-        "- a.py (3 bytes)",
-        "- git commit: `abc123`",
-        "state.json",
-        "events.jsonl",
-        resume_command(tmp_path),
+        "**Task:** ship it", "**Status:** failed (latest node: verifier)", "**Attempts:** 2/3",
+        "## Plan", "write then verify", "- [~] t1: write", "## Last error", "exit code 1",
+        "## Compressed context", "## Workspace files", "- a.py (3 bytes)",
+        "- git commit: `abc123`", "state.json", "events.jsonl", resume_command(tmp_path),
     ):
         assert expected in text, expected
 
@@ -312,12 +295,9 @@ def test_build_recovery_markdown_includes_everything(tmp_path: Path) -> None:
 def test_message_round_trip_keeps_tool_calls() -> None:
     messages = [
         HumanMessage(content="do it"),
-        AIMessage(
-            content="",
-            tool_calls=[{"name": "bash", "args": {"command": "ls"}, "id": "c1", "type": "tool_call"}],
-        ),
+        tool_call("bash", {"command": "ls"}, "c1"),
         ToolMessage(content="ok", tool_call_id="c1", name="bash"),
-        AIMessage(content="done"),
+        answer("done"),
     ]
 
     rebuilt = [message_from_dict(message_to_dict(message)) for message in messages]
@@ -352,22 +332,21 @@ def test_state_to_payload_survives_odd_values(tmp_path: Path) -> None:
 
 
 # -- loading / resume --------------------------------------------------------
-def test_load_resume_inputs_without_a_checkpoint(tmp_path: Path) -> None:
-    inputs, event = CheckpointManager.load_resume_inputs(_runtime(tmp_path))
+@pytest.mark.parametrize(
+    "options, warning",
+    [
+        ({}, "no checkpoint.json"),
+        ({"checkpoint_mode": "off"}, "checkpointing is off"),
+    ],
+)
+def test_load_resume_inputs_without_a_usable_checkpoint(
+    tmp_path: Path, options: dict[str, Any], warning: str
+) -> None:
+    inputs, event = CheckpointManager.load_resume_inputs(runtime_for(tmp_path / "ws", **options))
 
     assert inputs is None
-    assert event["type"] == "resume"
-    assert event["ok"] is False
-    assert any("no checkpoint.json" in warning for warning in event["warnings"])
-
-
-def test_load_resume_inputs_when_checkpointing_is_off(tmp_path: Path) -> None:
-    inputs, event = CheckpointManager.load_resume_inputs(
-        _runtime(tmp_path, checkpoint_mode="off")
-    )
-
-    assert inputs is None
-    assert any("checkpointing is off" in warning for warning in event["warnings"])
+    assert event["type"] == "resume" and event["ok"] is False
+    assert any(warning in item for item in event["warnings"])
 
 
 def test_resume_restores_the_workspace_and_the_state(tmp_path: Path) -> None:
@@ -377,13 +356,12 @@ def test_resume_restores_the_workspace_and_the_state(tmp_path: Path) -> None:
     manager = CheckpointManager(state["runtime"], "write hello.py")
     state["attempts"] = 1
     state["last_error"] = "exit code 1"
-    if not manager.save(state, status="failed", latest_node="verifier")["git_ok"]:
-        pytest.skip("git unavailable")  # pragma: no cover
+    _save_or_skip(manager, state, status="failed", latest_node="verifier")
     # the workspace changes after the checkpoint
     (workspace / "hello.py").write_text("broken\n", encoding="utf-8")
     (workspace / "extra.txt").write_text("added later\n", encoding="utf-8")
 
-    runtime = _runtime(tmp_path)  # a fresh runtime, as a new process would build
+    runtime = runtime_for(tmp_path / "ws")  # a fresh runtime, as a new process would build
     inputs, event = CheckpointManager.load_resume_inputs(runtime, max_attempts=2)
 
     assert event["ok"] is True
@@ -410,11 +388,11 @@ def test_resume_restores_the_workspace_and_the_state(tmp_path: Path) -> None:
 def test_strict_resume_restores_the_transcript(tmp_path: Path) -> None:
     state = _state(tmp_path, mode="strict")
     manager = CheckpointManager(state["runtime"], "write hello.py")
-    saved = manager.save(state, status="running", latest_node="planner")
-    if not saved["git_ok"]:
-        pytest.skip("git unavailable")  # pragma: no cover
+    _save_or_skip(manager, state, status="running", latest_node="planner")
 
-    inputs, event = CheckpointManager.load_resume_inputs(_runtime(tmp_path, checkpoint_mode="strict"))
+    inputs, event = CheckpointManager.load_resume_inputs(
+        runtime_for(tmp_path / "ws", checkpoint_mode="strict")
+    )
 
     assert inputs is not None
     assert event["message_count"] == 4
@@ -426,11 +404,9 @@ def test_strict_resume_restores_the_transcript(tmp_path: Path) -> None:
 
 def test_resume_warns_when_the_task_differs(tmp_path: Path) -> None:
     state = _state(tmp_path, task="the original task")
-    saved = CheckpointManager(state["runtime"], "the original task").save(state)
-    if not saved["git_ok"]:
-        pytest.skip("git unavailable")  # pragma: no cover
+    _save_or_skip(CheckpointManager(state["runtime"], "the original task"), state)
 
-    inputs, event = CheckpointManager.load_resume_inputs(_runtime(tmp_path), task="a different task")
+    inputs, event = CheckpointManager.load_resume_inputs(runtime_for(tmp_path / "ws"), task="a different task")
 
     assert inputs is not None and inputs["task"] == "the original task"
     assert any("different task" in warning for warning in event["warnings"])
@@ -439,13 +415,10 @@ def test_resume_warns_when_the_task_differs(tmp_path: Path) -> None:
 def test_resume_does_not_leak_metadata_into_the_new_checkpoints(tmp_path: Path) -> None:
     """Regression: a resumed run must not inherit the old status / latest_node."""
     state = _state(tmp_path)
-    saved = CheckpointManager(state["runtime"], "write hello.py").save(
-        state, status="running", latest_node="verifier"
-    )
-    if not saved["git_ok"]:
-        pytest.skip("git unavailable")  # pragma: no cover
+    manager = CheckpointManager(state["runtime"], "write hello.py")
+    _save_or_skip(manager, state, status="running", latest_node="verifier")
 
-    inputs, _ = CheckpointManager.load_resume_inputs(_runtime(tmp_path))
+    inputs, _ = CheckpointManager.load_resume_inputs(runtime_for(tmp_path / "ws"))
 
     assert inputs is not None
     for leaked in ("status", "latest_node", "mode", "saved_at", "workspace_manifest", "git"):
@@ -462,7 +435,7 @@ def test_resume_does_not_leak_metadata_into_the_new_checkpoints(tmp_path: Path) 
 
 
 def test_load_resume_inputs_survives_a_corrupt_checkpoint(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path)
+    runtime = runtime_for(tmp_path / "ws")
     manager = CheckpointManager(runtime)
     manager.root.mkdir(parents=True)
     manager.checkpoint_path.write_text("{not json", encoding="utf-8")
