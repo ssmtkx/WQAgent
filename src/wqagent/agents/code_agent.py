@@ -277,6 +277,7 @@ def run_code_agent(
                     "type": "tool_result",
                     "name": str(payload.get("name") or ""),
                     "result": data,
+                    "diff": payload.get("diff"),
                     "loop": loop,
                 }
             )

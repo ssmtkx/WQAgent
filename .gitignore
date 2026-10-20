@@ -51,3 +51,6 @@ coding-agent-learning-plan.md
 
 # local helper, machine-specific (not for sharing)
 run_wq.sh
+
+# test
+pytest-of-*/

@@ -49,9 +49,11 @@ from wqagent.core.agent import (
     last_ai_text,
     message_text,
     react_loop,
+    stream_writer,
     write_event,
 )
 from wqagent.core.state import RuntimeState
+from wqagent.core.streaming import streaming_invoke
 from wqagent.graph.memory import (
     COMPRESSION_FIELD_CHARS,
     COMPRESSION_ITEMS,
@@ -476,6 +478,16 @@ def _note(
         except Exception:  # pragma: no cover - a broken callback
             pass
     write_event(writer, event)
+
+
+def _emit_token(sink: Callable[[Any], None], text: str) -> None:
+    """Stream one delta to the UI as a transient event (never persisted)."""
+    if not text:
+        return
+    try:
+        sink({"type": "token", "node": "chat_responder", "text": text, "transient": True})
+    except Exception:  # pragma: no cover - a broken stream must not kill the reply
+        pass
 
 
 def _merge_notes(existing: str, summary: str, sources: Sequence[Mapping[str, Any]]) -> str:
@@ -2046,13 +2058,18 @@ def chat_responder_node(
     """
     try:
         chat = model if model is not None else get_model()
-        response = chat.invoke(
-            _entry_messages(
-                CHAT_RESPONDER_PROMPT,
-                "Reply to the user input above. No tool calls, no invented workspace facts.",
-                state,
-            )
+        messages = _entry_messages(
+            CHAT_RESPONDER_PROMPT,
+            "Reply to the user input above. No tool calls, no invented workspace facts.",
+            state,
         )
+        sink = stream_writer()  # deltas go to the UI, never to the event files
+        if sink is None:
+            response = chat.invoke(messages)
+        else:
+            response = streaming_invoke(
+                chat, messages, lambda delta: _emit_token(sink, delta)
+            )
         text = message_text(response).strip()
     except Exception as exc:  # noqa: BLE001 - always answer something
         text = f"(chat unavailable: {type(exc).__name__}: {exc})"

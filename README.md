@@ -25,9 +25,9 @@ wq "创建 hello.py，打印 Hello, World，然后运行它" --workspace .\demo
 
 ### 1. 安装
 
-项目用 `uv` 管理依赖（推荐），也支持纯 `pip + venv`。两种方式二选一，结果等价。
+项目用 `uv` 管理依赖（推荐），也支持纯 `pip + venv`。
 
-**方式 A：uv（推荐，装包更快、版本锁定在 `uv.lock`）**
+**方式 A：uv**
 
 ```powershell
 git clone <repo> ; cd WQAgent
@@ -35,7 +35,7 @@ uv sync --extra tui          # 自动建 .venv 并装齐依赖（含 TUI 的 tex
 uv run wq --version
 ```
 
-**方式 B：pip + venv（不想装 uv 也能跑）**
+**方式 B：pip + venv**
 
 ```powershell
 git clone <repo> ; cd WQAgent
@@ -260,14 +260,28 @@ src/wqagent/
 └── cli/
     ├── app.py             # wq 命令
     └── tui/
-        ├── app.py         # Textual 界面（Plan 面板 / 事件流 / 状态栏）
-        ├── approval.py    # 审批弹窗 + 工具线程 ↔ UI 线程的 gate
+        ├── app.py         # Textual 界面（双栏布局 / 事件流 / 键位条）
+        ├── approval.py    # 审批（内联提示条 + 工具线程 ↔ UI 线程的 gate）
+        ├── diff_view.py   # 文件改动块
+        ├── stream_view.py # 流式回复的实时行
         └── logo.py        # 启动 Logo（rich 渐变 + 揭幕动画）
 ```
 
 ---
 
 ## 使用
+
+### 怎么启动 `wq`
+
+
+| 安装方式 | 启动命令 | 说明 |
+| --- | --- | --- |
+| **uv**（方式 A） | `uv run wq "任务" -w .\demo` | 每条命令前加 `uv run`，uv 自动切到 venv |
+| **pip + venv** | `wq "任务" -w .\demo` | 先 `.\.venv\Scripts\Activate.ps1` 激活（已激活可跳过），之后直接 `wq` |
+
+
+
+> 下文示例统一用裸 `wq`：uv 用户记得加 `uv run` 前缀，pip 用户记得先激活 venv。
 
 ### 快速开始
 
@@ -323,67 +337,36 @@ $ pip install fastapi
 
 ### 交互式 TUI
 
-```powershell
-pip install -e ".[tui]"
-wq --tui -w .\demo                 # 不需要 TASK，进界面后输入
-wq --tui -w .\demo --approval-mode auto --trace-mode full
-```
+
+
+浅色双栏：左边 Plan，右边 Activity，输入框嵌在右栏底部，键位在最下面一行。
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│ 🐺 WQ Agent   ● ready                     session: 8f3c1d2e · turn 2 │
-├──────────────────────────────────────────────────────────────────────┤
-│ ╭ Plan ────────────────────────────────────────────────────────────╮ │
-│ │ ▰▰▰▱▱▱▱▱▱▱  1/3 done  ·  build the FastAPI app                    │ │
-│ │ ✅ scaffold   🔄 auth-router   ⬜ tests                            │ │
-│ ╰──────────────────────────────────────────────────────────────────╯ │
-│ ╭ Activity ────────────────────────────────────────────────────────╮ │
-│ │  💬 帮我搭一个 FastAPI 后台管理系统，包含用户认证                   │ │
-│ │  🔧 codeAgent · file_write → file_path=app/main.py                │ │
-│ │  ✔ codeAgent · file_write: Created app/main.py                    │ │
-│ │  🔄 handoff · planner → codeAgent: add the JWT auth router        │ │
-│ │  💾 checkpoint · running/verifier (4 files, git 9ad3b835)         │ │
-│ ╰──────────────────────────────────────────────────────────────────╯ │
-│ ╭──────────────────────────────────────────────────────────────────╮ │
-│ │ ›  ask WQ Agent…                                                 │ │
-│ ╰──────────────────────────────────────────────────────────────────╯ │
-│ Enter send   ·   Ctrl+L clear   ·   Ctrl+C quit                      │
-└──────────────────────────────────────────────────────────────────────┘
+ WQ  Agent        8f3c1d2e · turn 2 · workflow                  ● ready     
+────────────────────────────┬───────────────────────────────────────────────
+ Plan                       │ Activity
+ ▰▰▰▰▰▱▱▱▱▱▱▱               │ ↳  handoff  planner → codeAgent
+ 3 / 7 done                 │ ›  file_write → app/main.py
+ ✓  scaffold FastAPI app    │ ✓  file_write : written (412 lines)
+ ✓  write unit tests        │ »  checkpoint  running/codeAgent (4 files)
+ ●  implement auth          │ »  chat : here is the FastAPI scaffold
+ ○  add API docs            │ ●  intent  chat [0.82]  quick question
+ ✕  deploy to staging       │ ╭───────────────────────────────────────────╮
+                            │ │ ›  ask WQ Agent…                          │
+                            │ ╰───────────────────────────────────────────╯
+────────────────────────────┴───────────────────────────────────────────────
+ Enter send   Ctrl+L clear   Ctrl+B plan   Ctrl+D diff   Ctrl+C quit  .\demo
 ```
 
-- 每次回车 = 一个会话轮次，后台线程跑 `stream_session_events()`，事件回到 UI 线程更新 Plan 面板 / 事件流 / 状态栏；
-- 危险命令弹审批框：`Y`/Enter 批准、`N`/Esc 拒绝，按钮等价；
-- 启动前用 rich 画一块 ASCII Art Logo（青→紫渐变 + 揭幕动画，约 0.5 秒）；非终端只画一次，`WQ_NO_LOGO=1` 完全不画，`WQ_NO_ANIMATION=1` 只用静态版；控制台编码装不下方块字或 🐺 时自动换纯 ASCII 版；
+- **左栏 Plan**：一根细进度条 + `3 / 7 done`，每条 todo 一行，靠符号和颜色区分状态（`✓` 完成=灰、`●` 进行中=加粗、`○` 待办=浅灰、`✕` 阻塞=红）。
+- **右栏 Activity**：一行一条事件，颜色即语义 —— `↳` 交接、`›` 工具调用、`✓`/`✕` 结果、`»` 系统事件、`●` 意图路由。不用 emoji，也不给每行画边框。
+- **Ctrl+B** 折叠/展开左栏；终端窄于 100 列时自动折叠，把宽度让给事件流（此时再按 Ctrl+B 可以强行展开）。
+- **审批不弹窗**：危险命令在输入框上方插入一条琥珀色提示（命令、工具、风险、超时），按 `y` 批准、`n` 或 `Esc` 拒绝；等待期间输入框禁用，答完自动恢复并把焦点还给输入框。
+- **底部键位条**：左边键位、右边工作区路径（宽度不够时先隐藏路径，保证键位完整）；`Ctrl+D` 展开最近一次文件改动的 diff。
+- **顶栏**：`WQ` 色块、Agent、会话摘要（session · turn · route），右侧是运行状态（`● ready` / `⠋ working` / `● approval`）。
+
+其余行为：
+
+- 每次回车 = 一个会话轮次，后台线程跑 `stream_session_events()`，事件回到 UI 线程更新左栏 / 右栏 / 顶栏；
+- 启动前用 rich 画一块 ASCII Art Logo（青→紫渐变 + 揭幕动画）；非终端只画一次，`WQ_NO_LOGO=1` 完全不画，`WQ_NO_ANIMATION=1` 只用静态版；
 - Textual 未安装时 `wq --tui` 会提示 `pip install "wqagent[tui]"` 并以 2 退出，普通 CLI 不受影响。
-
-### Python API
-
-```python
-from wqagent.core.agent import stream_agent_events, stream_session_events
-
-# 一次运行：拿到扁平的流式事件
-for event in stream_agent_events("创建 hello.py 并运行", workspace="./demo"):
-    print(event["type"], event.get("node", ""))
-
-# 一轮对话：内部完成「读会话 → 记录用户轮 → 构建上下文 → 路由 → 记录助手轮 → 落盘」
-for event in stream_session_events("继续，加个登录接口", session_workspace="./demo"):
-    if event["type"] == "final_answer":
-        print(event["route"], event["content"])
-    if event["type"] == "session_saved":
-        print("turn", event["turn"], "->", event["reply_turn"], event["path"])
-```
-
-```python
-from wqagent.core.session import load_or_create_session, build_session_context, save_session
-from wqagent.core.checkpoint import CheckpointManager
-from wqagent.graph import build_complex_workflow, new_graph_state
-from wqagent.core.state import create_runtime
-
-runtime = create_runtime("./demo", approval_mode="auto", trace_mode="full")
-graph = build_complex_workflow()                     # 或 build_entry_workflow() / build_workflow()
-state = new_graph_state("重构 cli/app.py", runtime)
-session = load_or_create_session("./demo")
-print(build_session_context("./demo", session))
-```
-
-`create_runtime(workspace, approval_mode=…, approval_handler=…, checkpoint_mode=…, trace_mode=…, resume_from=…, session=…)` 是推荐入口；`RuntimeState` 直接构造也支持。

@@ -190,7 +190,6 @@ class WQGraphState(TypedDict, total=False):
     intent_confidence: float
     chat_response: str
     final_answer: str
-    my_note: str
 
 
 def make_todo(

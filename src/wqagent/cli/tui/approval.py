@@ -1,16 +1,19 @@
-"""Approval inside the TUI: the modal and the gate that connects it to the tool thread.
+"""Approval inside the TUI: the inline prompt and the gate that connects it to the tool thread.
 
 The bash tool asks for approval **from its own thread** and must not continue until a
-human answered, while the dialog can only exist on the UI thread. :class:`ApprovalGate`
+human answered, while the prompt can only exist on the UI thread. :class:`ApprovalGate`
 is the middle ground:
 
 1. the tool thread calls :class:`TuiApprovalHandler`, which creates a gate and posts an
    :class:`ApprovalRequestedMessage`;
-2. the app pushes :class:`ApprovalModal` and, when it is dismissed, calls
-   ``gate.resolve(approved)``;
+2. the app mounts an :class:`ApprovalBar` above the composer and, when a key answers it,
+   calls ``gate.resolve(approved)``;
 3. the tool thread sits in ``gate.wait()`` until that happens - with the run's approval
    timeout (``WQ_APPROVAL_TIMEOUT``) as the backstop, because a run nobody answers must
    end up *denied* rather than stuck.
+
+The prompt is a **bar, not a modal**: it slides in three rows above the input, keeps the
+conversation readable, and never swaps the screen out from under the user.
 """
 
 from __future__ import annotations
@@ -18,12 +21,12 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from rich.text import Text
 from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Vertical
+from textual.events import Resize
 from textual.message import Message
-from textual.screen import ModalScreen
-from textual.widgets import Button, Static
+from textual.widgets import Static
 
 from wqagent.core.approval import (
     ApprovalDecision,
@@ -32,8 +35,8 @@ from wqagent.core.approval import (
 )
 
 __all__ = [
+    "ApprovalBar",
     "ApprovalGate",
-    "ApprovalModal",
     "ApprovalRequestedMessage",
     "TuiApprovalHandler",
 ]
@@ -83,55 +86,105 @@ class ApprovalRequestedMessage(Message):
         super().__init__()
 
 
-class ApprovalModal(ModalScreen[bool]):
-    """The dialog: what would run, why it is risky, and Approve/Deny.
+class ApprovalBar(Vertical):
+    """Three rows above the composer: what would run, why it is risky, and the keys.
 
-    ``Y``/Enter approves, ``N``/Escape denies; the buttons do the same.
+    ``y`` approves, ``n``/``esc`` deny. The app owns the keys (so they work whichever
+    widget has focus) and calls :meth:`decided`; the bar only renders and reports.
     """
 
-    BINDINGS = [
-        Binding("y", "approve", "Approve"),
-        Binding("enter", "approve", "Approve", show=False),
-        Binding("n", "deny", "Deny"),
-        Binding("escape", "deny", "Deny", show=False),
-    ]
+    DEFAULT_CSS = """
+    ApprovalBar {
+        height: 4;
+        padding: 0 1;
+        background: #fffbeb;
+        border-top: solid #f59e0b;
+    }
+    ApprovalBar Static { height: 1; }
+    """
 
-    def __init__(self, gate: ApprovalGate, *, workspace: Any = "") -> None:
+    class Decided(Message):
+        """The operator pressed a key; the app resolves the gate."""
+
+        def __init__(self, approved: bool) -> None:
+            self.approved = approved
+            super().__init__()
+
+    def __init__(
+        self,
+        gate: ApprovalGate,
+        *,
+        workspace: Any = "",
+        queued: int = 0,
+    ) -> None:
         super().__init__()
         self.gate = gate
         self.workspace = str(workspace or "")
+        self.queued = int(queued)
 
     def compose(self) -> ComposeResult:
+        yield Static(id="approval-title")
+        yield Static(id="approval-command")
+        yield Static(id="approval-hint")
+
+    def on_mount(self) -> None:
+        self.render_request()
+
+    def on_resize(self, event: Resize) -> None:
+        self.render_request()
+
+    # -- rendering -----------------------------------------------------------
+    def render_request(self) -> None:
+        """Rewrite the three rows to fit the current width."""
+        if len(self.children) < 3:  # called before the rows were composed
+            return
+        # on_mount runs before the first layout, where self.size is still 0 wide
+        width = max(20, (self.size.width or self.app.size.width) - 2)
         request = self.gate.request
-        with Vertical(id="approval-dialog"):
-            yield Static("⚠  approval required", id="approval-title")
-            yield Static(f"tool      : {request.tool_name}", classes="approval-row")
-            yield Static(f"risk      : {request.risk_reason}", classes="approval-row")
-            yield Static(f"approval  : {request.id}", classes="approval-row")
-            if self.workspace:
-                yield Static(f"workspace : {self.workspace}", classes="approval-row")
-            yield Static(f"$ {request.command}", id="approval-command")
-            with Horizontal(id="approval-buttons"):
-                yield Button("Approve (Y)", variant="success", id="approval-approve")
-                yield Button("Deny (N)", variant="error", id="approval-deny")
-            yield Static(
-                f"Y / Enter approves · N / Esc denies"
-                + (
-                    f" · no answer within {self.gate.timeout:g}s = denied"
-                    if self.gate.timeout > 0
-                    else ""
-                ),
-                id="approval-hint",
-            )
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "approval-approve")
+        title = Text()
+        title.append("▲  approval required", style="bold #B45309")
+        title.append(f"  ·  {request.tool_name}", style="#92400E")
+        if self.queued:
+            title.append(f"  ·  {self.queued} more waiting", style="#B45309")
+        self.query_one("#approval-title", Static).update(_fit(title, width))
 
-    def action_approve(self) -> None:
-        self.dismiss(True)
+        command = Text()
+        command.append("$ ", style="#92400E")
+        command.append(_fit(Text(str(request.command)), width - 2).plain, style="#1f2933")
+        lines = Text()
+        lines.append_text(command)
+        risk = str(request.risk_reason or "")
+        if risk:
+            lines.append(f"   ({risk})", style="#92400E")
+        self.query_one("#approval-command", Static).update(_fit(lines, width))
 
-    def action_deny(self) -> None:
-        self.dismiss(False)
+        hint = Text()
+        hint.append(" y ", style="bold #ffffff on #B45309")
+        hint.append(" approve    ", style="#7c2d12")
+        hint.append(" n ", style="bold #ffffff on #92400E")
+        hint.append(" deny    ", style="#7c2d12")
+        hint.append(" esc ", style="bold #ffffff on #92400E")
+        hint.append(" deny", style="#7c2d12")
+        if self.gate.timeout > 0:
+            note = f"      no answer in {self.gate.timeout:g}s = denied"
+            if hint.cell_len + len(note) <= width:  # never truncate the keys away
+                hint.append(note, style="#a16207")
+        self.query_one("#approval-hint", Static).update(_fit(hint, width))
+
+    # -- input ---------------------------------------------------------------
+    def decide(self, approved: bool) -> None:
+        """Report the decision to the app (it resolves the gate and unmounts the bar)."""
+        self.post_message(self.Decided(approved))
+
+
+def _fit(text: Text, width: int) -> Text:
+    """Truncate a one-line Text to *width* cells, keeping its styles."""
+    if width <= 0 or text.cell_len <= width:
+        return text
+    fitted = text.copy()
+    fitted.truncate(width - 1, overflow="ellipsis")
+    return fitted
 
 
 class TuiApprovalHandler:

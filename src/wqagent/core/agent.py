@@ -32,6 +32,8 @@ from langchain_core.messages import (
 from langchain_core.tools import BaseTool
 
 from wqagent.core.checkpoint import CheckpointManager
+from wqagent.core.diff import capture as capture_diff
+from wqagent.core.diff import finish as finish_diff
 from wqagent.core.session import (
     append_assistant_turn,
     append_user_turn,
@@ -270,9 +272,10 @@ def _pump_graph(
                 # The actor round's own end marker - only the `final` node closes
                 # the run, and that answer is emitted once at the end.
                 continue
-            if manager.strict:
-                manager.append_event(event)
-            tracer.record_custom_event(event)
+            if not event.get("transient"):  # token deltas are for the UI only
+                if manager.strict:
+                    manager.append_event(event)
+                tracer.record_custom_event(event)
             yield _publish(on_event, event)
             if _custom_event_needs_checkpoint(event):
                 # after the event, so the checkpoint is "everything up to here"
@@ -394,7 +397,11 @@ def react_loop(
             yield _publish(
                 on_event, {"type": "tool_call", "name": name, "args": args, "loop": loop}
             )
+            # read the file before/after the call so the UI can show a real diff;
+            # the model only ever sees `result`, never the patch
+            snapshot = capture_diff(tools_by_name.get(name), args)
             result = execute_tool(name, args, tools_by_name)
+            change = finish_diff(snapshot)
             messages.append(
                 ToolMessage(
                     content=json.dumps(result, ensure_ascii=False, default=str),
@@ -403,7 +410,13 @@ def react_loop(
             )
             yield _publish(
                 on_event,
-                {"type": "tool_result", "name": name, "result": result, "loop": loop},
+                {
+                    "type": "tool_result",
+                    "name": name,
+                    "result": result,
+                    "diff": change.as_dict() if change is not None else None,
+                    "loop": loop,
+                },
             )
 
     yield _publish(

@@ -1,22 +1,38 @@
 """The WQ Agent TUI, built with `Textual <https://textual.textualize.io>`_.
 
-    ┌─────────────────────────────────────────────┐
-    │ 🐺 WQ Agent    session: 8f3c…  turn 2       │  header + status bar
-    ├─────────────────────────────────────────────┤
-    │ [Plan] t1 ✅  t2 🔄  t3 ⬜                   │  plan panel
-    │                                             │
-    │ 🔧 file_write → app.py                      │  event stream (scrollable)
-    │ 📝 notepad: "Created FastAPI app"           │
-    │ 🔄 handoff: planner → codeAgent             │
-    ├─────────────────────────────────────────────┤
-    │ 💬 Input …                                  │  one Input per session turn
-    └─────────────────────────────────────────────┘
+Skeleton **C** -- a two-pane layout whose plan sidebar folds away::
 
-The agent itself runs in a **background thread** (one thread per turn), and every event
-it yields is posted to the UI thread as an :class:`AgentEventMessage`; the UI then
-updates the plan panel, the event stream, the status bar or the approval modal. Each
-submitted line is one :func:`~wqagent.core.agent.stream_session_events` turn, so the
-conversation continues exactly like the ``wq`` CLI does.
+    +----------------------------------------------------------------------+
+    | WQ  Agent           8f3c1d2e . turn 2 . workflow          * ready    |  brand bar
+    +--------------------------+-------------------------------------------+
+    | Plan                     | Activity                                  |
+    | =====--------------------| >  handoff  planner -> codeAgent           |
+    | 3 / 7 done               | >  file_write -> app/main.py               |
+    | v  scaffold FastAPI app  | v  file_write : written (412 lines)        |
+    | *  implement auth        | >  checkpoint  running/codeAgent (4 files) |
+    | o  add API docs          | >  chat : here is the FastAPI scaffold...  |
+    | x  deploy to staging     | *  intent  chat [0.82]  quick question     |
+    |                          | +---------------------------------------+  |
+    |                          | | >  ask WQ Agent...                    |  |
+    |                          | +---------------------------------------+  |
+    +--------------------------+-------------------------------------------+
+    | Enter send   Ctrl+L clear   Ctrl+B plan   Ctrl+C quit        .\\demo  |  key bar
+    +----------------------------------------------------------------------+
+
+The sidebar is :data:`PLAN_WIDTH` columns wide and toggles with ``Ctrl+B``.
+Below :data:`NARROW_WIDTH` columns it collapses by itself: 38 columns of plan
+inside an 80-column terminal leaves the event log nothing but wrapped scraps.
+
+The agent itself runs in a **background thread** (one thread per turn), and every
+event it yields is posted to the UI thread as an :class:`AgentEventMessage`; the
+UI then updates the plan pane, the activity log, the brand bar or the approval
+modal. Each submitted line is one
+:func:`~wqagent.core.agent.stream_session_events` turn, so the conversation
+continues exactly like the ``wq`` CLI does.
+
+Every container height is an explicit number of rows. A ``height: auto`` around a
+``1fr`` child is what collapsed this screen to a blank rectangle on Textual 8, so
+:func:`test_layout_has_real_geometry` pins the result down.
 """
 
 from __future__ import annotations
@@ -25,110 +41,141 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
+from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Button, Input, Static
+from textual.widgets import Input, ProgressBar, Static
 
 from wqagent.cli.tui.approval import (
-    ApprovalModal,
+    ApprovalBar,
+    ApprovalGate,
     ApprovalRequestedMessage,
     TuiApprovalHandler,
 )
+from wqagent.cli.tui.diff_view import DiffBlock
+from wqagent.cli.tui.stream_view import LiveReply
 
-__all__ = ["AgentEventMessage", "WQAgentTuiApp", "format_event"]
+__all__ = ["AgentEventMessage", "WQAgentTuiApp", "format_event", "keybar_text"]
 
 #: Event kinds that should not clutter the stream (they are bookkeeping).
 QUIET_EVENTS = frozenset({"node_end", "memory", "ai_message", "trace_saved"})
 
+#: Columns reserved for the plan sidebar while it is expanded.
+PLAN_WIDTH = 38
+#: Terminals narrower than this fold the sidebar away on their own.
+NARROW_WIDTH = 100
 
+#: One glyph per todo state, in the design's vocabulary (text, never emoji).
+TODO_MARKS = {"completed": "✓", "in_progress": "●", "pending": "○", "blocked": "✕"}
+#: Todo state -> CSS class, so colours stay in the stylesheet.
+TODO_CLASSES = {
+    "completed": "todo-completed",
+    "in_progress": "todo-active",
+    "pending": "todo-pending",
+    "blocked": "todo-blocked",
+}
+
+#: Argument keys worth showing as the target of a tool call, in order.
+_TARGET_KEYS = ("file_path", "path", "command", "pattern", "query", "url", "name")
+
+
+# -- event formatting --------------------------------------------------------
 def format_event(event: Mapping[str, Any]) -> tuple[str, str]:
-    """One stream line for an agent event: ``(text, css_class)``."""
+    """One activity line for an agent event: ``(text, css_class)``.
+
+    The markers follow the design: ``↳`` handoff, ``›`` tool call, ``✓``/``✕``
+    result, ``»`` metadata, ``●`` routing.
+    """
     kind = str(event.get("type") or "event")
-    node = str(event.get("node") or "")
-    where = f"{node} · " if node else ""
+
     if kind == "user":
-        return f"💬 {event.get('text') or ''}", "event-user"
+        return f"› {event.get('text') or ''}", "event-user"
     if kind == "tool_call":
-        return f"🔧 {where}{event.get('name')} → {_args(event.get('args'))}", "event-tool"
+        return f"› {event.get('name')} → {_target(event.get('args'))}", "event-tool"
     if kind == "tool_result":
         result = event.get("result") if isinstance(event.get("result"), Mapping) else {}
-        ok = result.get("ok", True)
-        detail = str(result.get("error") or result.get("result") or "")
-        mark = "✔" if ok else "✖"
-        return f"{mark} {where}{event.get('name')}: {_short(detail, 160)}", (
+        ok = bool(result.get("ok", True))
+        detail = _short(result.get("result") if ok else result.get("error"), 140)
+        mark = "✓" if ok else "✕"
+        return f"{mark} {event.get('name')} : {detail}".rstrip(), (
             "event-ok" if ok else "event-error"
         )
     if kind == "handoff":
-        return (
-            f"🔄 handoff · {event.get('from')} → {event.get('to')}: "
-            f"{_short(event.get('instruction'), 120)}",
-            "event-handoff",
-        )
+        instruction = _short(event.get("instruction"), 60)
+        line = f"↳  handoff  {event.get('from')} → {event.get('to')}"
+        return (f"{line}  ·  {instruction}" if instruction else line), "event-handoff"
     if kind == "intent":
         confidence = float(event.get("intent_confidence") or 0.0)
-        return (
-            f"🧭 route · {event.get('intent_route')} [{confidence:.2f}] "
-            f"{_short(event.get('intent_reason'), 100)}",
-            "event-intent",
-        )
+        reason = _short(event.get("intent_reason"), 80)
+        line = f"●  intent  {event.get('intent_route')} [{confidence:.2f}]"
+        return (f"{line}  {reason}" if reason else line), "event-intent"
     if kind == "chat_response":
-        return f"💬 {_short(event.get('chat_response'), 160)}", "event-chat"
+        return f"»  chat : {_short(event.get('chat_response'), 160)}", "event-chat"
     if kind == "checkpoint_saved":
-        git = str(event.get("git_commit") or "")[:8]
         return (
-            f"💾 checkpoint · {event.get('status')}/{event.get('latest_node')} "
-            f"({event.get('files')} files{', git ' + git if git else ''})",
+            f"»  checkpoint  {event.get('status')}/{event.get('latest_node')} "
+            f"({event.get('files')} files)",
             "event-meta",
         )
     if kind == "context_compressed":
         return (
-            f"🗜 compressed · {event.get('messages_before')} msgs/"
-            f"{event.get('tokens_before')} tokens → {event.get('tokens_after')} tokens",
+            f"»  context  {event.get('messages_before')} msgs/"
+            f"{event.get('tokens_before')} → {event.get('tokens_after')} tokens",
             "event-meta",
         )
     if kind == "todo_update":
-        return f"📝 plan · {_plan_chips(event.get('todos'))}", "event-plan"
+        return _plan_line(event.get("todos")), "event-plan"
     if kind == "plan_snapshot":
-        return f"📋 plan · {_short(event.get('plan_summary'), 120)}", "event-plan"
+        return f"»  plan  {_short(event.get('plan_summary'), 90)}", "event-plan"
     if kind == "search_results":
         return (
-            f"🔍 {len(event.get('results') or [])} result(s) for {event.get('query')!r}",
+            f"›  search  {len(event.get('results') or [])} result(s) "
+            f"for {event.get('query')!r}",
             "event-tool",
         )
     if kind == "session_saved":
         return (
-            f"🧵 session · turn {event.get('turn')} → {event.get('reply_turn')} "
-            f"({event.get('route')}) saved={event.get('saved')}",
+            f"»  session  turn {event.get('turn')} → {event.get('reply_turn')} "
+            f"({event.get('route')})",
             "event-meta",
         )
     if kind == "turn_failed":
-        return f"✖ turn failed: {_short(event.get('error'), 200)}", "event-error"
+        return f"✕  turn failed : {_short(event.get('error'), 200)}", "event-error"
     if kind == "turn_finished":
         return "", "event-meta"
-    return f"· {kind}: {_short(_json(event), 160)}", "event-meta"
+    return f"»  {kind} : {_short(_json(event), 140)}", "event-meta"
 
 
-def _plan_chips(todos: Any) -> str:
-    """``✅ a  🔄 b`` for a todo list, instead of its Python repr."""
+def _plan_line(todos: Any) -> str:
+    """``»  plan  2 / 7 done  ·  ● implement auth`` for one todo update."""
     if not isinstance(todos, (list, tuple)) or not todos:
-        return _short(todos, 120)
-    marks = {"completed": "✅", "in_progress": "🔄", "blocked": "⛔", "pending": "⬜"}
-    chips = []
-    for todo in todos:
-        if isinstance(todo, Mapping):
-            glyph = marks.get(str(todo.get("status") or "pending"), "⬜")
-            chips.append(f"{glyph} {todo.get('id')}")
-        else:
-            chips.append(str(todo))
-    return "   ".join(chips)
+        return "»  plan  (empty)"
+    done = sum(1 for todo in todos if _status(todo) == "completed")
+    line = f"»  plan  {done} / {len(todos)} done"
+    active = next((todo for todo in todos if _status(todo) == "in_progress"), None)
+    if isinstance(active, Mapping):
+        label = _short(active.get("content") or active.get("id"), 50)
+        line += f"  ·  ● {label}"
+    return line
 
 
-def _args(value: Any) -> str:
+def _status(todo: Any) -> str:
+    return str(todo.get("status") or "pending") if isinstance(todo, Mapping) else "pending"
+
+
+def _target(value: Any) -> str:
+    """The most meaningful argument of a tool call (a path, a command, ...)."""
     if isinstance(value, Mapping):
-        return ", ".join(f"{key}={_short(item, 60)}" for key, item in list(value.items())[:3])
-    return _short(value, 80)
+        for key in _TARGET_KEYS:
+            if key in value:
+                return _short(value[key], 70)
+        for item in list(value.values())[:1]:
+            return _short(item, 70)
+        return ""
+    return _short(value, 70)
 
 
 def _json(value: Any) -> str:
@@ -144,7 +191,31 @@ def _short(value: Any, limit: int) -> str:
     text = " ".join(str(value or "").split())
     if len(text) <= limit:
         return text
-    return text[: limit - 3].rstrip() + "..."
+    return text[: limit - 1].rstrip() + "…"
+
+
+def keybar_text(*, plan_open: bool = True) -> Text:
+    """The key hints, drawn as chips (a one-row bar cannot draw borders)."""
+    hints = (
+        ("Enter", "send"),
+        ("Ctrl+L", "clear"),
+        ("Ctrl+B", "plan ▾" if plan_open else "plan ▸"),
+        ("Ctrl+D", "diff"),
+        ("Ctrl+C", "quit"),
+    )
+    text = Text()
+    for index, (key, label) in enumerate(hints):
+        if index:
+            text.append("  ")
+        text.append(f" {key} ", style="bold #0F6E56 on #dde5ee")
+        text.append(f" {label}", style="#475569")
+    return text
+
+
+def _tail(value: Any, limit: int) -> str:
+    """A path shortened from the left (the last segments matter, not the drive)."""
+    text = str(value or "")
+    return text if len(text) <= limit else "…" + text[-(limit - 1) :]
 
 
 class AgentEventMessage(Message):
@@ -159,144 +230,169 @@ class WQAgentTuiApp(App[None]):
     """The interactive front end: talk to the agent, watch what it does."""
 
     CSS = """
-    /* ---- palette (matches the startup logo: slate + cyan/violet) ---------- */
+    /* ---- surfaces: white body, hairline rules, one grey key bar ---------- */
     Screen {
         layout: vertical;
-        background: #0b1220;
-        color: #e2e8f0;
+        background: #ffffff;
+        color: #1f2933;
     }
 
     /* ---- brand bar ------------------------------------------------------- */
     #brandbar {
         height: 3;
         padding: 0 1;
-        background: #0f172a;
-        border-bottom: solid #1e293b;
+        background: #ffffff;
+        border-bottom: solid #e6e9ed;
+        align: left middle;
+    }
+    #chip {
+        width: auto;
+        height: 1;
+        padding: 0 1;
+        background: #0F6E56;
+        color: #ffffff;
+        text-style: bold;
     }
     #brand {
         width: auto;
-        height: 3;
-        content-align: left middle;
+        height: 1;
+        margin: 0 0 0 1;
+        color: #1f2933;
         text-style: bold;
-        color: #22d3ee;
     }
     #status {
         width: 1fr;
-        height: 3;
-        content-align: right middle;
+        height: 1;
+        content-align: center middle;
         color: #64748b;
     }
-
-    /* ---- cards ----------------------------------------------------------- */
-    #plan {
-        height: auto;
-        max-height: 7;
-        margin: 1 1 0 1;
-        padding: 0 1;
-        background: #111c33;
-        border: round #334155;
-        border-title-color: #a78bfa;
-        border-title-style: bold;
-        color: #cbd5e1;
+    #ready {
+        width: auto;
+        height: 1;
+        color: #15803D;
+        text-style: bold;
     }
-    #plan-progress { color: #a78bfa; }
-    .plan-chip { color: #cbd5e1; }
 
+    /* ---- the two panes --------------------------------------------------- */
+    #panes { height: 1fr; }
+    #planpane {
+        width: 38;
+        height: 1fr;
+        padding: 0 1;
+        border-right: solid #e6e9ed;
+    }
+    #activitypane {
+        width: 1fr;
+        height: 1fr;
+        padding: 0 1;
+    }
+    .pane-title {
+        height: 1;
+        margin: 1 0 0 0;
+        color: #1f2933;
+        text-style: bold;
+    }
+
+    /* ---- plan pane: one thin bar, a caption, then a row per todo --------- */
+    #plan-progress {
+        height: 1;
+        margin: 0;
+        background: #ffffff;
+    }
+    #plan-progress Bar { width: 1fr; }
+    #plan-progress Bar > .bar--bar { color: #0F6E56; background: #e2e8f0; }
+    #plan-progress Bar > .bar--complete { color: #15803D; background: #e2e8f0; }
+    #plan-caption {
+        height: 1;
+        color: #64748b;
+    }
+    #plan {
+        height: 1fr;
+        scrollbar-size-vertical: 0;
+    }
+    #plan Static { padding: 0; }
+    .todo-completed { color: #9aa0a6; }
+    .todo-active { color: #1f2933; text-style: bold; }
+    .todo-pending { color: #64748b; }
+    .todo-blocked { color: #B91C1C; text-style: bold; }
+
+    /* ---- activity pane: the log, then the composer at its foot ----------- */
     #stream {
         height: 1fr;
-        margin: 1;
-        padding: 0 1;
-        background: #0d1526;
-        border: round #334155;
-        border-title-color: #22d3ee;
-        border-title-style: bold;
+        padding: 0;
+        background: #ffffff;
         scrollbar-size-vertical: 1;
-        scrollbar-color: #334155;
-        scrollbar-background: #0d1526;
+        scrollbar-color: #cbd5e1;
+        scrollbar-background: #ffffff;
     }
-    #stream Static { padding: 0 0 0 1; }
-
-    /* ---- event styles ---------------------------------------------------- */
-    .event-user { color: #f8fafc; text-style: bold; }
-    .event-tool { color: #38bdf8; }
-    .event-ok { color: #34d399; }
-    .event-error { color: #f87171; }
-    .event-handoff { color: #c084fc; }
-    .event-intent { color: #22d3ee; }
-    .event-chat { color: #a7f3d0; }
-    .event-plan { color: #fbbf24; }
-    .event-meta { color: #64748b; }
-    .event-final {
-        color: #34d399;
-        text-style: bold;
-        background: #0f2a22;
-        padding: 0 1;
-    }
-    .event-rule { color: #1e293b; }
-
-    /* ---- input ----------------------------------------------------------- */
     #inputbar {
         height: 3;
-        margin: 0 1 1 1;
-        background: #111c33;
-        border: round #334155;
+        margin: 0 0 1 0;
+        background: #ffffff;
+        border: round #d8dee6;
     }
-    #inputbar:focus-within { border: round #22d3ee; }
+    #inputbar:focus-within { border: round #0F6E56; }
     #prompt-prefix {
         width: 3;
+        height: 1;
         content-align: center middle;
-        color: #22d3ee;
+        color: #0F6E56;
         text-style: bold;
     }
     #prompt {
+        height: 1;
         border: none;
-        background: #111c33;
-        color: #e2e8f0;
+        background: #ffffff;
+        color: #1f2933;
     }
     #prompt:focus { border: none; }
-    #hints {
+    #prompt:disabled { color: #9aa0a6; }
+
+    /* ---- key bar: two rows so the hairline does not eat the text --------- */
+    #keybar {
+        height: 2;
+        padding: 0 1;
+        background: #eef2f6;
+        border-top: solid #e6e9ed;
+        align: left middle;
+    }
+    #keys {
+        width: 1fr;
         height: 1;
-        padding: 0 2;
-        color: #475569;
+    }
+    #workspace {
+        width: auto;
+        height: 1;
+        color: #9aa0a6;
     }
 
-    /* ---- approval modal -------------------------------------------------- */
-    #approval-dialog {
-        width: 84;
-        height: auto;
-        padding: 1 2;
-        background: #111c33;
-        border: thick #fbbf24;
-        border-title-color: #fbbf24;
-        border-title-style: bold;
-        align: center middle;
-    }
-    #approval-title { text-style: bold; color: #fbbf24; padding: 0 0 1 0; }
-    .approval-row { color: #94a3b8; }
-    #approval-command {
-        margin: 1 0;
-        padding: 0 1;
-        background: #0b1220;
-        color: #f8fafc;
-    }
-    #approval-buttons { height: auto; align: center middle; padding: 1 0 0 0; }
-    #approval-buttons Button { margin: 0 1; min-width: 16; }
-    #approval-hint { color: #64748b; }
+    /* ---- event styles (light surface, semantic colours, no emoji) -------- */
+    .event-user { color: #0f172a; text-style: bold; }
+    .event-tool { color: #0E7490; }
+    .event-ok { color: #15803D; }
+    .event-error { color: #B91C1C; }
+    .event-handoff { color: #6D28D9; }
+    .event-intent { color: #1D4ED8; }
+    .event-chat { color: #1f2933; }
+    .event-plan { color: #64748b; }
+    .event-meta { color: #64748b; }
+    .event-final { color: #15803D; text-style: bold; }
     """
 
-    TITLE = "🐺 WQ Agent"
+    theme = "textual-light"
+    TITLE = "WQ Agent"
     SUB_TITLE = "workspace-scoped coding agent"
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
+        Binding("ctrl+b", "toggle_plan", "Plan"),
+        Binding("ctrl+d", "toggle_diff", "Diff"),
         Binding("ctrl+l", "clear_stream", "Clear stream"),
     ]
 
     #: Spinner frames for the "working" indicator in the brand bar.
     SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-    #: Lines kept in the activity stream (the oldest are dropped).
+    #: Lines kept in the activity log (the oldest are dropped).
     STREAM_LIMIT = 400
-    #: Separator drawn between turns.
-    TURN_RULE = "╌" * 46
 
     def __init__(
         self,
@@ -331,37 +427,114 @@ class WQAgentTuiApp(App[None]):
         self.plan: list[dict[str, Any]] = []
         self._busy = False
         self._pending_approvals = 0
+        self._approval_queue: list[ApprovalGate] = []
+        self._active_gate: ApprovalGate | None = None
+        self._approval_bar: ApprovalBar | None = None
+        self._diffs: list[DiffBlock] = []
+        #: The line a streamed reply is being written into (``None`` when idle).
+        self._live: LiveReply | None = None
+        self._live_text = ""
+        self._token_buffer = ""
+        self._flush_timer: Any = None
+        self._last_reply = ""
         self._spin = 0
         self._spinner_timer: Any = None
+        self._route = ""
+        self._passed: bool | None = None
+        #: What the user asked for; a narrow terminal overrides it, not the reverse.
+        self._want_plan = True
+        #: Set when the user forces the sidebar open on a terminal that auto-folded it.
+        self._ignore_narrow = False
 
     # -- layout --------------------------------------------------------------
     def compose(self) -> ComposeResult:
         with Horizontal(id="brandbar"):
-            yield Static(f"🐺 WQ Agent", id="brand")
+            yield Static(" WQ ", id="chip")
+            yield Static("Agent", id="brand")
             yield Static(id="status")
-        with Vertical():
-            plan = Static(id="plan")
-            plan.border_title = "Plan"
-            plan.display = False  # nothing to show until the planner speaks
-            yield plan
-            stream = VerticalScroll(id="stream")
-            stream.border_title = "Activity"
-            with stream:
-                yield Static(
-                    "Ready — describe a task or ask a question.",
-                    classes="event-meta",
+            yield Static(id="ready")
+        with Horizontal(id="panes"):
+            with Vertical(id="planpane"):
+                yield Static("Plan", classes="pane-title")
+                yield ProgressBar(
+                    total=1,
+                    show_percentage=False,
+                    show_eta=False,
+                    id="plan-progress",
                 )
-        with Horizontal(id="inputbar"):
-            yield Static("›", id="prompt-prefix")
-            yield Input(placeholder="ask WQ Agent…", id="prompt")
-        yield Static(
-            "Enter send   ·   Ctrl+L clear   ·   Ctrl+C quit",
-            id="hints",
-        )
+                yield Static("no plan yet", id="plan-caption")
+                with VerticalScroll(id="plan"):
+                    yield from ()
+            with Vertical(id="activitypane"):
+                yield Static("Activity", classes="pane-title")
+                yield VerticalScroll(id="stream")
+                with Horizontal(id="inputbar"):
+                    yield Static("›", id="prompt-prefix")
+                    yield Input(placeholder="ask WQ Agent…", id="prompt")
+        with Horizontal(id="keybar"):
+            yield Static(keybar_text(), id="keys")
+            yield Static(_tail(self.workspace, 30), id="workspace")
 
     def on_mount(self) -> None:
-        self._refresh_status()
+        self.theme = "textual-light"
+        self.dark = False  # guarantee a light surface regardless of default
+        self._apply_plan_visibility()
+        self._apply_keybar()
+        self._render_header()
+        self._append("Ready — describe a task or ask a question.", "event-meta")
         self.query_one("#prompt", Input).focus()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._apply_plan_visibility()
+        self._apply_keybar()
+
+    # -- the collapsible sidebar ---------------------------------------------
+    def _plan_visible(self) -> bool:
+        width = self.size.width
+        return self._want_plan and (width >= NARROW_WIDTH or self._ignore_narrow)
+
+    def _apply_plan_visibility(self) -> None:
+        """Fold the plan pane away on narrow terminals (or when the user asked)."""
+        if not self.is_mounted:
+            return
+        if self.size.width >= NARROW_WIDTH:
+            self._ignore_narrow = False  # widening re-arms the automatic rule
+        visible = self._plan_visible()
+        pane = self.query_one("#planpane", Vertical)
+        if pane.display != visible:
+            pane.display = visible
+            self._apply_keybar()  # the hint reads "plan ▾" / "plan ▸"
+
+    def action_toggle_plan(self) -> None:
+        """``Ctrl+B``: hide the sidebar, or force it open on a terminal that folded it."""
+        if self._plan_visible():
+            self._want_plan = False
+            self._ignore_narrow = False
+        else:
+            self._want_plan = True
+            self._ignore_narrow = self.size.width < NARROW_WIDTH
+        self._apply_plan_visibility()
+
+    def action_toggle_diff(self) -> None:
+        """``Ctrl+D``: open or close the most recent patch in the activity log."""
+        blocks = [block for block in self._diffs if block.parent is not None]
+        if not blocks:
+            return
+        block = blocks[-1]
+        block.toggle()
+        block.scroll_visible(animate=False)
+
+    def _apply_keybar(self) -> None:
+        """Fit the key hints first; the workspace path gets whatever is left."""
+        if not self.is_mounted:
+            return
+        keys = keybar_text(plan_open=self._plan_visible())
+        self.query_one("#keys", Static).update(keys)
+        hint = self.query_one("#workspace", Static)
+        space = self.size.width - 4 - keys.cell_len  # padding 1 each side + a gap
+        hint.display = space >= 18  # never let the path eat a key hint
+        if hint.display:
+            hint.update(_tail(self.workspace, min(30, space)))
 
     # -- the turn ------------------------------------------------------------
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -370,18 +543,17 @@ class WQAgentTuiApp(App[None]):
         if not task:
             return
         if self._busy:
-            self._append("⚠ still working on the previous turn - wait for it to finish", "event-error")
+            self._append("still working on the previous turn — wait for it", "event-error")
             return
         self._start_turn(task)
 
     def _start_turn(self, task: str) -> None:
         """One session turn, on its own thread."""
         self._busy = True
-        if self.plan:  # separate turns visually once something has happened
-            self._turn_rule()
-        self._append(f"💬 {task}", "event-user")
+        self._last_reply = ""
+        self._append(f"› {task}", "event-user")
         self._start_spinner()
-        self._refresh_status()
+        self._render_header()
         thread = threading.Thread(
             target=self._run_turn, args=(task,), name="wq-tui-turn", daemon=True
         )
@@ -422,31 +594,112 @@ class WQAgentTuiApp(App[None]):
     def on_agent_event_message(self, message: AgentEventMessage) -> None:
         event = message.event
         kind = str(event.get("type") or "")
+        if kind == "token":
+            self._on_token(str(event.get("text") or ""))
+            return
+
+        # anything else ends a reply that was still streaming
+        final = ""
+        if kind == "chat_response":
+            final = str(event.get("chat_response") or "")
+        elif kind == "final_answer":
+            final = str(event.get("content") or "")
+        streamed = self._close_stream(final)
+
         if kind == "turn_finished":
             self._busy = False
             self._stop_spinner()
-            self._refresh_status()
+            self._render_header()
             return
         if kind == "final_answer":
-            self._append(f"📝 {_short(event.get('content'), 400)}", "event-final")
-            self._refresh_status(passed=bool(event.get("passed")), route=str(event.get("route") or ""))
+            self._passed = bool(event.get("passed"))
+            self._route = str(event.get("route") or self._route)
+            # the chat route reports the same text twice: do not print it again
+            if not (streamed or (final.strip() and final.strip() == self._last_reply.strip())):
+                self._append(f"»  answer : {_short(final, 400)}", "event-final")
+            self._last_reply = final or self._last_reply
+            self._render_header()
+            return
+        if kind == "chat_response":
+            self._last_reply = final
+            if not streamed:
+                self._append(format_event(event)[0], "event-chat")
             return
         if kind == "session_saved":
             self.session_id = str(event.get("session_id") or "")
             self.turn = int(event.get("turn_index") or self.turn)
-            self._refresh_status(route=str(event.get("route") or ""))
+            self._route = str(event.get("route") or self._route)
+            self._render_header()
             self._append(format_event(event)[0], "event-meta")
             return
         if self._updates_plan(event):
             self._update_plan(event)
             if kind == "todo_update":
-                self._append(format_event(event)[0], "event-plan")
+                self._append(_plan_line(event.get("todos")), "event-plan")
             return
         if kind in QUIET_EVENTS:
+            return
+        if kind == "tool_result" and isinstance(event.get("diff"), Mapping):
+            self._mount_diff(event)
             return
         text, css = format_event(event)
         if text:
             self._append(text, css)
+
+    def _mount_diff(self, event: Mapping[str, Any]) -> None:
+        """A file-changing tool call: the summary line plus a collapsible patch."""
+        diff = event.get("diff")
+        if not isinstance(diff, Mapping):
+            return
+        text, css = format_event(event)
+        block = DiffBlock(dict(diff), header=text, css=css)
+        self._append_widget(block)
+        self._diffs.append(block)
+
+    # -- streaming replies ---------------------------------------------------
+    def _on_token(self, text: str) -> None:
+        """One model delta: open the live line if needed, then buffer the text."""
+        if not text:
+            return
+        if self._live is not None and self._live.parent is None:
+            self._live = None  # the log was trimmed under it
+        if self._live is None:
+            live = LiveReply()
+            self._live = live
+            self._live_text = ""
+            self._append_widget(live)
+        self._token_buffer += text
+        if self._flush_timer is None:
+            # ~20 repaints a second: a fast stream must not starve the event loop
+            self._flush_timer = self.set_timer(0.05, self._flush_tokens)
+
+    def _flush_tokens(self) -> None:
+        self._flush_timer = None
+        block = self._live
+        if block is None or block.parent is None or not self._token_buffer:
+            return
+        self._live_text += self._token_buffer
+        self._token_buffer = ""
+        block.update_text(self._live_text)
+        self.query_one("#stream", VerticalScroll).scroll_end(animate=False)
+
+    def _close_stream(self, final_text: str = "") -> bool:
+        """Finish the live line, keeping (or replacing) its text; True if one was open."""
+        block = self._live
+        if block is None:
+            return False
+        if self._token_buffer:
+            self._live_text += self._token_buffer
+            self._token_buffer = ""
+        if final_text.strip():
+            self._live_text = final_text
+        if block.parent is not None:
+            block.update_text(self._live_text)
+        self._live = None
+        if self._flush_timer is not None:
+            self._flush_timer.stop()
+            self._flush_timer = None
+        return True
 
     @staticmethod
     def _updates_plan(event: Mapping[str, Any]) -> bool:
@@ -462,89 +715,73 @@ class WQAgentTuiApp(App[None]):
             raw = event["update"].get("todos")
         if isinstance(raw, list):
             self.plan = [item for item in raw if isinstance(item, Mapping)]
-        summary = str(event.get("plan_summary") or "")
-        if not summary and isinstance(event.get("update"), Mapping):
-            summary = str(event["update"].get("plan_summary") or "")
-        panel = self.query_one("#plan", Static)
-        panel.update(self._render_plan(summary))
-        panel.display = True  # the card only exists once there is a plan
-
-    def _render_plan(self, summary: str = "") -> str:
-        """The plan card: a progress line, then one chip per todo."""
-        if not self.plan and not summary:
-            return "(no plan yet)"
-        done = sum(1 for todo in self.plan if str(todo.get("status")) == "completed")
+        done = sum(1 for todo in self.plan if _status(todo) == "completed")
         total = len(self.plan)
-        bar = self._progress_bar(done, total)
-        header = f"{bar}  {done}/{total} done" if total else bar
-        if summary:
-            header += f"  ·  {_short(summary, 60)}"
-        marks = {
-            "completed": ("✅", "dim #64748b"),
-            "in_progress": ("🔄", "bold #fbbf24"),
-            "blocked": ("⛔", "bold #f87171"),
-            "pending": ("⬜", "#cbd5e1"),
-        }
-        chips = []
+        self.query_one("#plan-progress", ProgressBar).update(
+            total=max(total, 1), progress=done
+        )
+        self.query_one("#plan-caption", Static).update(
+            f"{done} / {total} done" if total else "no plan yet"
+        )
+        panel = self.query_one("#plan", VerticalScroll)
+        for child in list(panel.children):
+            child.remove()
         for todo in self.plan:
-            glyph, _ = marks.get(str(todo.get("status") or "pending"), ("⬜", ""))
-            chips.append(f"{glyph} {todo.get('id')}")
-        lines = [header]
-        if chips:
-            lines.append("   ".join(chips))
-        return "\n".join(lines)
-
-    @staticmethod
-    def _progress_bar(done: int, total: int, width: int = 10) -> str:
-        if total <= 0:
-            return "▱" * width
-        filled = max(0, min(width, round(width * done / total)))
-        return "▰" * filled + "▱" * (width - filled)
+            status = _status(todo)
+            label = _short(todo.get("content") or todo.get("id") or "", PLAN_WIDTH - 6)
+            panel.mount(
+                Static(
+                    f"{TODO_MARKS.get(status, '○')}  {label}",
+                    classes=f"todo {TODO_CLASSES.get(status, 'todo-pending')}",
+                )
+            )
 
     def _append(self, text: str, css: str = "event-meta") -> None:
-        """Add one line to the (scrolling) activity stream."""
-        if not str(text or "").strip():
+        """Add one line to the (scrolling) activity log."""
+        text = str(text or "")
+        if not text.strip():
             return
+        self._append_widget(Static(text, classes=css))
+
+    def _append_widget(self, widget: Static) -> None:
+        """Mount one row in the log, keep it bounded, and follow the tail."""
         stream = self.query_one("#stream", VerticalScroll)
-        stream.mount(Static(text, classes=css))
+        stream.mount(widget)
+        self._trim_stream()
+        stream.scroll_end(animate=False)
+
+    def _trim_stream(self) -> None:
+        """Drop the oldest lines once the log is over :data:`STREAM_LIMIT`."""
+        stream = self.query_one("#stream", VerticalScroll)
         children = list(stream.children)
         for stale in children[: max(0, len(children) - self.STREAM_LIMIT)]:
             stale.remove()
-        stream.scroll_end(animate=False)
+        self._diffs = [block for block in self._diffs if block.parent is not None]
 
-    def _turn_rule(self) -> None:
-        """A dim separator, drawn between turns."""
-        self._append(self.TURN_RULE, "event-rule")
-
+    # -- brand bar -----------------------------------------------------------
     def _tick(self) -> None:
         """Advance the brand-bar spinner while a turn runs."""
         self._spin = (self._spin + 1) % len(self.SPINNER)
-        self._refresh_status()
+        self._render_ready()
 
-    def _refresh_status(self, *, passed: bool | None = None, route: str = "") -> None:
+    def _render_header(self) -> None:
+        """Session, turn and route in the middle; the run's state on the right."""
         session = self.session_id[:8] if self.session_id else "new"
-        parts = [f"session: {session}", f"turn {self.turn}"]
-        if route:
-            parts.append(f"last: {route}")
-        if passed is not None:
-            parts.append("✔ passed" if passed else "✖ not verified")
-        if self._busy:
-            parts.append("working…")
-        if self._pending_approvals:
-            parts.append(f"⚠ {self._pending_approvals} approval(s) waiting")
-        self.query_one("#status", Static).update("  ·  ".join(parts))
-        self._refresh_brand()
+        parts = [session, f"turn {self.turn}"]
+        if self._route:
+            parts.append(self._route)
+        self.query_one("#status", Static).update(" · ".join(parts))
+        self._render_ready()
 
-    def _refresh_brand(self) -> None:
-        """The left side of the brand bar: the wolf, the state and the spinner."""
+    def _render_ready(self) -> None:
         if self._busy:
             frame = self.SPINNER[self._spin % len(self.SPINNER)]
-            state = f"[#fbbf24]{frame} working[/]"
+            ready = Text(f"{frame} working", style="bold #B45309")
         elif self._pending_approvals:
-            state = "[#f87171]● needs approval[/]"
+            ready = Text("● approval", style="bold #B91C1C")
         else:
-            state = "[#34d399]● ready[/]"
-        self.query_one("#brand", Static).update(f"🐺 WQ Agent   {state}")
+            ready = Text("● ready", style="bold #15803D")
+        self.query_one("#ready", Static).update(ready)
 
     def _start_spinner(self) -> None:
         if self._spinner_timer is None:
@@ -557,25 +794,75 @@ class WQAgentTuiApp(App[None]):
 
     # -- approval ------------------------------------------------------------
     def on_approval_requested_message(self, message: ApprovalRequestedMessage) -> None:
-        """Show the modal for a risky command and feed the answer back to the tool."""
-        gate = message.gate
-        self._pending_approvals += 1
-        self._append(f"⚠ approval required: {_short(gate.request.command, 140)}", "event-handoff")
-        self._refresh_status()
+        """Queue a risky command; the inline bar shows one request at a time."""
+        self._approval_queue.append(message.gate)
+        self._append(
+            f"▲  approval required : {_short(message.gate.request.command, 140)}",
+            "event-handoff",
+        )
+        self._sync_pending()
+        bar = self._approval_bar
+        if bar is not None:  # a second request arrived: show the queue depth
+            bar.queued = len(self._approval_queue)
+            bar.render_request()
+        self._show_next_approval()
 
-        def decided(approved: bool | None) -> None:
-            gate.resolve(bool(approved))
-            self._pending_approvals = max(0, self._pending_approvals - 1)
-            self._append(
-                "✔ approved" if approved else "✖ denied",
-                "event-ok" if approved else "event-error",
-            )
-            self._refresh_status()
+    def _show_next_approval(self) -> None:
+        """Mount the bar for the next queued gate, if nothing is being asked."""
+        if self._active_gate is not None or not self._approval_queue:
+            return
+        gate = self._approval_queue.pop(0)
+        self._active_gate = gate
+        bar = ApprovalBar(gate, workspace=self.workspace, queued=len(self._approval_queue))
+        self._approval_bar = bar
+        self.query_one("#activitypane").mount(bar, before=self.query_one("#inputbar"))
+        self.query_one("#prompt", Input).disabled = True  # nobody types while a gate waits
+        self._sync_pending()
+        self._render_ready()
 
-        self.push_screen(ApprovalModal(gate, workspace=self.workspace), decided)
+    def _finish_approval(self, approved: bool) -> None:
+        """Answer the active gate, drop the bar, and show the next one if any."""
+        gate = self._active_gate
+        if gate is None:
+            return
+        self._active_gate = None
+        gate.resolve(approved)  # releases the tool thread
+        self._append(
+            "✓  approved" if approved else "✕  denied",
+            "event-ok" if approved else "event-error",
+        )
+        bar = self._approval_bar
+        self._approval_bar = None
+        if bar is not None:
+            bar.remove()
+        prompt = self.query_one("#prompt", Input)
+        prompt.disabled = False
+        prompt.focus()
+        self._sync_pending()
+        self._show_next_approval()
+        self._render_ready()
+
+    def on_approval_bar_decided(self, message: ApprovalBar.Decided) -> None:
+        self._finish_approval(message.approved)
+
+    def on_key(self, event: events.Key) -> None:
+        """While a gate waits, the whole screen answers ``y`` / ``n`` / ``esc``."""
+        if self._active_gate is None:
+            return
+        if event.key == "y":
+            event.stop()
+            self._finish_approval(True)
+        elif event.key in ("n", "escape"):
+            event.stop()
+            self._finish_approval(False)
+
+    def _sync_pending(self) -> None:
+        self._pending_approvals = len(self._approval_queue) + (1 if self._active_gate else 0)
 
     # -- actions -------------------------------------------------------------
     def action_clear_stream(self) -> None:
+        self._close_stream()
         stream = self.query_one("#stream", VerticalScroll)
         for child in list(stream.children):
             child.remove()
+        self._diffs.clear()

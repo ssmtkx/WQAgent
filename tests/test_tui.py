@@ -14,13 +14,16 @@ import pytest
 
 pytest.importorskip("textual", reason="the TUI needs the optional 'textual' dependency")
 
+from textual.screen import ModalScreen  # noqa: E402
 from textual.widgets import Input, Static  # noqa: E402
 
 from wqagent.cli.tui import TEXTUAL_MISSING_HINT, run_tui, textual_available  # noqa: E402
 from wqagent.cli.tui.app import AgentEventMessage, WQAgentTuiApp, format_event  # noqa: E402
+from wqagent.cli.tui.diff_view import DiffBlock  # noqa: E402
 from wqagent.cli.tui.approval import (  # noqa: E402
+    ApprovalBar,
     ApprovalGate,
-    ApprovalModal,
+    ApprovalRequestedMessage,
     TuiApprovalHandler,
 )
 from wqagent.core.approval import ApprovalRequest, new_approval_request  # noqa: E402
@@ -49,17 +52,23 @@ def _stream(app: WQAgentTuiApp) -> str:
     return "\n".join(_text(widget) for widget in app.query("#stream Static"))
 
 
+def _plan(app: WQAgentTuiApp) -> str:
+    """The plan pane is a stack of one Static per todo row."""
+    return "\n".join(_text(widget) for widget in app.query("#plan Static"))
+
+
 def _run(
     scenario: Callable[[WQAgentTuiApp, Any], Awaitable[None]],
     *,
     runner: Any = None,
+    size: tuple[int, int] | None = None,
     **options: Any,
 ) -> None:
     """The boilerplate every TUI test shares: one app, one headless pilot, one event loop."""
 
     async def main() -> None:
         app = WQAgentTuiApp(runner=runner, **options)
-        async with app.run_test() as pilot:
+        async with app.run_test(size=size) as pilot:
             await scenario(app, pilot)
 
     asyncio.run(main())
@@ -73,16 +82,18 @@ async def _settle(app: WQAgentTuiApp, pilot: Any, limit: int = 60) -> None:
             return
 
 
-async def _answer_approval(app: WQAgentTuiApp, pilot: Any, key: str) -> Any:
-    """Ask for approval on a worker thread, answer the modal with *key*, return the decision."""
+async def _answer_approval(
+    app: WQAgentTuiApp, pilot: Any, key: str, *, command: str = "pip install fastapi"
+) -> Any:
+    """Ask for approval on a worker thread, answer the inline bar, return the decision."""
     handler = TuiApprovalHandler(app, timeout=10)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(handler, _request())
-        for _ in range(60):  # wait for the modal to appear
+        future = pool.submit(handler, _request(command))
+        for _ in range(60):  # wait for the bar to appear
             await pilot.pause()
-            if isinstance(app.screen, ApprovalModal):
+            if app._active_gate is not None:
                 break
-        assert isinstance(app.screen, ApprovalModal)
+        assert app._active_gate is not None, "the approval bar never appeared"
         assert not future.done(), "the tool thread must be blocked while asking"
 
         await pilot.press(key)
@@ -161,51 +172,193 @@ def test_handler_without_an_app_denies() -> None:
     assert "could not ask" in decision.reason
 
 
-# -- the modal ---------------------------------------------------------------
-def test_modal_shows_the_request_and_approves_with_y() -> None:
+# -- the inline approval bar -------------------------------------------------
+def test_approval_bar_is_inline_and_shows_the_request() -> None:
+    """The prompt sits above the composer, in the activity pane - never over it."""
+
     async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
         gate = ApprovalGate(_request(), timeout=5)
-        results: list[Any] = []
-        app.push_screen(ApprovalModal(gate, workspace="D:/demo"), results.append)
-        await pilot.pause()
-        assert "pip install fastapi" in _text(app.screen.query_one("#approval-command"))
-        rows = [_text(widget) for widget in app.screen.query(".approval-row")]
-        assert any("BashTool" in row for row in rows)  # the tool name
-        assert any("Python package installation" in row for row in rows)  # the risk
-        assert any("D:/demo" in row for row in rows)  # the workspace
+        app.post_message(ApprovalRequestedMessage(gate))
+        for _ in range(60):
+            await pilot.pause()
+            if app.query(ApprovalBar):
+                break
+
+        bar = app.query_one(ApprovalBar)
+        assert bar.parent is app.query_one("#activitypane")  # inline, not a modal
+        assert not isinstance(app.screen, ModalScreen)  # the screen is still the app
+
+        title = _text(app.query_one("#approval-title", Static))
+        assert "approval required" in title and "BashTool" in title
+        body = _text(app.query_one("#approval-command", Static))
+        assert "pip install fastapi" in body  # the command
+        assert "Python package installation" in body  # the risk
+        hint = _text(app.query_one("#approval-hint", Static))
+        assert "approve" in hint and "deny" in hint and "esc" in hint
+
+        # nothing gets typed into the composer while a gate waits
+        assert app.query_one("#prompt", Input).disabled is True
 
         await pilot.press("y")
         await pilot.pause()
 
-        assert results == [True]
+        assert not app.query(ApprovalBar)  # the bar is gone again
+        assert app.query_one("#prompt", Input).disabled is False
+        assert gate.decision is not None and gate.decision.approved is True
 
     _run(scenario, workspace=".", runner=_scripted([]))
 
 
-@pytest.mark.parametrize(
-    ("interaction", "target", "expected"),
-    [
-        ("press", "y", True),
-        ("press", "n", False),
-        ("press", "escape", False),
-        ("press", "enter", True),
-        ("click", "#approval-approve", True),
-        ("click", "#approval-deny", False),
-    ],
-)
-def test_modal_answers_by_key_and_by_button(interaction: str, target: str, expected: bool) -> None:
+@pytest.mark.parametrize(("key", "expected"), [("y", True), ("n", False), ("escape", False)])
+def test_approval_bar_answers_by_key(key: str, expected: bool) -> None:
     async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
-        gate = ApprovalGate(_request(), timeout=5)
-        results: list[Any] = []
-        app.push_screen(ApprovalModal(gate), results.append)
-        await pilot.pause()
+        decision = await _answer_approval(app, pilot, key)
 
-        await (pilot.press(target) if interaction == "press" else pilot.click(target))
-        await pilot.pause()
-
-        assert results == [expected], target
+        assert decision.approved is expected
+        assert ("approved" if expected else "denied") in _stream(app)
 
     _run(scenario, workspace=".", runner=_scripted([]))
+
+
+def test_second_approval_waits_for_the_first() -> None:
+    """Two gates at once: one bar, a "more waiting" hint, then the second request."""
+
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        handler = TuiApprovalHandler(app, timeout=10)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(handler, _request("pip install fastapi"))
+            second = pool.submit(handler, _request("rm -rf build"))
+            for _ in range(60):
+                await pilot.pause()
+                if app.query(ApprovalBar):
+                    break
+
+            assert len(app.query(ApprovalBar)) == 1
+            assert "pip install fastapi" in _text(app.query_one("#approval-command", Static))
+            assert "1 more waiting" in _text(app.query_one("#approval-title", Static))
+
+            await pilot.press("y")
+            assert first.result(timeout=10).approved is True
+
+            for _ in range(60):
+                await pilot.pause()
+                if "rm -rf build" in _text(app.query_one("#approval-command", Static)):
+                    break
+            assert "rm -rf build" in _text(app.query_one("#approval-command", Static))
+
+            await pilot.press("n")
+            assert second.result(timeout=10).approved is False
+
+    _run(scenario, workspace=".", runner=_scripted([]))
+
+
+# -- the diff view -----------------------------------------------------------
+DIFF_EVENT = {
+    "type": "tool_result",
+    "name": "file_write",
+    "result": {"ok": True, "result": "Created app/main.py (412 lines)"},
+    "diff": {
+        "path": "app/main.py",
+        "added": 2,
+        "removed": 1,
+        "text": (
+            "--- a/app/main.py\n+++ b/app/main.py\n@@ -1,2 +1,3 @@\n-old\n+new\n+extra\n"
+        ),
+        "truncated": False,
+    },
+}
+
+
+def test_diff_block_lands_in_the_stream_and_toggles(tmp_path: Path) -> None:
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        app.post_message(AgentEventMessage(dict(DIFF_EVENT)))
+        for _ in range(40):
+            await pilot.pause()
+            if app.query(DiffBlock):
+                break
+
+        block = app.query_one(DiffBlock)
+        assert block.parent is app.query_one("#stream")  # inline in the log
+        header = _text(block.query_one("#diff-header", Static))
+        assert "file_write" in header and "app/main.py" in header
+        assert "+2" in header and "−1" in header  # the counts are the summary
+
+        body = block.query_one("#diff-body", Static)
+        assert body.display is False  # collapsed by default
+
+        app.action_toggle_diff()
+        await pilot.pause()
+        assert body.display is True
+        assert "+new" in _text(body) and "-old" in _text(body)
+
+        app.action_toggle_diff()
+        await pilot.pause()
+        assert body.display is False
+
+    _run(scenario, workspace=tmp_path / "ws", runner=_scripted([]))
+
+
+def test_tool_result_without_a_diff_stays_a_plain_line(tmp_path: Path) -> None:
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        app.post_message(
+            AgentEventMessage(
+                {"type": "tool_result", "name": "file_read", "result": {"ok": True, "result": "ok"}}
+            )
+        )
+        await pilot.pause()
+        assert not app.query(DiffBlock)
+        assert "file_read" in _stream(app)
+
+    _run(scenario, workspace=tmp_path / "ws", runner=_scripted([]))
+
+
+# -- streaming replies -------------------------------------------------------
+def test_tokens_stream_into_one_line_then_settle(tmp_path: Path) -> None:
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        for piece in ("Hel", "lo", " there"):
+            app.post_message(AgentEventMessage({"type": "token", "text": piece}))
+        await pilot.pause()
+        app._flush_tokens()  # what the 50 ms timer does
+        await pilot.pause()
+
+        live = app._live
+        assert live is not None
+        assert _text(live.query_one("#live-gutter", Static)) == "»  chat :"
+        assert "Hello there" in _text(live.body)  # the text wraps beside the gutter
+
+        app.post_message(
+            AgentEventMessage({"type": "chat_response", "chat_response": "Hello there"})
+        )
+        for _ in range(20):
+            await pilot.pause()
+
+        assert app._live is None  # the line settled
+        lives = app.query("#stream LiveReply")
+        assert len(lives) == 1  # one block, not a duplicate
+        assert "Hello there" in _text(lives[0].body)
+
+    _run(scenario, workspace=tmp_path / "ws", runner=_scripted([]))
+
+
+def test_the_chat_route_does_not_print_the_reply_twice(tmp_path: Path) -> None:
+    """The chat route reports the same text as chat_response and final_answer."""
+
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        app.post_message(AgentEventMessage({"type": "token", "text": "hi"}))
+        await pilot.pause()
+        app.post_message(AgentEventMessage({"type": "chat_response", "chat_response": "hi"}))
+        app.post_message(
+            AgentEventMessage(
+                {"type": "final_answer", "content": "hi", "passed": True, "route": "chat"}
+            )
+        )
+        for _ in range(20):
+            await pilot.pause()
+
+        assert "answer :" not in _stream(app)
+        assert len(app.query("#stream LiveReply")) == 1
+
+    _run(scenario, workspace=tmp_path / "ws", runner=_scripted([]))
 
 
 # -- the app -----------------------------------------------------------------
@@ -213,12 +366,62 @@ def test_app_renders_the_layout(tmp_path: Path) -> None:
     async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
         await pilot.pause()
         assert app.query_one("#status", Static)
-        assert app.query_one("#plan", Static)
+        assert app.query_one("#plan")
         assert app.query_one("#stream")
         assert app.query_one("#prompt", Input)
         assert "new" in _text(app.query_one("#status", Static))  # no session yet
 
     _run(scenario, workspace=tmp_path / "ws", runner=_scripted([]))
+
+
+def test_layout_has_real_geometry(tmp_path: Path) -> None:
+    """Regression: the panes must actually occupy rows (a blank screen used to pass)."""
+
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        await pilot.pause()
+        stream = app.query_one("#stream")
+        assert stream.content_size.height > 10, "the activity log has no visible rows"
+        assert stream.region.width > 40, "the activity log is squeezed to nothing"
+        assert app.query_one("#planpane").display is True
+        assert app.query_one("#planpane").region.width == 38
+        inputbar = app.query_one("#inputbar").region
+        assert inputbar.y + inputbar.height <= app.size.height, "the composer is off screen"
+
+    _run(scenario, size=(120, 34), workspace=tmp_path / "ws", runner=_scripted([]))
+
+
+def test_narrow_terminal_folds_the_plan_sidebar(tmp_path: Path) -> None:
+    """Below NARROW_WIDTH the sidebar yields its columns to the activity log."""
+
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        await pilot.pause()
+        assert app.query_one("#planpane").display is False
+        assert app.query_one("#activitypane").region.width == app.size.width
+        assert "plan ▸" in str(app.query_one("#keys", Static).render())
+
+        await pilot.press("ctrl+b")  # the user may insist on seeing the plan
+        await pilot.pause()
+        assert app.query_one("#planpane").display is True
+        assert "plan ▾" in str(app.query_one("#keys", Static).render())
+
+    _run(scenario, size=(84, 26), workspace=tmp_path / "ws", runner=_scripted([]))
+
+
+def test_toggle_plan_folds_and_restores_it(tmp_path: Path) -> None:
+    async def scenario(app: WQAgentTuiApp, pilot: Any) -> None:
+        await pilot.pause()
+        assert app.query_one("#planpane").display is True
+
+        await pilot.press("ctrl+b")
+        await pilot.pause()
+        assert app.query_one("#planpane").display is False
+        assert app.query_one("#activitypane").region.width == app.size.width
+
+        await pilot.press("ctrl+b")
+        await pilot.pause()
+        assert app.query_one("#planpane").display is True
+
+    _run(scenario, size=(120, 34), workspace=tmp_path / "ws", runner=_scripted([]))
 
 
 def test_app_turn_updates_stream_plan_and_status(tmp_path: Path) -> None:
@@ -249,11 +452,11 @@ def test_app_turn_updates_stream_plan_and_status(tmp_path: Path) -> None:
         assert "build the app" in stream  # the user's turn
         assert "file_write" in stream and "app.py" in stream  # the tool call
         assert "Created app.py" in stream  # the tool result
-        assert "handoff · planner" in stream and "codeAgent" in stream
-        assert "checkpoint · running/planner" in stream
+        assert "handoff" in stream and "planner" in stream and "codeAgent" in stream
+        assert "checkpoint" in stream and "running/planner" in stream
         assert "Done: app.py created." in stream  # the final answer
 
-        plan = _text(app.query_one("#plan", Static))
+        plan = _plan(app)
         assert "t1" in plan and "t2" in plan
         assert app.turn == 2 and app.session_id == "8f3c1d2e4b5a"
         status = _text(app.query_one("#status", Static))
@@ -422,15 +625,17 @@ def test_textual_is_available_in_this_environment() -> None:
 # -- rendering helpers -------------------------------------------------------
 def test_format_event_lines() -> None:
     tool = format_event({"type": "tool_call", "name": "bash", "args": {"command": "ls"}})[0]
-    assert "bash" in tool and "command=ls" in tool
+    assert "bash" in tool and "ls" in tool  # the target, not key=value noise
 
     assert format_event({"type": "turn_finished"})[0] == ""
-    assert "route · chat" in format_event(
+    intent = format_event(
         {"type": "intent", "intent_route": "chat", "intent_confidence": 0.8}
     )[0]
-    assert "codeAgent" in format_event(
+    assert "intent" in intent and "chat" in intent and "0.80" in intent
+    written = format_event(
         {"type": "tool_call", "node": "codeAgent", "name": "file_write", "args": {"file_path": "a.py"}}
     )[0]
+    assert "file_write" in written and "a.py" in written
     assert "checkpoint" in format_event(
         {"type": "checkpoint_saved", "status": "running", "latest_node": "planner"}
     )[0]
@@ -444,19 +649,32 @@ def test_format_event_lines() -> None:
     assert failed[1] == "event-error" and "exit 1" in failed[0]
 
 
-def test_format_event_renders_todo_chips_instead_of_a_repr() -> None:
+def test_format_event_never_uses_emoji() -> None:
+    """The design is explicit: text markers (✓ ✕ ↳ › » ●), never emoji."""
+    samples = [
+        {"type": "tool_result", "name": "f", "result": {"ok": True, "result": "x"}},
+        {"type": "tool_result", "name": "f", "result": {"ok": False, "error": "x"}},
+        {"type": "handoff", "from": "a", "to": "b"},
+        {"type": "tool_call", "name": "bash", "args": {"command": "ls"}},
+    ]
+    for event in samples:
+        line = format_event(event)[0]
+        assert not any(ord(char) > 0x2190 and char not in "↳›»→●✓✕…·" for char in line), line
+
+
+def test_format_event_summarises_todo_updates_instead_of_a_repr() -> None:
     line, css = format_event(
         {
             "type": "todo_update",
             "todos": [
-                {"id": "scaffold", "status": "completed"},
-                {"id": "auth", "status": "in_progress"},
+                {"id": "scaffold", "content": "scaffold the app", "status": "completed"},
+                {"id": "auth", "content": "add auth", "status": "in_progress"},
             ],
         }
     )
 
     assert css == "event-plan"
-    assert "scaffold" in line and "auth" in line
+    assert "1 / 2" in line and "add auth" in line  # progress + the active item
     assert "{'id'" not in line  # no Python repr in the stream
 
 
