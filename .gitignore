@@ -48,3 +48,6 @@ Thumbs.db
 
 # coding agent learn plan
 coding-agent-learning-plan.md
+
+# local helper, machine-specific (not for sharing)
+run_wq.sh

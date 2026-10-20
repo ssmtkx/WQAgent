@@ -25,15 +25,28 @@ wq "创建 hello.py，打印 Hello, World，然后运行它" --workspace .\demo
 
 ### 1. 安装
 
+项目用 `uv` 管理依赖（推荐），也支持纯 `pip + venv`。两种方式二选一，结果等价。
+
+**方式 A：uv（推荐，装包更快、版本锁定在 `uv.lock`）**
+
+```powershell
+git clone <repo> ; cd WQAgent
+uv sync --extra tui          # 自动建 .venv 并装齐依赖（含 TUI 的 textual）
+uv run wq --version
+```
+
+**方式 B：pip + venv（不想装 uv 也能跑）**
+
 ```powershell
 git clone <repo> ; cd WQAgent
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # Linux/macOS: source .venv/bin/activate
-
 pip install -e .                      # 安装 wq 命令（可编辑模式）
 pip install -e ".[tui]"               # 需要交互式 TUI 时再加 Textual
 wq --version
 ```
+
+> 无 uv 且想锁死版本：见仓库根目录 `requirements.txt`，可执行 `pip install -r requirements.txt`。
 
 运行时依赖（`pyproject.toml` 声明，本仓库当前实际使用括号内版本）：
 
