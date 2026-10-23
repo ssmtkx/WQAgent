@@ -20,37 +20,12 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
-# tiktoken's downloaded BPE vocabularies (e.g. cl100k_base, ~1.7 MB); langchain's
-# token counting fetches them, and they land here when tiktoken's cache dir
-# resolves to the relative path "data-gym-cache"
-data-gym-cache/
 
 # agent scratch space (default workspace)
 workspace/
-demo/
-demo1/
 
 # checkpoints an agent run writes into its workspace
 .wqagent/
-
-# stray runtime logs (written into the cwd by other processes, e.g. IME debug output)
-debug.log
-
-# editors / os
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
-
-# workbuddy generation
-.workbuddy/
-
-
-# coding agent learn plan
-coding-agent-learning-plan.md
-
-# local helper, machine-specific (not for sharing)
-run_wq.sh
 
 # test
 pytest-of-*/
